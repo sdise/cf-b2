@@ -1,0 +1,404 @@
+# 部署说明与参数详解
+
+适用对象：`src/b2-worker.js`（单文件 Worker，连接 Backblaze B2 私有/公有桶 + 文件管理）。
+
+---
+
+## 目录
+
+1. [部署前的准备（B2 侧）](#1-部署前的准备b2-侧)
+2. [部署方式](#2-部署方式)
+3. [环境变量参数总表](#3-环境变量参数总表)
+4. [路由与路径规则](#4-路由与路径规则)
+5. [API 参考](#5-api-参考)
+6. [网页文件管理器](#6-网页文件管理器)
+7. [CORS 配置（直传必须）](#7-cors-配置直传必须)
+8. [配额与限制](#8-配额与限制)
+9. [安全建议](#9-安全建议)
+10. [故障排查](#10-故障排查)
+
+---
+
+## 1. 部署前的准备（B2 侧）
+
+### 1.1 创建 Application Key
+
+Backblaze 控制台 → **Account → Application Keys → Add a New Application Key**
+
+| 字段 | 建议值 |
+| --- | --- |
+| Name | `cf-b2-worker` |
+| Allow access to Bucket(s) | 只勾选目标桶（最小权限） |
+| Type | Read and Write（只需只读就选 Read Only） |
+| Capabilities | `listFiles` `readFiles` `writeFiles` `deleteFiles`；`$path`/`$host` 模式再加 `listBuckets` |
+
+创建后**立刻记录**：
+
+- `keyID`（形如 `0056xxxxxxxxxxxxxxxxxxxxx`）→ 对应变量 `B2_KEY_ID`
+- `applicationKey`（形如 `Kxxxxxxxxxxxxxxxxxxxxxxxxxxxx`）→ 对应变量 `B2_APPLICATION_KEY`，**只显示一次**
+
+> 若之前用过 rclone/aws-cli，注意区分：这里是 **Application Key**（S3 兼容），不是 master application key。
+
+### 1.2 获取 S3 兼容 Endpoint
+
+B2 控制台 → **Buckets → 点击目标桶 → Bucket Settings**，在 "Bucket Info" / "Endpoint" 处可见：
+
+```
+s3.us-west-001.backblazeb2.com
+```
+
+填 `B2_ENDPOINT` 时要带协议：`https://s3.us-west-001.backblazeb2.com`。
+
+Region 会自动从主机名推导（`s3.<region>.backblazeb2.com` → `<region>`），也可显式设置 `B2_REGION`。
+**Region 与 Endpoint 必须同区**，否则签名会返回 `AuthorizationHeaderMalformed`。
+
+### 1.3 桶的可见性
+
+桶要保持 **Private** 也没问题 —— Worker 会用密钥实时签名，客户端无需任何凭据。
+只有当你要让 S3 原生直链（`f00x.backblazeb2.com`）也能直接访问时，才需要设 Public。
+
+---
+
+## 2. 部署方式
+
+### 方式 A：Wrangler CLI（推荐，便于版本管理）
+
+```bash
+# 1. 准备目录
+cp .dev.vars.example .dev.vars      # 本地调试用
+
+# 2. 登录
+npx wrangler login
+
+# 3. 写入密钥（不会进 wrangler.toml，也不会进 Git）
+npx wrangler secret put B2_KEY_ID
+npx wrangler secret put B2_APPLICATION_KEY
+npx wrangler secret put ADMIN_PASS
+npx wrangler secret put ADMIN_TOKEN   # 可选，与 Basic 二选一
+
+# 4. 修改 wrangler.toml 里的 [vars]
+
+# 5. 本地预览
+npx wrangler dev --remote          # 用真实 B2 联调；不带 --remote 时签名仍会发出去
+
+# 6. 部署
+npx wrangler deploy
+
+# 7. 看日志
+npx wrangler tail
+```
+
+> 本地 `wrangler dev` 建议加 `--remote`，因为 Miniflare 本地模式对 `caches.default` 与流式 Range 的表现与线上不完全一致。
+
+### 方式 B：Cloudflare 控制台（无需本地环境）
+
+1. **Workers & Pages → Create → Create Worker → 起个名字 → Deploy**
+2. **Edit Code**：把 `src/b2-worker.js` 的内容整段粘贴覆盖，再 **Deploy**
+3. **Settings → Variables and Secrets**：
+   - **Secrets（加密）**：`B2_KEY_ID`、`B2_APPLICATION_KEY`、`ADMIN_PASS`
+   - **Variables（明文）**：见第 3 节表格
+4. **Settings → Domains & Routes** → Add → Custom domain（推荐绑定到 DNS 由 Cloudflare 托管的域名，会自动建 DNS 记录并让 CDN 缓存生效）
+
+### 方式 C：最小 package.json（可选）
+
+本 Worker **零依赖**，不需要 `npm install`。若希望固化 wrangler 版本：
+
+```json
+{
+  "name": "cf-b2-worker",
+  "private": true,
+  "type": "module",
+  "scripts": { "dev": "wrangler dev", "deploy": "wrangler deploy", "tail": "wrangler tail" },
+  "devDependencies": { "wrangler": "^3.80.0" }
+}
+```
+
+---
+
+## 3. 环境变量参数总表
+
+> 布尔值接受：`true/false`、`1/0`、`yes/no`、`on/off`（大小写不敏感）。未设置时使用下表默认值。
+
+### 3.1 连接（必需）
+
+| 变量 | 推荐位置 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `B2_KEY_ID` | Secret | — | Application Key ID。为兼容 CF-Proxy-B2 也接受 `B2_APPLICATION_KEY_ID` |
+| `B2_APPLICATION_KEY` | Secret | — | Application Key 本体。别名 `B2_SECRET_ACCESS_KEY` |
+| `B2_ENDPOINT` | vars | `https://s3.us-west-001.backblazeb2.com` | S3 兼容端点，必须 `https://` 开头，末尾不要带 `/` |
+| `BUCKET_NAME` | vars | — | 固定桶名，或 `$path`（URL 首段做桶名）、`$host`（主机名首段做桶名） |
+| `B2_REGION` | vars | 由 `B2_ENDPOINT` 推导 | 显式指定区域，例如 `us-west-001`、`eu-central-003` |
+| `URL_STYLE` | vars | `path` | `path`：`s3.xxx.backblazeb2.com/<bucket>/<key>`（兼容带点桶名）；`virtual`：`<bucket>.s3.xxx.backblazeb2.com/<key>` |
+
+### 3.2 访问控制
+
+| 变量 | 推荐位置 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `ADMIN_USER` | vars | 空 | Basic 用户名 |
+| `ADMIN_PASS` | **Secret** | 空 | Basic 密码。比较采用恒定时间算法 |
+| `ADMIN_TOKEN` | **Secret** | 空 | Bearer 令牌。存在时优先级高于 Basic |
+| `PUBLIC_READ` | vars | `true` | 是否允许匿名读取对象；`false` 时 GET/HEAD 也需要鉴权 |
+| `PUBLIC_WRITE` | vars | `false` | 是否允许匿名写入；谨慎开启，等于开放网盘 |
+| `ALLOW_LIST_BUCKET` | vars | `false` | 是否允许**匿名**列举目录。鉴权用户始终可列举 |
+| `ENABLE_WRITE` | vars | `true` | 总写开关，关闭后所有 PUT/POST 变 403/405 |
+| `ENABLE_DELETE` | vars | `true` | 总删开关 |
+| `ENABLE_MANAGE` | vars | `true` | 是否开放 `/__manage` 网页管理器 |
+| `ALLOWED_ORIGINS` | vars | `*` | CORS 白名单，逗号分隔完整 Origin，例如 `https://a.com,https://b.com` |
+
+**鉴权判定的优先级：**
+
+```
+PUBLIC_WRITE=true            → 直接放行所有写删（强烈不建议）
+Bearer ADMIN_TOKEN 匹配      → 放行
+Basic ADMIN_USER/ADMIN_PASS  → 放行
+两者都未配置                 → 默认拒绝（fail-closed）
+```
+
+### 3.3 性能与缓存
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `CACHE_MAX_AGE` | `86400` | 响应 `Cache-Control: public, max-age=N`；`0` 表示不改 `Cache-Control` |
+| `ENABLE_CACHE` | `true` | 是否使用 Cloudflare Cache API 缓存响应；命中时响应头带 `X-B2-Cache: HIT` |
+| `ALLOW_REDIRECT` | `false` | 允许 `/<key>?redirect=1` 返回 302 到预签名 URL，把大文件流量完全交给 B2（会绕过 CF 缓存） |
+| `UPLOAD_CACHE_CONTROL` | 空 | 上传时写入对象的 Cache-Control，例如 `public, max-age=31536000, immutable` |
+
+缓存生效范围：**仅 GET、且无 Range、且无 Authorization 头、且状态码 200**。
+带 Range 的请求不写缓存（避免半段内容污染 Cache API）。
+
+### 3.4 上传
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `MAX_UPLOAD_BYTES` | `104857600`（100MB） | 经 Worker 代理上传的体积上限（Workers 硬上限就是 100MB） |
+| `PRESIGN_EXPIRES` | `3600` | 预签名 URL 有效期（秒） |
+| `MULTIPART_THRESHOLD` | `104857600` | 超过该体积自动走 S3 分片上传 |
+| `MULTIPART_PART_SIZE` | `26214400`（25MB） | 分片大小；B2 要求最后一片外其他片 ≥5MB |
+| `RCLONE_DOWNLOAD` | `false` | 兼容 `rclone --b2-download-url`：剥掉 URL 中 `file/<bucket>/` 前缀 |
+
+### 3.5 调试
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `DEBUG` | `false` | 保留项；异常时会在日志输出堆栈（`wrangler tail` 可见），响应体始终只返回简短错误信息 |
+
+---
+
+## 4. 路由与路径规则
+
+| 路径 | 方法 | 说明 |
+| --- | --- | --- |
+| `/<key>` | GET / HEAD | 下载对象（支持 Range、条件请求） |
+| `/<key>` | PUT | 经 Worker 上传（需鉴权，`ENABLE_WRITE`） |
+| `/<key>` | DELETE | 删除对象（需鉴权，`ENABLE_DELETE`） |
+| `/<prefix>/` | GET | 目录列表（HTML；`?format=json` 返回 JSON；`?cursor=` 翻页；`?limit=` 每页条数） |
+| `/__manage` | GET | 网页文件管理器（需鉴权） |
+| `/<bucket>/__manage` | GET | `$path` 模式下的管理器，自动把 API 前缀带上桶名 |
+| `/__api/*` | 见下节 | 管理 API（需鉴权，`/health` 除外） |
+| `/<bucket>/__api/*` | 同上 | `$path` 模式下显式指定桶；也可用 `/__api/*?bucket=<桶名>` |
+| 任意 | OPTIONS | CORS 预检，返回 204 |
+
+> **判断规则**：路径以 `/` 结尾视为"目录"→ 返回列表；否则视为"对象"→ 走下载/上传/删除。
+> 含 `__api/` 的路径总是优先当 API 处理。
+
+**桶名解析（`BUCKET_NAME`）**
+
+| 取值 | 示例 URL | 桶 | 对象 key |
+| --- | --- | --- | --- |
+| `my-bucket` | `/a/b.jpg` | `my-bucket` | `a/b.jpg` |
+| `$path` | `/my-bucket/a/b.jpg` | `my-bucket` | `a/b.jpg` |
+| `$host` | `https://my-bucket.dl.example.com/a/b.jpg` | `my-bucket` | `a/b.jpg` |
+
+> 安全：`key` 会做归一化，`..` 会被消解（`../../etc/passwd` → `etc/passwd`），无法跳出桶外。
+
+---
+
+## 5. API 参考
+
+所有 `/__api/*` 端点除 `/health` 外均需鉴权，统一返回 JSON，失败时 `ok:false` 且带 `error`。
+
+### `GET /__api/health`
+
+```json
+{ "ok": true, "service": "cf-b2-worker", "bucketMode": "fixed", "region": "us-west-001",
+  "publicRead": true, "authenticated": true }
+```
+
+### `GET /__api/list`
+
+| 参数 | 说明 |
+| --- | --- |
+| `prefix` | 前缀，例如 `photos/` |
+| `cursor` | 上一页返回的 `nextToken` |
+| `limit` | 每页条数，默认 1000 |
+| `recursive=1` | 不使用 `/` 分隔符，递归列出全部对象 |
+| `bucket` | 仅 `$path`/`$host` 模式需要 |
+
+```json
+{ "ok": true, "bucket": "my-bucket",
+  "files": [{ "key":"a.txt","name":"a.txt","size":12,"lastModified":"2026-09-27T10:00:00.000Z","etag":"..." }],
+  "folders": ["photos/"], "truncated": false, "nextToken": "" }
+```
+
+### `GET /__api/presign`
+
+| 参数 | 说明 |
+| --- | --- |
+| `key` | 对象 key（必需） |
+| `type` | `get`（默认）或 `put` |
+| `expires` | 有效期秒数，默认 `PRESIGN_EXPIRES` |
+| `download=1` | 追加 `response-content-disposition: attachment` |
+| `ct` | `type=put` 时的 Content-Type，客户端 PUT 时必须使用同一个值 |
+
+返回：
+
+```json
+{ "ok": true, "url": "https://s3.us-west-001.backblazeb2.com/my-bucket/a.txt?X-Amz-...", "expires": 3600 }
+```
+
+> **PUT 预签名 URL 必须同时发送头 `x-amz-content-sha256: UNSIGNED-PAYLOAD`**（本项目管理器的 `<span>` 已自动带上；你自己写客户端时务必加上）。
+
+### `PUT|GET|HEAD|DELETE /__api/object?key=<key>`
+
+- `PUT`：请求体即文件内容，走 Worker 中转，受 `MAX_UPLOAD_BYTES` 限制
+- `DELETE`：删除对象
+- `GET/HEAD`：等价下载地址 `/<key>`
+
+### `POST /__api/copy`
+
+```json
+{ "from": "old.txt", "to": "new.txt", "move": true }
+```
+
+`move:true` 时复制完成后删除源对象（用服务端 `x-amz-copy-source` 复制，数据不经过 Worker）。
+`$path`/`$host` 模式再加 `?bucket=xxx`。
+
+### `POST /__api/mkdir`
+
+```json
+{ "prefix": "photos/2026" }
+```
+
+实际写入 `photos/2026/.keep`（0 字节占位对象），使 `ListObjectsV2` 能把该目录作为 `CommonPrefixes` 返回。
+
+### 分片上传
+
+| 端点 | 参数 / body | 说明 |
+| --- | --- | --- |
+| `POST /__api/multipart/create?key=` | `{ "contentType": "video/mp4" }` | 返回 `{ uploadId }` |
+| `GET /__api/multipart/part?key=&uploadId=&partNumber=` | — | 返回该分片的预签名 PUT URL |
+| `POST /__api/multipart/complete?key=` | `{ "uploadId": "..." }` | 服务端自动 ListParts 取 ETag 后合并 |
+| `POST /__api/multipart/abort?key=` | `{ "uploadId": "..." }` | 取消并清理碎片 |
+
+`complete` 不需要客户端回传 ETag（避免依赖跨域暴露的 ETag 响应头），服务端会分页拉取全部已上传分片并排序后合并。
+
+**curl 示例（直传）**
+
+```bash
+# 1. 取上传直链
+UP=$(curl -s -u admin:pass "https://<host>/__api/presign?key=demo.bin&type=put" | jq -r .url)
+
+# 2. 直传到 B2（不受 Workers 100MB 限制）
+curl -X PUT -T ./demo.bin \
+  -H "Content-Type: application/octet-stream" \
+  -H "x-amz-content-sha256: UNSIGNED-PAYLOAD" \
+  "$UP"
+```
+
+---
+
+## 6. 网页文件管理器
+
+访问 `https://<你的域名>/__manage`（需 Basic/Bearer 鉴权）。
+
+- 目录浏览、面包屑导航、翻页
+- 拖拽上传、进度条；超过 `MULTIPART_THRESHOLD` 自动切换分片上传
+- 一键复制临时直链（预签名 GET，默认 1 小时）
+- 下载（带 `attachment` 的预签名链接）
+- 重命名（服务端复制 + 删除）
+- 新建目录、删除文件/目录
+- 右上角输入 Basic 用户名/密码或 Bearer 令牌后点"鉴权"；若浏览器已完成 Basic 弹窗登录，通常无需再填
+
+---
+
+## 7. CORS 配置（直传必须）
+
+管理器运行在你的域名上，但 `PUT` 是发给 `https://s3.<region>.backblazeb2.com` 的预签名 URL，属于跨域请求。必须在 B2 桶上配置 CORS：
+
+**B2 控制台 → Bucket Settings → CORS Rules**，或命令行：
+
+```bash
+b2 update-bucket --corsRules '[
+  {
+    "corsRuleName": "allowUploadFromMySite",
+    "allowedOrigins": ["https://dl.example.com"],
+    "allowedOperations": ["s3_put", "s3_get", "s3_head"],
+    "allowedHeaders": ["content-type", "x-amz-content-sha256", "x-amz-request-id"],
+    "exposeHeaders": ["ETag"],
+    "maxAgeSeconds": 3600
+  }
+]' your-bucket-name allPrivate
+```
+
+要点：
+
+- `allowedOrigins` 必须是完整 Origin（含协议），B2 也支持形如 `https://*.example.com` 的通配形式
+- `allowedOperations` 至少要 `s3_put`
+- `allowedHeaders` 必须包含 `x-amz-content-sha256`，否则预检失败
+- 如果希望自己的 CDN 域也能被 CDN 读取，把 `https://dl.example.com` 一并写入 `allowedOrigins`
+
+> 只做**读取/CDN 代理**时（全部请求经过 Worker），不需要任何 B2 CORS 配置。
+
+---
+
+## 8. 配额与限制
+
+| 项目 | 限制 | 应对 |
+| --- | --- | --- |
+| Workers 请求体（代理上传） | 100MB（免费/付费同上限） | 走预签名直传或分片上传 |
+| 子请求数 | 免费套餐每次请求 50 个 | 正常读写为 1 个子请求；`multipart/complete` 会分页 ListParts，极多分片时略增 |
+| CPU 时间 | 免费套餐 10ms/请求 | SigV4 仅 4 次 HMAC + 若干 SHA-256，开销极小 |
+| Cache API 单对象 | 约 512MB | 更大的对象自动跳过缓存（不报错） |
+| 流式响应 | 长时间流式可控，但大文件建议用 `?redirect=1` 走 302 | 见 `ALLOW_REDIRECT` |
+| SigV4 有效期 | 签名 15 分钟内有效（由 `x-amz-date` 决定） | 无需处理，签名即时生成 |
+| B2 分片规则 | 除最后一片外每片 ≥5MB，最多 10000 片 | 调大 `MULTIPART_PART_SIZE` |
+
+---
+
+## 9. 安全建议
+
+1. **密钥只放 Secret**：`B2_APPLICATION_KEY`、`ADMIN_PASS`、`ADMIN_TOKEN` 一律用 `wrangler secret put`，绝不写进 `wrangler.toml`/Git。
+2. **最小权限 Key**：Application Key 只授权目标桶和必要的 capabilities；只读场景就别给 `writeFiles`/`deleteFiles`。
+3. **不要开启 `PUBLIC_WRITE`**：除非你确实想做一个公开网盘。
+4. **`ALLOW_LIST_BUCKET` 保持 `false`**：开放后任何人都能枚举桶内容。
+5. **管理入口单独保护**：可以再加一层 Cloudflare Access（Zero Trust），或在自定义域名上只给 `/__manage` 设置访问策略。
+6. **防盗链/限速**：将 `PUBLIC_READ` 设为 `false`，或在 Cloudflare WAF 里对 Referer / 速率做限制，避免被刷量虽然流量免费但请求数计费。
+7. **定期轮换**：Application Key、Basic 口令建议定期更换；更换 Secret 后 `wrangler deploy` 使其生效。
+8. **不要用 `$path`/`$host` 模式对外提供匿名服务**：这两种模式等于把该密钥可见的所有桶都暴露出来。
+
+---
+
+## 10. 故障排查
+
+| 现象 | 原因 / 处理 |
+| --- | --- |
+| 全部请求返回 `SignatureDoesNotMatch` | `B2_ENDPOINT` 与 `B2_REGION` 不对应；或 keyID/applicationKey 复制错误/带了空格；确认 Key 有该桶权限 |
+| `AuthorizationQueryParametersError` / presign 403 | 预签名 URL 过期（`PRESIGN_EXPIRES`）；或客户端改了 URL 参数 |
+| `AuthorizationHeaderMalformed` | 端点前缀多写了 `/`、或 region 推导错误 → 显式设置 `B2_REGION` |
+| PUT 预签名上传 400/403 | 缺少 `x-amz-content-sha256: UNSIGNED-PAYLOAD` 头，或 Content-Type 与预签名时的 `ct` 不一致 |
+| 浏览器上传报"网络错误" | B2 桶 CORS 未允许你的 Origin / `s3_put` / `x-amz-content-sha256` |
+| 删除后再列举仍可见 | B2 可能存在延迟；另外带斜杠的"目录"是 `.keep` 占位对象，需一并删除 |
+| 下载大文件慢或超时 | 开 `ALLOW_REDIRECT=true`，用 `/<key>?redirect=1` 走 302 直连 B2 |
+| 视频无法拖动进度 | 源响应缺 `Accept-Ranges` 时已自动补；确认客户端带了 Range 且 Worker 未被中间件剥离 |
+| 命中不了缓存 | Range / Authorization 请求不缓存；URL 上的查询串会成为缓存键；`CACHE_MAX_AGE=0` 时不写缓存 |
+| 目录列表 403 | `ALLOW_LIST_BUCKET=false` 且未带鉴权；加 Basic/Bearer 即可 |
+| `$path` 模式全部 400 | URL 第一段缺失，访问 `https://host/<bucket>/<key>` 或带 `?bucket=` 走 API |
+| TS/构建报错 `.html` | 与本项目无关：那是 CF-Proxy-B2 的问题（详见 README 分析章节） |
+
+排错利器：
+
+```bash
+npx wrangler tail                         # 实时日志
+curl -u admin:pass https://<host>/__api/health
+curl -I https://<host>/some/key.jpg       # 看 X-B2-Cache / Accept-Ranges / Cache-Control
+```

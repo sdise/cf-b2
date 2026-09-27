@@ -1,0 +1,15 @@
+# 本地开发用（把本文件复制为 .dev.vars，永远不要提交到 Git）
+# 生产环境请用 `npx wrangler secret put XXX`
+
+# Backblaze B2 Application Key ID（形如 0056xxxxxxxxxxxxxxxxxxxxx）
+B2_KEY_ID = "your-b2-key-id"
+
+# Backblaze B2 Application Key（形如 Kxxxxxxxxxxxxxxxxxxxxxxxxxx）
+B2_APPLICATION_KEY = "your-b2-application-key"
+
+# 管理端 Basic 认证（两者都要配）
+ADMIN_USER = "admin"
+ADMIN_PASS = "change-me-please"
+
+# 或者使用 Bearer 令牌（与 Basic 二选一即可，配置后优先级更高）
+# ADMIN_TOKEN = "a-random-long-token"

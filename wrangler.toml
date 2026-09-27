@@ -1,0 +1,85 @@
+# =============================================================
+# cf-b2-worker · Wrangler 配置
+# 部署：npx wrangler deploy
+# 本地：npx wrangler dev
+# 密钥类变量不要写在这里，用 `npx wrangler secret put XXX` 设置
+# =============================================================
+
+name = "cf-b2-worker"
+main = "src/b2-worker.js"
+compatibility_date = "2024-11-01"
+
+# ---------- 自定义域名 / 路由（三选一，按需打开）----------
+# 方式 A：Workers 的 workers.dev 子域（默认就有，无需配置）
+workers_dev = true
+
+# 方式 B：Cloudflare 托管域名上的自定义子域（推荐，会自动创建 DNS 记录）
+# [[routes]]
+# pattern = "dl.example.com"
+# custom_domain = true
+
+# 方式 C：已有 DNS 记录的路由匹配
+# [[routes]]
+# pattern = "dl.example.com/*"
+# zone_name = "example.com"
+
+# ---------- 明文环境变量（非敏感）----------
+[vars]
+# Backblaze B2 的 S3 兼容端点，请换成你自己桶的 Endpoint（B2 控制台桶详情页可见）
+B2_ENDPOINT = "https://s3.us-west-001.backblazeb2.com"
+
+# 桶名。三种取值：
+#   "your-bucket"   固定桶（推荐）
+#   "$path"         由 URL 第一段决定桶名：https://host/<bucket>/<key>
+#   "$host"         由主机名第一段决定桶名：https://<bucket>.host/<key>
+BUCKET_NAME = "your-bucket-name"
+
+# 路径样式：path（推荐，兼容性最好）| virtual（<bucket>.s3.xxx.backblazeb2.com）
+URL_STYLE = "path"
+
+# 是否允许匿名读取对象
+PUBLIC_READ = "true"
+
+# 是否允许匿名列举目录
+ALLOW_LIST_BUCKET = "false"
+
+# 是否开启写 / 删 / Web 管理器
+ENABLE_WRITE = "true"
+ENABLE_DELETE = "true"
+ENABLE_MANAGE = "true"
+
+# 边缘缓存：0 表示不缓存
+CACHE_MAX_AGE = "86400"
+ENABLE_CACHE = "true"
+
+# 是否允许 ?redirect=1 302 跳转到预签名直链（大文件可绕过 Worker 流式转发）
+ALLOW_REDIRECT = "false"
+
+# 单个 proxy 上传大小上限（字节）。Workers 请求体上限为 100MB，更大请走直传/分片
+MAX_UPLOAD_BYTES = "104857600"
+
+# 预签名 URL 有效期（秒）
+PRESIGN_EXPIRES = "3600"
+
+# 超过该大小自动切换到 S3 分片上传（字节）
+MULTIPART_THRESHOLD = "104857600"
+MULTIPART_PART_SIZE = "26214400"
+
+# CORS 允许的 Origin，逗号分隔；* 表示全部（直传时需要包含你的站点域名）
+ALLOWED_ORIGINS = "*"
+
+# 上传时写入对象的 Cache-Control（留空表示不设置，使用 B2 桶默认）
+# UPLOAD_CACHE_CONTROL = "public, max-age=31536000, immutable"
+
+# 兼容 rclone --b2-download-url（去掉 URL 中 file/<bucket>/ 前缀）
+RCLONE_DOWNLOAD = "false"
+
+# 调试模式：出错时返回详细堆栈（生产环境请保持 false）
+DEBUG = "false"
+
+# ---------- 以下为密钥，禁止写进本文件 ----------
+# 用命令行设置：
+#   npx wrangler secret put B2_KEY_ID              # keyID / applicationKeyId
+#   npx wrangler secret put B2_APPLICATION_KEY     # applicationKey
+#   npx wrangler secret put ADMIN_PASS             # 管理口令（Basic）
+#   npx wrangler secret put ADMIN_TOKEN            # 管理令牌（Bearer，二选一）

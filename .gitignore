@@ -1,0 +1,7 @@
+node_modules/
+.wrangler/
+.dev.vars
+*.log
+
+# 若你的 wrangler.toml 内含真实桶信息，可取消下一行注释避免误提交
+# wrangler.toml
