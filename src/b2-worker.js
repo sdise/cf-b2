@@ -18,10 +18,11 @@
  *
  * 能力清单：
  *   · GET/HEAD 代理下载（Range 续传、条件请求、304、补偿 CF 丢失 content-range）
- *   · Cache API 边缘缓存 + Cache-Control 覆写 + 可选 302 直链跳转
+ *   · 下载强制经 Worker：不签发任何 GET 预签名直链，?dl=1 由 Worker 下发附件头
+ *   · Cache API 边缘缓存 + Cache-Control 覆写
  *   · 目录列表（HTML/JSON；$path、$host、固定桶三种模式）
- *   · 网页文件管理器：浏览/上传/下载/复制直链/删除/重命名/建目录
- *   · 预签名 URL（下载 / 直传 / response-content-disposition）
+ *   · 网页文件管理器：浏览/上传/下载（经 Worker）/删除/重命名/建目录
+ *   · 预签名 URL 仅用于「上传直传」与分片上传
  *   · S3 分片上传（create → part presign → complete / abort）
  *   · 访问控制：Basic/Bearer 恒定时间比较、公有读写开关、路径穿越防护、CORS 白名单
  *
@@ -367,7 +368,6 @@ function loadConfig(env) {
 
     cacheMaxAge: readInt(env.CACHE_MAX_AGE, 86400),
     useCache: readBool(env.ENABLE_CACHE, true),
-    allowRedirect: readBool(env.ALLOW_REDIRECT, false),
     rcloneDownload: readBool(env.RCLONE_DOWNLOAD, false),
 
     maxUploadBytes: readInt(env.MAX_UPLOAD_BYTES, 100 * 1024 * 1024),
@@ -550,15 +550,6 @@ async function readObject(request, env, ctx, cfg, bucket, key, options = {}) {
     }
   }
 
-  // 2) 可选：302 跳转预签名直链，把大文件流量完全交给 B2（会绕过 CF 缓存）
-  //    该 URL 内含端点、桶名与 keyID，故仅限已登录用户使用
-  if (cfg.allowRedirect && !anonymous && method === 'GET' && url.searchParams.get('redirect') === '1') {
-    const signed = await signerOf(cfg).sign('GET', upstreamUrl, {
-      headers: {}, unsignedPayload: true, expiresIn: cfg.presignExpires,
-    });
-    return Response.redirect(signed, 302);
-  }
-
   const forwardHeaders = {};
   for (const name of FORWARD_READ_HEADERS) {
     const value = request.headers.get(name);
@@ -613,6 +604,14 @@ async function readObject(request, env, ctx, cfg, bucket, key, options = {}) {
 
   const headers = responseHeaders;
   if (cfg.cacheMaxAge > 0) headers.set('Cache-Control', 'public, max-age=' + cfg.cacheMaxAge);
+
+  // 下载一律经 Worker：?dl=1 / ?download=1 时由 Worker 直接加附件头，不再签发预签名直链
+  if (url.searchParams.get('dl') === '1' || url.searchParams.get('download') === '1') {
+    headers.set(
+      'Content-Disposition',
+      "attachment; filename*=UTF-8''" + encodeURIComponent(key.split('/').pop() || 'download'),
+    );
+  }
   if (!headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes');
   headers.set('X-Content-Type-Options', 'nosniff');
   headers.delete('Set-Cookie');
@@ -881,17 +880,16 @@ async function apiRouter(request, env, ctx, cfg, url) {
       return json({ ok: true, bucket: targetBucket, ...result }, 200, request, cfg);
     }
 
-    /* ---- 预签名 URL ---- */
+    /* ---- 预签名 URL（仅用于上传直传；下载直链已禁用，必须经 Worker） ---- */
     case 'presign': {
       const key = normalizeKey(url.searchParams.get('key') || '');
       if (!key) return deny('缺少 key', request, cfg, 400);
       const isPut = (url.searchParams.get('type') || 'get') === 'put';
+      if (!isPut) {
+        return deny('已禁用预签名下载直链：下载必须经 Worker（访问 /<key> 或 /<key>?dl=1）', request, cfg, 403);
+      }
       const expires = readInt(url.searchParams.get('expires'), cfg.presignExpires);
       const query = {};
-      if (url.searchParams.get('download')) {
-        query['response-content-disposition'] =
-          "attachment; filename*=UTF-8''" + encodeURIComponent(key.split('/').pop());
-      }
       const signedUrl = await signerOf(cfg).sign(isPut ? 'PUT' : 'GET', objectUrl(cfg, targetBucket, key), {
         headers: isPut
           ? { 'content-type': url.searchParams.get('ct') || 'application/octet-stream' }
@@ -1211,8 +1209,12 @@ function managePage(cfg, url) {
     else defaultBucket = url.searchParams.get('bucket') || '';
   }
 
+  // 对象访问根路径（$path 模式会带桶名段），下载一律走这里，不再用预签名直链
+  const basePath = apiBase.slice(0, apiBase.lastIndexOf(API_PREFIX)) + '/';
+
   const configJson = JSON.stringify({
     apiBase,
+    basePath,
     defaultBucket,
     publicPrefix: cfg.publicPrefix,
     bucketMode: cfg.bucketMode,
@@ -1371,7 +1373,6 @@ function managePage(cfg, url) {
     '    rows += "<tr><td>" + esc(f.name) + "</td><td>" + size(f.size) + "</td>"',
     '      + "<td class=\\"muted\\">" + esc(f.lastModified) + "</td>"',
     '      + \'<td style="text-align:right">\'',
-    '      + \'<button class="mini" data-act="link" data-k="\' + k + \'">直链</button> \'',
     '      + \'<button class="mini" data-act="dl" data-k="\' + k + \'">下载</button> \'',
     '      + \'<button class="mini" data-act="ren" data-k="\' + k + \'">重命名</button> \'',
     '      + \'<button class="mini" data-act="del" data-k="\' + k + \'">删除</button>\'',
@@ -1551,19 +1552,7 @@ function managePage(cfg, url) {
     '      break;',
     '    case "dir": load(p); break;',
     '    case "dl":',
-    '      call("presign" + q({ key: k, type: "get", download: "1" })).then(function (r) {',
-    '        if (r.ok) window.open(r.data.url, "_blank"); else toast("预签名失败", true);',
-    '      });',
-    '      break;',
-    '    case "link":',
-    '      call("presign" + q({ key: k, type: "get" })).then(function (r) {',
-    '        if (!r.ok) { toast("预签名失败", true); return; }',
-    '        var ta = document.createElement("input");',
-    '        ta.value = r.data.url; document.body.appendChild(ta); ta.select();',
-    '        try { document.execCommand("copy"); toast("直链已复制（默认 1 小时有效）"); }',
-    '        catch (e) { window.prompt("复制这条直链", r.data.url); }',
-    '        document.body.removeChild(ta);',
-    '      });',
+    '      window.open(CFG.basePath + k.split("/").map(encodeURIComponent).join("/") + "?dl=1", "_blank");',
     '      break;',
     '    case "ren":',
     '      var target = window.prompt("重命名为：", k.split("/").pop());',

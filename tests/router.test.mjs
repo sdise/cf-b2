@@ -480,21 +480,43 @@ await check('管理员仍能看到上游错误细节用于排错', async () => {
   return '保留排错信息';
 });
 
-await check('匿名 ?redirect=1 不会拿到预签名 URL（含端点/keyID）', async () => {
-  const res = await handle(req('/share/photo.jpg?redirect=1'), { ...shareEnv, ALLOW_REDIRECT: 'true' }, ctx);
-  assert(res.status === 200, 'status=' + res.status);
-  assert(!(res.headers.get('location') || '').includes('X-Amz-Signature'), '匿名拿到了预签名直链');
-  return '已拒绝 302 直链';
-});
-
-await check('管理员 ?redirect=1 可拿到预签名直链', async () => {
+await check('?redirect=1 不再签发预签名直链（功能已移除）', async () => {
   const res = await handle(
     req('/private/photo.jpg?redirect=1', { headers: { Authorization: basic } }),
     { ...shareEnv, ALLOW_REDIRECT: 'true' }, ctx,
   );
-  assert(res.status === 302, 'status=' + res.status);
-  assert(res.headers.get('location').includes('X-Amz-Signature'), '缺少签名参数');
-  return '管理员可用';
+  assert(res.status === 200, 'status=' + res.status);
+  assert(!(res.headers.get('location') || '').includes('X-Amz-Signature'), '仍然拿到了预签名直链');
+  return '302 直链已移除，走 Worker 代理';
+});
+
+await check('预签名下载直链已被禁用（仅保留上传用 PUT）', async () => {
+  const get = await handle(
+    req('/__api/presign?key=share/a.txt&type=get', { headers: { Authorization: basic } }), shareEnv, ctx,
+  );
+  assert(get.status === 403, 'GET 预签名应被拒，实际 status=' + get.status);
+  const put = await handle(
+    req('/__api/presign?key=share/a.txt&type=put', { headers: { Authorization: basic } }), shareEnv, ctx,
+  );
+  assert(put.status === 200, 'PUT 预签名应保留，实际 status=' + put.status);
+  return 'get=403 / put=200';
+});
+
+await check('?dl=1 由 Worker 下发附件头（不泄露 B2 端点）', async () => {
+  const res = await handle(req('/share/' + encodeURIComponent('报告 2026.pdf') + '?dl=1'), shareEnv, ctx);
+  assert(res.status === 200, 'status=' + res.status);
+  const cd = res.headers.get('content-disposition') || '';
+  assert(cd.includes('attachment') && cd.includes('2026.pdf'), 'content-disposition=' + cd);
+  return cd;
+});
+
+await check('管理器不再出现「直链」按钮，下载走 Worker 路径', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(!page.includes('data-act=\\"link\\"'), '直链按钮仍在');
+  assert(!page.includes('data-act="link"'), '直链按钮仍在');
+  assert(page.includes('basePath'), '缺少 basePath 配置');
+  assert(page.includes('?dl=1'), '下载未改为 Worker 路径');
+  return '已移除';
 });
 
 await check('分片经 Worker 中继（PUT multipart/part）', async () => {

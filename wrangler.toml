@@ -67,13 +67,10 @@ ROOT_ACTION = "welcome"
 CACHE_MAX_AGE = "86400"
 ENABLE_CACHE = "true"
 
-# 是否允许 ?redirect=1 302 跳转到预签名直链（大文件可绕过 Worker 流式转发）
-ALLOW_REDIRECT = "false"
-
 # 单个 proxy 上传大小上限（字节）。Workers 请求体上限为 100MB，更大请走直传/分片
 MAX_UPLOAD_BYTES = "104857600"
 
-# 预签名 URL 有效期（秒）
+# 预签名 URL 有效期（秒）。仅用于「上传直传」；下载直链已强制禁用，必须经 Worker
 PRESIGN_EXPIRES = "3600"
 
 # 超过该大小自动切换到 S3 分片上传（字节）

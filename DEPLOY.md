@@ -280,14 +280,17 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
   "folders": ["photos/"], "truncated": false, "nextToken": "" }
 ```
 
-### `GET /__api/presign`
+> ⚠️ **下载必须经 Worker**：`type=get` 的预签名（即"B2 直链"）**已被强制禁用**，调用返回 403。
+> 下载请直接用 `GET /<key>`，需要另存为时加 `?dl=1`（Worker 会下发 `Content-Disposition: attachment`）。
+> 预签名仅保留给**上传直传**使用，这样端点/桶名/keyID 不再出现在任何下载链接里。
+
+### `GET /__api/presign`（仅上传）
 
 | 参数 | 说明 |
 | --- | --- |
 | `key` | 对象 key（必需） |
-| `type` | `get`（默认）或 `put` |
+| `type` | **只能 `put`**（`get` 已禁用 → 403） |
 | `expires` | 有效期秒数，默认 `PRESIGN_EXPIRES` |
-| `download=1` | 追加 `response-content-disposition: attachment` |
 | `ct` | `type=put` 时的 Content-Type，客户端 PUT 时必须使用同一个值 |
 
 返回：
@@ -355,8 +358,7 @@ curl -X PUT -T ./demo.bin \
 - 目录浏览、面包屑导航、翻页
 - 拖拽上传、进度条；超过 `MULTIPART_THRESHOLD` 自动切换分片上传
 - **主题切换**（按钮在右上角）：暖色（默认）/ 深色，选择记在 localStorage
-- 一键复制临时直链（预签名 GET，默认 1 小时）
-- 下载（带 `attachment` 的预签名链接）
+- 下载（走 Worker：`/<key>?dl=1`，由 Worker 下发 `Content-Disposition: attachment`；**不再提供 B2 直链**）
 - 重命名（服务端复制 + 删除）
 - 新建目录、删除文件/目录
 - 右上角输入 Basic 用户名/密码或 Bearer 令牌后点"鉴权"；若浏览器已完成 Basic 弹窗登录，通常无需再填
@@ -547,7 +549,7 @@ B2_KEY_ID=<keyID> B2_APP_KEY=<applicationKey> node tools/setup-b2-cors.mjs
 | 子请求数 | 免费套餐每次请求 50 个 | 正常读写为 1 个子请求；`multipart/complete` 会分页 ListParts，极多分片时略增 |
 | CPU 时间 | 免费套餐 10ms/请求 | SigV4 仅 4 次 HMAC + 若干 SHA-256，开销极小 |
 | Cache API 单对象 | 约 512MB | 更大的对象自动跳过缓存（不报错） |
-| 流式响应 | 长时间流式可控，但大文件建议用 `?redirect=1` 走 302 | 见 `ALLOW_REDIRECT` |
+| 流式响应 | 下载统一经 Worker 流式回源；大文件建议配合 CDN 缓存与 Range | 见 `CACHE_MAX_AGE` |
 | SigV4 有效期 | 签名 15 分钟内有效（由 `x-amz-date` 决定） | 无需处理，签名即时生成 |
 | B2 分片规则 | 除最后一片外每片 ≥5MB，最多 10000 片 | 调大 `MULTIPART_PART_SIZE` |
 
