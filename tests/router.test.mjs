@@ -82,6 +82,7 @@ const env = {
   ADMIN_PASS: 'secret-pass',
   ALLOW_LIST_BUCKET: 'true',
   PUBLIC_READ: 'true',
+  PUBLIC_PREFIX: '',        // 留空 = 旧行为（整桶匿名可读）
   CACHE_MAX_AGE: '60',
 };
 
@@ -243,6 +244,79 @@ await check('分片上传 create/complete 链路', async () => {
   return 'uploadId=' + created.uploadId + ' parts=' + done.parts;
 });
 
+/* ---------- 匿名只读 share 前缀 / 管理员全权限 ---------- */
+const shareEnv = { ...env, ALLOW_LIST_BUCKET: 'false', PUBLIC_PREFIX: 'share', PUBLIC_LIST: 'true' };
+
+await check('匿名访问根路径自动路由到 /share/', async () => {
+  const res = await handle(req('/'), shareEnv, ctx);
+  assert(res.status === 302, 'status=' + res.status);
+  assert(res.headers.get('location') === 'https://dl.example.com/share/', 'location=' + res.headers.get('location'));
+  return res.headers.get('location');
+});
+
+await check('匿名可读 share 前缀内的对象', async () => {
+  const res = await handle(req('/share/photo.jpg'), shareEnv, ctx);
+  assert(res.status === 200, 'status=' + res.status);
+  const sent0 = sent[sent.length - 1];
+  assert(sent0.url.endsWith('/my-bucket/share/photo.jpg'), 'url=' + sent0.url);
+  return sent0.url;
+});
+
+await check('匿名读取 share 之外的对象被拒', async () => {
+  const res = await handle(req('/private/secret.txt'), shareEnv, ctx);
+  const body = await res.json();
+  assert(res.status === 403 && body.ok === false, 'status=' + res.status);
+  return body.error;
+});
+
+await check('匿名无法读取 share 同名的平行路径（sharex.txt）', async () => {
+  const res = await handle(req('/sharex.txt'), shareEnv, ctx);
+  assert(res.status === 403, 'status=' + res.status);
+  return '403（未越权命中 share 前缀）';
+});
+
+await check('匿名可列举 /share/ 目录', async () => {
+  const res = await handle(req('/share/'), shareEnv, ctx);
+  assert(res.status === 200 && res.headers.get('content-type').includes('text/html'), 'status=' + res.status);
+  return 'HTML ok';
+});
+
+await check('匿名列举其它目录被拒', async () => {
+  const res = await handle(req('/private/'), shareEnv, ctx);
+  assert(res.status === 403, 'status=' + res.status);
+  return '403';
+});
+
+await check('管理员可读取 share 之外的对象', async () => {
+  const res = await handle(req('/private/secret.txt', { headers: { Authorization: basic } }), shareEnv, ctx);
+  assert(res.status === 200, 'status=' + res.status);
+  const sent0 = sent[sent.length - 1];
+  return sent0.url;
+});
+
+await check('管理员访问根路径列全桶（不跳转）', async () => {
+  const res = await handle(req('/', { headers: { Authorization: basic } }), shareEnv, ctx);
+  assert(res.status === 200, 'status=' + res.status);
+  const body = await res.text();
+  assert(body.includes('readme.txt'), '管理员应能列出全桶内容');
+  return '全桶列表';
+});
+
+await check('匿名写操作仍然被拒', async () => {
+  const res = await handle(req('/share/hack.txt', { method: 'PUT', body: 'x' }), shareEnv, ctx);
+  assert(res.status === 401, 'status=' + res.status);
+  return '401';
+});
+
+await check('管理员可在 share 之外写入', async () => {
+  const res = await handle(
+    req('/private/ok.txt', { method: 'PUT', body: 'x', headers: { Authorization: basic } }), shareEnv, ctx,
+  );
+  const body = await res.json();
+  assert(res.status === 200 && body.ok === true, 'status=' + res.status);
+  return '已写入 /private/ok.txt';
+});
+
 /* ---------- $path 多桶模式 ---------- */
 const pathEnv = { ...env, BUCKET_NAME: '$path' };
 
@@ -281,6 +355,29 @@ await check('$path 模式：缺失桶名时明确报错', async () => {
   const body = await res.json();
   assert(res.status === 400 && body.ok === false, 'status=' + res.status);
   return body.error;
+});
+
+await check('匿名根目录：默认返回 403 JSON', async () => {
+  const res = await handle(req('/'), { ...env, ALLOW_LIST_BUCKET: 'false' }, ctx);
+  const body = await res.json();
+  assert(res.status === 403 && body.ok === false, 'status=' + res.status);
+  return body.error;
+});
+
+await check('匿名根目录：ROOT_ACTION=redirect 跳转管理器', async () => {
+  const res = await handle(req('/'), { ...env, ALLOW_LIST_BUCKET: 'false', ROOT_ACTION: 'redirect' }, ctx);
+  assert(res.status === 302, 'status=' + res.status);
+  assert(res.headers.get('location') === 'https://dl.example.com/__manage', 'location=' + res.headers.get('location'));
+  return res.headers.get('location');
+});
+
+await check('匿名根目录：ROOT_ACTION=welcome 渲染引导页', async () => {
+  const res = await handle(req('/'), { ...env, ALLOW_LIST_BUCKET: 'false', ROOT_ACTION: 'welcome' }, ctx);
+  const body = await res.text();
+  assert(res.status === 200, 'status=' + res.status);
+  assert(res.headers.get('content-type').includes('text/html'), '非 HTML');
+  assert(body.includes('Backblaze B2 资源网关') && body.includes('my-bucket'), '内容不完整');
+  return 'HTML ' + body.length + ' bytes';
 });
 
 await check('管理器内嵌前端 JS 可解析', async () => {

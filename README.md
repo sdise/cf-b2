@@ -131,6 +131,7 @@ cron(每周) → b2_authorize_account → b2_get_download_authorization(validDur
 
 | 类别 | 说明 |
 | --- | --- |
+| 权限模型 | 匿名只读 `/share/`（`PUBLIC_PREFIX` 可配）、访问根路径自动跳转 `/share/`；管理员可读写删全桶 |
 | 下载代理 | `GET/HEAD /<key>`，支持 Range、`If-*` 条件请求、304、`Accept-Ranges` |
 | 边缘缓存 | `ENABLE_CACHE=true` 时使用 Cache API，命中返回头 `X-B2-Cache: HIT` |
 | 直链跳转 | `ALLOW_REDIRECT=true` 时 `GET /<key>?redirect=1` 返回 302 到预签名 URL |

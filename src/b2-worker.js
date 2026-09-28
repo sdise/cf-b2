@@ -251,6 +251,29 @@ class SigV4 {
 
 /* ============================ 3. 配置加载 ============================ */
 
+/** 前缀归一化：去掉首尾斜杠，中间保留；结果为空串表示"不限制" */
+function normalizePrefix(value) {
+  if (value === undefined || value === null) return '';
+  return String(value).trim().replace(/^\/+/, '').replace(/\/+$/, '');
+}
+
+/** key/prefix 是否位于指定前缀内（share 与 share/a.txt 均算命中） */
+function withinPrefix(key, prefix) {
+  if (!prefix) return true;
+  const target = String(key || '');
+  return target === prefix || target.startsWith(prefix + '/');
+}
+
+/** 拼出带尾斜杠的前缀，用于生成链接 */
+function prefixWithSlash(prefix) {
+  return prefix ? prefix + '/' : '';
+}
+
+/** 公开目录的基础路径（$path 模式下需要带上桶名段） */
+function publicBase(cfg, bucket) {
+  return cfg.bucketMode === 'path' ? '/' + bucket + '/' : '/';
+}
+
 function loadConfig(env) {
   const rawEndpoint = String(env.B2_ENDPOINT || DEFAULT_ENDPOINT).trim().replace(/\/+$/, '');
   const endpoint = new URL(rawEndpoint);
@@ -280,10 +303,16 @@ function loadConfig(env) {
 
     publicRead: readBool(env.PUBLIC_READ, true),
     publicWrite: readBool(env.PUBLIC_WRITE, false),
+    // 匿名可读写的对象前缀；留空表示整个桶匿名可读（旧行为）
+    publicPrefix: normalizePrefix(env.PUBLIC_PREFIX === undefined ? 'share' : env.PUBLIC_PREFIX),
+    publicList: readBool(env.PUBLIC_LIST, true),
     allowList: readBool(env.ALLOW_LIST_BUCKET, false),
     enableWrite: readBool(env.ENABLE_WRITE, true),
     enableDelete: readBool(env.ENABLE_DELETE, true),
     enableManage: readBool(env.ENABLE_MANAGE, true),
+    // 匿名访问目录时的行为：deny(返回403 JSON，默认) | redirect(302到管理器) | welcome(渲染引导页)
+    rootAction: ['deny', 'redirect', 'welcome'].includes(String(env.ROOT_ACTION || 'deny').toLowerCase())
+      ? String(env.ROOT_ACTION).toLowerCase() : 'deny',
 
     cacheMaxAge: readInt(env.CACHE_MAX_AGE, 86400),
     useCache: readBool(env.ENABLE_CACHE, true),
@@ -758,6 +787,7 @@ async function apiRouter(request, env, ctx, cfg, url) {
       bucketMode: cfg.bucketMode,
       region: cfg.region,
       publicRead: cfg.publicRead,
+      publicPrefix: cfg.publicPrefix || '',
       authenticated: (await checkAuth(request, cfg)).ok,
     }, 200, request, cfg);
   }
@@ -971,6 +1001,40 @@ function renderDirectory(data, prefix, base, bucketLabel) {
   ].join('\n');
 }
 
+/** 匿名访问未被授权目录时的引导页（ROOT_ACTION=welcome） */
+function welcomePage(cfg, bucketLabel, prefix, publicPath) {
+  const manageUrl = MANAGE_PATH;
+  const shareUrl = publicPath || '/';
+  return [
+    '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<title>B2 资源网关</title>',
+    '<style>',
+    'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}',
+    '.card{max-width:560px;padding:32px 36px;background:#161a22;border:1px solid #222836;border-radius:14px}',
+    'h1{font-size:19px;margin:0 0 10px}p{color:#8b93a7;line-height:1.7;font-size:14px;margin:6px 0}',
+    'code{background:#1d222d;padding:2px 6px;border-radius:5px;color:#7cc4ff}',
+    'a{color:#4c8dff}.btn{display:inline-block;margin-top:18px;padding:9px 16px;background:#4c8dff;color:#fff;border-radius:8px;text-decoration:none;font-size:14px}',
+    'ul{color:#8b93a7;font-size:13px;line-height:1.9;padding-left:18px}',
+    '</style></head><body><div class="card">',
+    '<h1>📦 Backblaze B2 资源网关</h1>',
+    '<p>服务已就绪。请通过<strong>完整对象路径</strong>访问资源：</p>',
+    '<p>根路径 <code>/</code> 的目录浏览未对匿名开放。</p>',
+    '<ul>',
+    (cfg.publicPrefix
+      ? '<li>公开目录：<a href="' + shareUrl + '"><code>' + shareUrl + '</code></a>（匿名可直接下载）</li>'
+        + '<li>其他目录需登录后访问：<a href="' + manageUrl + '">打开 ' + manageUrl + '</a></li>'
+      : '<li>匿名下载：<code>/&lt;对象key&gt;</code>，例如 <code>/photos/a.jpg</code></li>'
+        + '<li>可视化管理：<a href="' + manageUrl + '">打开 ' + manageUrl + '</a></li>'),
+    '</ul>',
+    '<p style="margin-top:14px">当前桶：<code>' + escapeHtml(bucketLabel) + '</code>'
+      + (prefix ? ' · 前缀 <code>' + escapeHtml(prefix) + '</code>' : '')
+      + ' · 区域 <code>' + escapeHtml(cfg.region) + '</code></p>',
+    '<a class="btn" href="' + manageUrl + '">进入文件管理器</a>',
+    '</div></body></html>',
+  ].join('\n');
+}
+
 /* ============================ 8. 文件管理器页面 ============================ */
 
 function managePage(cfg, url) {
@@ -989,6 +1053,7 @@ function managePage(cfg, url) {
   const configJson = JSON.stringify({
     apiBase,
     defaultBucket,
+    publicPrefix: cfg.publicPrefix,
     bucketMode: cfg.bucketMode,
     bucketFixed: cfg.bucketFixed,
     hasToken: Boolean(cfg.adminToken),
@@ -1325,7 +1390,8 @@ function managePage(cfg, url) {
     'dz.addEventListener("drop", function (e) {',
     '  if (e.dataTransfer && e.dataTransfer.files) uploadFiles(e.dataTransfer.files);',
     '});',
-    'el("capHint").textContent = "直传不受 Workers 限制；超过 " + size(CFG.multipartThreshold) + " 自动启用分片上传";',
+    'el("capHint").textContent = "直传不受 Workers 限制；超过 " + size(CFG.multipartThreshold) + " 自动启用分片上传"',
+    '  + (CFG.publicPrefix ? "；匿名只读目录: /" + CFG.publicPrefix + "/" : "") + "（登录后可管理全部文件）";',
     'el("bucketLabel").textContent = CFG.bucketMode === "fixed"',
     '  ? ("桶: " + CFG.bucketFixed)',
     '  : (CFG.bucketMode === "path" ? "桶: 按 URL 首段动态解析" : "桶: 按主机名首段动态解析");',
@@ -1375,13 +1441,34 @@ async function handle(request, env, ctx) {
   switch (request.method) {
     case 'GET':
     case 'HEAD': {
+      /* 统一的访问口径：
+       *   管理员（Basic/Bearer 通过）   → 全部权限
+       *   匿名                          → 只能读/列 PUBLIC_PREFIX（默认 share）以内，其余拒绝
+       *                                  且访问根路径自动 302 到 /<PUBLIC_PREFIX>/
+       */
+      const auth = await checkAuth(request, cfg);
+      const isAdmin = auth.ok;
+      const anonymous = !isAdmin;
+      const publicPath = publicBase(cfg, bucket) + prefixWithSlash(cfg.publicPrefix);
+
       if (resolved.isDir) {
         // 目录 → 列表（HTML 或 JSON）
-        const auth = await checkAuth(request, cfg);
         const prefix = normalizeKey(
           url.searchParams.get('prefix') || (resolved.key ? resolved.key + '/' : ''),
         );
-        if (!cfg.allowList && !auth.ok) {
+        // 匿名列举：只允许在公开前缀内（PUBLIC_LIST），或全局开放 ALLOW_LIST_BUCKET
+        const anonymousListingOk = anonymous && cfg.publicRead
+          && ((cfg.publicPrefix && cfg.publicList && withinPrefix(prefix, cfg.publicPrefix)) || cfg.allowList);
+
+        if (!isAdmin && !cfg.allowList && !anonymousListingOk) {
+          // 匿名访问根路径 → 自动路由到公开目录
+          if (!prefix && cfg.publicPrefix) {
+            return Response.redirect(new URL(publicPath, url.origin).toString(), 302);
+          }
+          if (cfg.rootAction === 'welcome') return html(welcomePage(cfg, bucket, prefix, publicPath));
+          if (cfg.rootAction === 'redirect') {
+            return Response.redirect(new URL(MANAGE_PATH, url.origin).toString(), 302);
+          }
           return json(
             { ok: false, error: '目录列举未开放（ALLOW_LIST_BUCKET=false），请带鉴权访问' },
             403, request, cfg,
@@ -1401,10 +1488,20 @@ async function handle(request, env, ctx) {
         return html(renderDirectory(result, prefix, base, bucket));
       }
 
-      if (!cfg.publicRead) {
-        const auth = await checkAuth(request, cfg);
-        if (!auth.ok) return challenge(request, cfg);
+      if (!resolved.key) return deny('缺少对象 key', request, cfg, 400);
+
+      if (anonymous) {
+        if (!cfg.publicRead) {
+          return json({ ok: false, error: '该对象需要登录后访问' }, 403, request, cfg);
+        }
+        if (!withinPrefix(resolved.key, cfg.publicPrefix)) {
+          return json({
+            ok: false,
+            error: '匿名只能访问公开目录 ' + publicPath + '，请登录后访问其他对象',
+          }, 403, request, cfg);
+        }
       }
+
       return readObject(request, env, ctx, cfg, bucket, applyRclone(cfg, resolved.key));
     }
 

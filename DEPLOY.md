@@ -139,20 +139,37 @@ npx wrangler tail
 | `ADMIN_TOKEN` | **Secret** | 空 | Bearer 令牌。存在时优先级高于 Basic |
 | `PUBLIC_READ` | vars | `true` | 是否允许匿名读取对象；`false` 时 GET/HEAD 也需要鉴权 |
 | `PUBLIC_WRITE` | vars | `false` | 是否允许匿名写入；谨慎开启，等于开放网盘 |
-| `ALLOW_LIST_BUCKET` | vars | `false` | 是否允许**匿名**列举目录。鉴权用户始终可列举 |
+| `PUBLIC_PREFIX` | vars | `share` | **匿名只读前缀**。非空时匿名只能下载该前缀下的对象，其余一律 403；访问根路径自动 302 到 `/<前缀>/`。留空＝整桶匿名可读（旧行为） |
+| `PUBLIC_LIST` | vars | `true` | 是否允许匿名列举 `PUBLIC_PREFIX` 目录（做公开目录索引） |
+| `ALLOW_LIST_BUCKET` | vars | `false` | 是否允许匿名列举**任意**目录。管理员始终可列举全桶 |
 | `ENABLE_WRITE` | vars | `true` | 总写开关，关闭后所有 PUT/POST 变 403/405 |
 | `ENABLE_DELETE` | vars | `true` | 总删开关 |
 | `ENABLE_MANAGE` | vars | `true` | 是否开放 `/__manage` 网页管理器 |
+| `ROOT_ACTION` | vars | `deny` | 匿名访问目录时的响应：`deny` 返回 403 JSON、`welcome` 渲染引导页（推荐）、`redirect` 302 跳到 `/__manage` |
 | `ALLOWED_ORIGINS` | vars | `*` | CORS 白名单，逗号分隔完整 Origin，例如 `https://a.com,https://b.com` |
 
 **鉴权判定的优先级：**
 
 ```
 PUBLIC_WRITE=true            → 直接放行所有写删（强烈不建议）
-Bearer ADMIN_TOKEN 匹配      → 放行
-Basic ADMIN_USER/ADMIN_PASS  → 放行
-两者都未配置                 → 默认拒绝（fail-closed）
+Bearer ADMIN_TOKEN 匹配      → 管理员
+Basic ADMIN_USER/ADMIN_PASS  → 管理员
+两者都未配置                 → 写删默认拒绝（fail-closed）
 ```
+
+### 3.2.1 匿名 vs 管理员
+
+| 操作 | 匿名 | 管理员（登录） |
+| --- | --- | --- |
+| 读取 `/<PUBLIC_PREFIX>/**` | ✅ | ✅ |
+| 读取其它 key | ❌ 403 | ✅ |
+| 列举 `/<PUBLIC_PREFIX>/` | ✅（`PUBLIC_LIST=true` 时） | ✅ |
+| 列举其它目录 | ❌ 403 | ✅ |
+| 访问根路径 `/` | 302 → `/<PUBLIC_PREFIX>/` | 正常列出全桶 |
+| 上传 / 删除 / 重命名 / 建目录 / API | ❌ 401 | ✅ |
+
+> 前缀匹配是**目录级**的：`share` 与 `share/a/b.jpg` 命中，`sharex.txt` 不命中。
+> 把 `PUBLIC_PREFIX` 设为空字符串即可恢复"整桶匿名可读"的旧行为。
 
 ### 3.3 性能与缓存
 
@@ -191,6 +208,8 @@ Basic ADMIN_USER/ADMIN_PASS  → 放行
 | `/<key>` | GET / HEAD | 下载对象（支持 Range、条件请求） |
 | `/<key>` | PUT | 经 Worker 上传（需鉴权，`ENABLE_WRITE`） |
 | `/<key>` | DELETE | 删除对象（需鉴权，`ENABLE_DELETE`） |
+| `/` | GET | 匿名 → 302 到 `/<PUBLIC_PREFIX>/`（默认 `/share/`）；管理员 → 列出全桶 |
+| `/share/<key>` | GET | 匿名可直接下载的公开对象；`/share/` 可作为公开目录索引 |
 | `/<prefix>/` | GET | 目录列表（HTML；`?format=json` 返回 JSON；`?cursor=` 翻页；`?limit=` 每页条数） |
 | `/__manage` | GET | 网页文件管理器（需鉴权） |
 | `/<bucket>/__manage` | GET | `$path` 模式下的管理器，自动把 API 前缀带上桶名 |
@@ -382,6 +401,7 @@ b2 update-bucket --corsRules '[
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
+| 访问根域名显示 `目录列举未开放（ALLOW_LIST_BUCKET=false）` | **预期行为**，不是故障：根路径＝目录列举，默认不允许匿名枚举。三种选择：① 直接访问具体对象 `/<key>`（公开读已生效）；② 先访问 `/__manage` 用 Basic 登录，浏览器缓存凭据后根路径即可列出；③ 设置 `ROOT_ACTION=welcome` 渲染引导页，或 `ROOT_ACTION=redirect` 直接跳转管理器；确实要公开枚举才设 `ALLOW_LIST_BUCKET=true` |
 | 全部请求返回 `SignatureDoesNotMatch` | `B2_ENDPOINT` 与 `B2_REGION` 不对应；或 keyID/applicationKey 复制错误/带了空格；确认 Key 有该桶权限 |
 | `AuthorizationQueryParametersError` / presign 403 | 预签名 URL 过期（`PRESIGN_EXPIRES`）；或客户端改了 URL 参数 |
 | `AuthorizationHeaderMalformed` | 端点前缀多写了 `/`、或 region 推导错误 → 显式设置 `B2_REGION` |

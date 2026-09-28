@@ -40,13 +40,28 @@ URL_STYLE = "path"
 # 是否允许匿名读取对象
 PUBLIC_READ = "true"
 
-# 是否允许匿名列举目录
+# 匿名只读目录（公开分享目录）：未登录用户只能下载该前缀下的文件，
+# 其余 key 一律 403；访问根路径会自动 302 跳到这里
+# 留空表示不做前缀限制（整桶匿名可读）
+PUBLIC_PREFIX = "share"
+
+# 是否允许匿名列举 PUBLIC_PREFIX 目录（做成公开目录索引）
+PUBLIC_LIST = "true"
+
+# 是否允许匿名列举任意目录（关闭后，匿名只能看 PUBLIC_PREFIX 内的列表）
 ALLOW_LIST_BUCKET = "false"
 
 # 是否开启写 / 删 / Web 管理器
 ENABLE_WRITE = "true"
 ENABLE_DELETE = "true"
 ENABLE_MANAGE = "true"
+
+# 匿名访问无权查看的目录时的响应：
+#   welcome  = 渲染引导页（推荐，访客友好的用法说明）
+#   redirect = 302 跳到 /__manage（会弹出 Basic 登录框）
+#   deny     = 返回 403 JSON
+# 注意：访问根路径时，若 PUBLIC_PREFIX 非空，优先 302 到 /<PUBLIC_PREFIX>/
+ROOT_ACTION = "welcome"
 
 # 边缘缓存：0 表示不缓存
 CACHE_MAX_AGE = "86400"
