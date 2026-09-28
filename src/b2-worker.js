@@ -150,6 +150,16 @@ function normalizeKey(key) {
   return out.join('/');
 }
 
+/**
+ * 目录前缀：归一化后**必须保留尾斜杠**。
+ * ListObjectsV2 要求 prefix 以 / 结尾，否则 "share" 下的对象会被折叠成单个
+ * CommonPrefix "share/"，导致文件列表为空、只剩一个无名"目录"。
+ */
+function dirPrefix(value) {
+  const normalized = normalizeKey(value);
+  return normalized ? normalized + '/' : '';
+}
+
 /* ============================ 2. AWS Signature V4 ============================ */
 
 class SigV4 {
@@ -862,7 +872,7 @@ async function apiRouter(request, env, ctx, cfg, url) {
     /* ---- 列举 ---- */
     case 'list': {
       const result = await listObjects(cfg, targetBucket, {
-        prefix: normalizeKey(url.searchParams.get('prefix') || ''),
+        prefix: dirPrefix(url.searchParams.get('prefix') || ''),
         delimiter: url.searchParams.get('recursive') === '1' ? '' : '/',
         limit: readInt(url.searchParams.get('limit'), 1000),
         cursor: url.searchParams.get('cursor') || '',
@@ -1686,7 +1696,7 @@ async function handle(request, env, ctx) {
 
       if (resolved.isDir) {
         // 目录 → 列表（HTML 或 JSON）
-        const prefix = normalizeKey(
+        const prefix = dirPrefix(
           url.searchParams.get('prefix') || (resolved.key ? resolved.key + '/' : ''),
         );
         // 匿名列举：只允许在公开前缀内（PUBLIC_LIST），或全局开放 ALLOW_LIST_BUCKET

@@ -28,16 +28,17 @@ globalThis.fetch = async (request, init) => {
   const url = new URL(target.url);
   request = target;
 
-  // ListObjectsV2
+  // ListObjectsV2：按请求里的 prefix 生成内容，便于验证前缀处理
   if (request.method === 'GET' && url.searchParams.get('list-type') === '2') {
+    const p = url.searchParams.get('prefix') || '';
     return new Response(
       '<?xml version="1.0" encoding="UTF-8"?>'
       + '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">'
-      + '<Name>my-bucket</Name><Prefix>docs/</Prefix><KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys>'
+      + '<Name>my-bucket</Name><Prefix>' + p + '</Prefix><KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys>'
       + '<Delimiter>/</Delimiter><IsTruncated>false</IsTruncated>'
-      + '<Contents><Key>docs/readme.txt</Key><LastModified>2026-09-27T10:00:00.000Z</LastModified>'
+      + '<Contents><Key>' + p + 'a.txt</Key><LastModified>2026-09-27T10:00:00.000Z</LastModified>'
       + '<ETag>&quot;abc123&quot;</ETag><Size>1024</Size><StorageClass>STANDARD</StorageClass></Contents>'
-      +       '<CommonPrefixes><Prefix>docs/img/</Prefix></CommonPrefixes>'
+      +       '<CommonPrefixes><Prefix>' + p + 'sub/</Prefix></CommonPrefixes>'
       + '</ListBucketResult>',
       { status: 200, headers: { 'Content-Type': 'application/xml' } },
     );
@@ -186,7 +187,7 @@ await check('目录列表 HTML', async () => {
   const res = await handle(req('/docs/'), env, ctx);
   const body = await res.text();
   assert(res.headers.get('content-type').includes('text/html'), 'content-type 非 HTML');
-  assert(body.includes('readme.txt') && body.includes('img'), '列表未包含预期条目');
+  assert(body.includes('a.txt') && body.includes('sub'), '列表未包含预期条目');
   return 'readme.txt / img';
 });
 
@@ -195,7 +196,7 @@ await check('目录列表 JSON', async () => {
   const body = await res.json();
   assert(body.ok === true, JSON.stringify(body).slice(0, 120));
   assert(body.files.length === 1 && body.files[0].size === 1024, 'files 解析异常');
-  assert(body.folders[0] === 'docs/img/', 'folders 解析异常');
+  assert(body.folders[0] === 'docs/sub/', 'folders 解析异常');
   return JSON.stringify({ files: body.files.length, folders: body.folders });
 });
 
@@ -320,7 +321,7 @@ await check('管理员访问根路径列全桶（不跳转）', async () => {
   const res = await handle(req('/', { headers: { Authorization: basic } }), shareEnv, ctx);
   assert(res.status === 200, 'status=' + res.status);
   const body = await res.text();
-  assert(body.includes('readme.txt'), '管理员应能列出全桶内容');
+  assert(body.includes('a.txt'), '管理员应能列出全桶内容');
   return '全桶列表';
 });
 
@@ -353,7 +354,7 @@ await check('$path 模式：目录列表与桶前缀 API', async () => {
   const res = await handle(req('/my-bucket/docs/', { headers: { Authorization: basic } }), pathEnv, ctx);
   const body = await res.text();
   assert(res.headers.get('content-type').includes('text/html'), '非 HTML');
-  assert(body.includes('readme.txt'), '缺少条目');
+  assert(body.includes('a.txt'), '缺少条目');
   assert(body.includes('/my-bucket/__manage'), '管理员视图应给出带桶前缀的管理器入口');
 
   const api = await handle(
@@ -377,6 +378,35 @@ await check('$path 模式：缺失桶名时明确报错', async () => {
   const body = await res.json();
   assert(res.status === 400 && body.ok === false, 'status=' + res.status);
   return body.error;
+});
+
+await check('目录 prefix 必须带尾斜杠（否则子对象被折叠成一个无名目录）', async () => {
+  const res = await handle(req('/share/?format=json'), shareEnv, ctx);
+  const body = await res.json();
+  assert(body.prefix === 'share/', 'prefix=' + body.prefix);
+  assert(body.files.length === 1 && body.files[0].name === 'a.txt', JSON.stringify(body.files));
+  assert(body.folders[0] === 'share/sub/', JSON.stringify(body.folders));
+  const sent0 = sent[sent.length - 1];
+  assert(sent0.url.includes('prefix=share%2F'), '回源 prefix 未带尾斜杠: ' + sent0.url);
+  return body.prefix + ' → ' + body.files.length + ' 文件 / ' + body.folders.length + ' 目录';
+});
+
+await check('API list 的 prefix 同样补尾斜杠', async () => {
+  const res = await handle(
+    req('/__api/list?prefix=share', { headers: { Authorization: basic } }), shareEnv, ctx,
+  );
+  const body = await res.json();
+  assert(body.ok === true, JSON.stringify(body).slice(0, 120));
+  assert(body.files[0].key === 'share/a.txt', JSON.stringify(body.files));
+  return body.files[0].key;
+});
+
+await check('根目录列举 prefix 为空串（不误加斜杠）', async () => {
+  const res = await handle(req('/?format=json', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const body = await res.json();
+  assert(body.prefix === '', 'prefix=' + body.prefix);
+  assert(body.files[0].key === 'a.txt', JSON.stringify(body.files));
+  return "prefix=''";
 });
 
 await check('匿名根目录：默认返回 403 JSON', async () => {
@@ -420,7 +450,7 @@ await check('匿名目录列表不泄露桶名与管理器入口', async () => {
   const body = await res.text();
   assert(!body.includes('my-bucket'), '泄露了桶名');
   assert(!body.includes('__manage'), '匿名视图不应暴露管理器入口');
-  assert(body.includes('readme.txt'), '仍应正常列出文件');
+  assert(body.includes('a.txt'), '仍应正常列出文件');
   return '已脱敏';
 });
 
