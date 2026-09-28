@@ -2,6 +2,25 @@
 
 **Cloudflare Workers ⇄ Backblaze B2 一体化网关**：单文件、零依赖，自带 AWS Signature V4 实现和网页文件管理器。
 
+## 项目预览
+
+线上实例（Cloudflare Workers + Backblaze B2 私有桶）：
+
+| 入口 | 地址 | 说明 |
+| --- | --- | --- |
+| 站点首页 | https://b2.edgeoneai.cc.cd/ | 匿名访问根路径自动 302 到公开目录 `/share/` |
+| 公开目录 | https://b2.edgeoneai.cc.cd/share/ | 匿名可浏览 + 下载（？format=json 返回 JSON） |
+| 文件管理器 | https://b2.edgeoneai.cc.cd/__manage | Basic 鉴权后可上传/删除/重命名/建目录 |
+| 备用域名 | https://b2.mose19960101.workers.dev/ | 同一 Worker 的 `workers.dev` 入口 |
+| 健康检查 | https://b2.edgeoneai.cc.cd/__api/health | 匿名只返回最小信息，不含桶名/区域 |
+
+预览要点：
+
+- 桶 `axyz-bucket` 保持 **Private**，所有请求由 Worker 实时签 SigV4，客户端无需任何凭据
+- 匿名只能在 `/share/` 前缀内读取，其余路径 403；管理员登录后全桶可读写删
+- 下载**强制经 Worker**（不签发 B2 直链），`/<key>?dl=1` 触发附件下载
+- 上传支持「预签名直传」与「Worker 代理」两种，>100MB 自动分片；两个域名均已加入 B2 的 CORS 允许来源
+
 它是对下面两个项目的分析、对比与重写：
 
 | 上游项目 | 地址 | 一句话概括 |
