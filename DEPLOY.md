@@ -419,15 +419,15 @@ b2 account authorize
 b2 get-bucket <你的桶名>
 ```
 
-写一条规则。**注意 `allowedOperations` 里的 S3 操作名是这种带空格的人类可读写法**（我之前文档写 `s3_put` 是错的，B2 不认）：
+写一条规则。**`allowedOperations` 必须用小写下划线写法**（`s3_put` / `s3_get` / `s3_head` / `s3_delete`）：
 
 ```bash
 b2 update-bucket \
   --corsRules '[
     {
-      "corsRuleName": "allow-worker-upload",
+      "corsRuleName": "allow-worker-b2-upload",
       "allowedOrigins": ["https://b2.mose19960101.workers.dev"],
-      "allowedOperations": ["S3 Put Object", "S3 Get Object", "S3 Head Object"],
+      "allowedOperations": ["s3_put", "s3_get", "s3_head"],
       "allowedHeaders": ["content-type", "x-amz-content-sha256"],
       "exposeHeaders": ["ETag"],
       "maxAgeSeconds": 3600
@@ -435,6 +435,12 @@ b2 update-bucket \
   ]' \
   <你的桶名> allPrivate
 ```
+
+> ⚠️ **实测更正**：官方 CORS 文档把 S3 操作写成 `S3 Put Object` / `S3 Get Object` 这类带空格的形式，
+> 但 **API 实际会返回 `400 bad_request unknown allowedOperation value: S3 Put Object`**。
+> 真实可用值只有四个：`s3_put`、`s3_get`、`s3_head`、`s3_delete`（另有原生侧的
+> `b2_upload_file`、`b2_upload_part`、`b2_download_file_by_name`、`b2_download_file_by_id`）。
+> 可用 `tools/setup-b2-cors.mjs`（见 7.7）一键配置 + 自检。
 
 Windows PowerShell（建议写文件避免引号地狱）：
 
@@ -484,7 +490,7 @@ aws s3api get-bucket-cors --bucket <你的桶名> --endpoint-url https://s3.us-e
 | --- | --- |
 | `corsRuleName` | 必填，6–63 位，仅字母数字和连字符，桶内唯一，不能以 `b2-` 开头 |
 | `allowedOrigins` | 必填。`https://域名`、可带端口、`https://*.example.com` 通配、`https`（任意 https 源）、`*`（任意源；**有 `*` 时必须唯一**） |
-| `allowedOperations` | 必填，至少一项。S3 侧只能是：`S3 Put Object` / `S3 Get Object` / `S3 Head Object` / `S3 Delete Object`（**区分大小写、带空格**） |
+| `allowedOperations` | 必填，至少一项。S3 侧实际可用值：**`s3_put` / `s3_get` / `s3_head` / `s3_delete`**；原生侧：`b2_download_file_by_name` / `b2_download_file_by_id` / `b2_upload_file` / `b2_upload_part` |
 | `allowedHeaders` | 可选。`content-type`、`x-amz-content-sha256`，支持后缀通配 `x-bz-info-*`，或单个 `*` |
 | `exposeHeaders` | 可选，必须是完整头名（如 `ETag`） |
 | `maxAgeSeconds` | **必填**，0–86400 |
@@ -496,11 +502,40 @@ aws s3api get-bucket-cors --bucket <你的桶名> --endpoint-url https://s3.us-e
 2. F12 → Network：应当看到先 `OPTIONS`（返回 200/204 且带 `Access-Control-Allow-Origin`、`Access-Control-Allow-Headers`），随后 `PUT` 返回 200。
 3. 仍失败的话，看 Console 里的具体原因多半是：
    - `Request header field x-amz-content-sha256 is not allowed` → `allowedHeaders` 少了它（或直接用 `"allowedHeaders": ["*"]` 排错）
-   - `Method PUT is not allowed` → `allowedOperations` 少了 `S3 Put Object`
+   - `Method PUT is not allowed` → `allowedOperations` 少了 `s3_put`
+   - `400 unknown allowedOperation value: S3 Put Object` → 用了文档里的空格写法，改成 `s3_put`
+   - `The bucket contains B2 Native CORS rules. Please use B2 Native API instead.` → 该桶已用原生规则，S3 的 `PutBucketCors` 不可用，改用 `b2_update_bucket`
    - `No 'Access-Control-Allow-Origin' header` → `allowedOrigins` 没命中（记得带 `https://`，workers.dev 子域也要写全）
 
 > 只做**读取 / CDN 代理**时（请求都经 Worker 转发），浏览器不跨源，**不需要任何 B2 CORS 配置**。
 > 也可以不配 CORS：把界面上传方式切到「Worker 代理」，代价是 100MB/请求上限且大文件更慢。
+
+### 7.7 一键脚本（推荐，幂等可重复执行）
+
+```bash
+# 凭据只在环境变量里，不写进文件、不进 Git
+B2_KEY_ID=<keyID> B2_APP_KEY=<applicationKey> node tools/setup-b2-cors.mjs
+# 可选：B2_BUCKET=其他桶  B2_ORIGIN=https://你的自定义域  B2_DRY_RUN=1（只看不改）
+```
+
+脚本依次做：登录 → 找桶 → `b2_update_bucket` 写 `corsRules` → 尝试 S3 `PutBucketCors`（桶已有原生规则时会被拒，属正常）→ `GetBucketCors` 回读 → **模拟浏览器 `OPTIONS` 预检**，打印 `Access-Control-Allow-*`，最后给出 ✅/❌ 结论。
+
+对 `axyz-bucket` 的实际执行结果：
+
+```
+[6] 模拟浏览器 OPTIONS 预检
+    HTTP 200
+    access-control-allow-origin : https://b2.mose19960101.workers.dev
+    access-control-allow-methods: PUT
+    access-control-allow-headers: content-type,x-amz-content-sha256
+    access-control-max-age      : 3600
+✅ CORS 已放行该来源，管理器切回「直传」即可上传
+```
+
+当前桶上两条规则：
+
+1. `restore-download-any-https`：`https` 任意来源、`s3_get`/`s3_head`、`authorization`/`range`（桶上原有规则，已写回）
+2. `allow-worker-b2-upload`：仅 `https://b2.mose19960101.workers.dev`、`s3_put`/`s3_get`/`s3_head`、`content-type`/`x-amz-content-sha256`
 
 ---
 
