@@ -78,6 +78,9 @@ PRESIGN_EXPIRES = "3600"
 
 # 超过该大小自动切换到 S3 分片上传（字节）
 MULTIPART_THRESHOLD = "104857600"
+
+# 分片大小（字节）。B2 要求除最后一片外 ≥5MB；
+# 走「Worker 代理」上传时必须小于 MAX_UPLOAD_BYTES（前端会自动取两者较小值）
 MULTIPART_PART_SIZE = "26214400"
 
 # CORS 允许的 Origin，逗号分隔；* 表示全部（直传时需要包含你的站点域名）

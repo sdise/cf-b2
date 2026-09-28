@@ -190,7 +190,7 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 | `MAX_UPLOAD_BYTES` | `104857600`（100MB） | 经 Worker 代理上传的体积上限（Workers 硬上限就是 100MB） |
 | `PRESIGN_EXPIRES` | `3600` | 预签名 URL 有效期（秒） |
 | `MULTIPART_THRESHOLD` | `104857600` | 超过该体积自动走 S3 分片上传 |
-| `MULTIPART_PART_SIZE` | `26214400`（25MB） | 分片大小；B2 要求最后一片外其他片 ≥5MB |
+| `MULTIPART_PART_SIZE` | `26214400`（25MB） | 分片大小；B2 要求最后一片外其他片 ≥5MB。**Worker 代理模式下必须小于 `MAX_UPLOAD_BYTES`**（前端会自动取两者较小值并留出 1MB 余量） |
 | `RCLONE_DOWNLOAD` | `false` | 兼容 `rclone --b2-download-url`：剥掉 URL 中 `file/<bucket>/` 前缀 |
 
 ### 3.5 隐私收敛（防信息泄露）
@@ -326,7 +326,8 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 | 端点 | 参数 / body | 说明 |
 | --- | --- | --- |
 | `POST /__api/multipart/create?key=` | `{ "contentType": "video/mp4" }` | 返回 `{ uploadId }` |
-| `GET /__api/multipart/part?key=&uploadId=&partNumber=` | — | 返回该分片的预签名 PUT URL |
+| `GET /__api/multipart/part?key=&uploadId=&partNumber=` | — | 返回该分片的预签名 PUT URL（**直传**路径） |
+| `PUT /__api/multipart/part?key=&uploadId=&partNumber=` | 请求体＝分片内容 | 由 Worker 中继该分片到 B2（**代理**路径，无需 CORS，单片必须 < `MAX_UPLOAD_BYTES`） |
 | `POST /__api/multipart/complete?key=` | `{ "uploadId": "..." }` | 服务端自动 ListParts 取 ETag 后合并 |
 | `POST /__api/multipart/abort?key=` | `{ "uploadId": "..." }` | 取消并清理碎片 |
 
@@ -353,6 +354,30 @@ curl -X PUT -T ./demo.bin \
 
 - 目录浏览、面包屑导航、翻页
 - 拖拽上传、进度条；超过 `MULTIPART_THRESHOLD` 自动切换分片上传
+- **主题切换**（按钮在右上角）：暖色（默认）/ 深色，选择记在 localStorage
+- **上传方式切换**（下拉框）：见 6.1
+
+### 6.1 两种上传方式怎么选
+
+| | 直传（默认，推荐） | Worker 代理 |
+| --- | --- | --- |
+| 数据路径 | 浏览器 → 预签名 URL → B2 | 浏览器 → Worker → B2 |
+| 是否需要桶配 CORS | **需要** | 不需要 |
+| 单请求体积上限 | 无（旁路 Worker） | **100MB**（Workers 请求体硬限） |
+| 大文件（>100MB） | 分片直传，速度最快 | 分片经 Worker 中继，稳定但慢（两跳） |
+| 适用 | 生产环境、大文件 | 临时救急、或不方便配 CORS 时 |
+
+切到任一种模式，**超过阈值都会自动走 S3 分片上传**，只是分片的落地点不同：
+
+| 场景 | 行为 |
+| --- | --- |
+| 直传 + 小文件（`≤MULTIPART_THRESHOLD`） | 签一张预签名 PUT URL，浏览器一次 PUT 到 B2 |
+| 直传 + 大文件 | 分片：`create` → 逐片取预签名 URL → `complete` |
+| Worker 代理 + 小文件（`≤MAX_UPLOAD_BYTES`） | 一次 PUT 到 `/__api/object` |
+| Worker 代理 + 大文件 | 分片：`create` → 逐片 PUT 到 `/__api/multipart/part`（Worker 中继）→ `complete` |
+
+> **>100MB 的文件能否经 Worker 上传？** 能，但只能走「Worker 代理 + 分片」：每片 ≤ `multipartPartSize` 且 <100MB，逐片转发。代价是两份带宽套娃、占 CPU/内存、速度慢。
+> 想快的话，请在 B2 桶配好 CORS 后用「直传」，配好后错误信息也就不出现了。
 - 一键复制临时直链（预签名 GET，默认 1 小时）
 - 下载（带 `attachment` 的预签名链接）
 - 重命名（服务端复制 + 删除）
@@ -440,7 +465,7 @@ b2 update-bucket --corsRules '[
 | `AuthorizationQueryParametersError` / presign 403 | 预签名 URL 过期（`PRESIGN_EXPIRES`）；或客户端改了 URL 参数 |
 | `AuthorizationHeaderMalformed` | 端点前缀多写了 `/`、或 region 推导错误 → 显式设置 `B2_REGION` |
 | PUT 预签名上传 400/403 | 缺少 `x-amz-content-sha256: UNSIGNED-PAYLOAD` 头，或 Content-Type 与预签名时的 `ct` 不一致 |
-| 浏览器上传报"网络错误" | B2 桶 CORS 未允许你的 Origin / `s3_put` / `x-amz-content-sha256` |
+| 浏览器上传报"网络错误" | 直传模式下 B2 桶 CORS 未允许你的 Origin / `s3_put` / `x-amz-content-sha256`。**应急办法**：把界面上的上传方式切到「Worker 代理」；**根治办法**：按第 7 节给桶配 CORS |
 | 删除后再列举仍可见 | B2 可能存在延迟；另外带斜杠的"目录"是 `.keep` 占位对象，需一并删除 |
 | 下载大文件慢或超时 | 开 `ALLOW_REDIRECT=true`，用 `/<key>?redirect=1` 走 302 直连 B2 |
 | 视频无法拖动进度 | 源响应缺 `Accept-Ranges` 时已自动补；确认客户端带了 Range 且 Worker 未被中间件剥离 |

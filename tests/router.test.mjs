@@ -467,6 +467,69 @@ await check('管理员 ?redirect=1 可拿到预签名直链', async () => {
   return '管理员可用';
 });
 
+await check('分片经 Worker 中继（PUT multipart/part）', async () => {
+  const res = await handle(
+    req('/__api/multipart/part?key=big.mp4&uploadId=upload-1&partNumber=1', {
+      method: 'PUT', body: 'PARTDATA',
+      headers: { Authorization: basic, 'Content-Type': 'application/octet-stream' },
+    }), env, ctx,
+  );
+  const body = await res.json();
+  assert(res.status === 200 && body.ok === true, 'status=' + res.status + ' ' + JSON.stringify(body));
+  assert(body.partNumber === 1 && body.size === 8, JSON.stringify(body));
+  const sent0 = sent[sent.length - 1];
+  assert(sent0.method === 'PUT', 'method=' + sent0.method);
+  assert(sent0.url.includes('uploadId=upload-1') && sent0.url.includes('partNumber=1'), sent0.url);
+  assert(sent0.headers.get('authorization').startsWith('AWS4-HMAC-SHA256'), '未签名转发');
+  return sent0.url;
+});
+
+await check('超过 MAX_UPLOAD_BYTES 的分片被拒绝', async () => {
+  const res = await handle(
+    req('/__api/multipart/part?key=big.mp4&uploadId=upload-1&partNumber=2', {
+      method: 'PUT', body: 'X'.repeat(64), headers: { Authorization: basic },
+    }), { ...env, MAX_UPLOAD_BYTES: '16' }, ctx,
+  );
+  const body = await res.json();
+  assert(res.status === 413 && body.ok === false, 'status=' + res.status);
+  return body.error;
+});
+
+await check('GET multipart/part 仍返回预签名 URL（直传路径）', async () => {
+  const res = await handle(
+    req('/__api/multipart/part?key=big.mp4&uploadId=upload-1&partNumber=1',
+      { headers: { Authorization: basic } }), env, ctx,
+  );
+  const body = await res.json();
+  assert(res.status === 200 && body.url.includes('X-Amz-Signature='), JSON.stringify(body).slice(0, 120));
+  return 'presign ok';
+});
+
+await check('主题：默认暖色且支持深色切换', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(page.includes('--bg:#f6f0e4'), '缺少暖色默认值');
+  assert(page.includes('[data-theme="dark"]{--bg:#0f1115'), '缺少深色主题块');
+  assert(page.includes('id="btnTheme"'), '缺少主题切换按钮');
+  assert(page.includes('cfb2-theme'), '主题未做本地记忆');
+  return 'warm 默认 / dark 可切';
+});
+
+await check('上传方式：提供直传与 Worker 代理两个选项', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(page.includes('id="upMode"'), '缺少模式选择器');
+  assert(page.includes('value="direct"') && page.includes('value="worker"'), '缺少两个选项');
+  assert(page.includes('multipart/part'), '缺少 Worker 分片通道');
+  assert(page.includes('cfb2-upmode'), '模式未做本地记忆');
+  return 'direct / worker';
+});
+
+await check('匿名目录页也带主题切换', async () => {
+  const res = await handle(req('/share/'), shareEnv, ctx);
+  const body = await res.text();
+  assert(body.includes('id="btnTheme"') && body.includes('--bg:#f6f0e4'), '目录页缺少主题支持');
+  return 'ok';
+});
+
 await check('管理器内嵌前端 JS 可解析', async () => {
   const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
   const scripts = [...page.matchAll(/<script(?![^>]*type="application\/json")[^>]*>([\s\S]*?)<\/script>/g)];

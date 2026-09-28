@@ -959,6 +959,37 @@ async function apiRouter(request, env, ctx, cfg, url) {
         if (!key || !uploadId || partNumber < 1) {
           return deny('需要 key / uploadId / partNumber', request, cfg, 400);
         }
+
+        // PUT 带 body = 让 Worker 中继该分片（不需要桶配 CORS，单片必须小于 Workers 请求体上限）
+        if (request.method === 'PUT') {
+          if (!cfg.enableWrite) return deny('已禁用写入（ENABLE_WRITE=false）', request, cfg, 403);
+          const declared = readInt(request.headers.get('content-length'), 0);
+          if (declared > cfg.maxUploadBytes) {
+            return json({
+              ok: false,
+              error: '分片 ' + partNumber + ' 超过 MAX_UPLOAD_BYTES(' + cfg.maxUploadBytes + ')，请调小 MULTIPART_PART_SIZE',
+            }, 413, request, cfg);
+          }
+          const body = await request.arrayBuffer();
+          if (body.byteLength > cfg.maxUploadBytes) {
+            return json({ ok: false, error: '分片超过 MAX_UPLOAD_BYTES' }, 413, request, cfg);
+          }
+          const response = await b2Fetch(cfg, 'PUT', objectUrl(cfg, targetBucket, key), {
+            query: { partNumber: String(partNumber), uploadId },
+            headers: { 'content-type': 'application/octet-stream' },
+            body,
+          });
+          const text = await response.text();
+          if (!response.ok) {
+            return json({ ok: false, status: response.status, error: extractError(text) }, response.status, request, cfg);
+          }
+          return json({
+            ok: true, partNumber, size: body.byteLength,
+            etag: (response.headers.get('etag') || '').replace(/"/g, ''),
+          }, 200, request, cfg);
+        }
+
+        // GET = 返回该分片的预签名 URL（浏览器直传路径）
         const signedUrl = await signerOf(cfg).sign('PUT', objectUrl(cfg, targetBucket, key), {
           query: { partNumber: String(partNumber), uploadId },
           unsignedPayload: true,
@@ -994,6 +1025,47 @@ async function apiRouter(request, env, ctx, cfg, url) {
 function escapeHtml(str) {
   return String(str).split('&').join('&amp;').split('<').join('&lt;')
     .split('>').join('&gt;').split('"').join('&quot;');
+}
+
+/* ---------- 主题：暖色（默认） / 深色 ---------- */
+
+const THEMES = {
+  warm: {
+    bg: '#f6f0e4', card: '#fffdf7', line: '#e6dcc6', txt: '#3b3327',
+    dim: '#8a7d66', acc: '#c2410c', hover: '#f4ecdb', btn: '#ffffff', chip: '#f0e4cd',
+  },
+  dark: {
+    bg: '#0f1115', card: '#161a22', line: '#222836', txt: '#e6e6e6',
+    dim: '#8b93a7', acc: '#4c8dff', hover: '#1a1f29', btn: '#ffffff', chip: '#1d222d',
+  },
+};
+
+/** 生成 CSS 变量：默认暖色，<html data-theme="dark"> 时切深色 */
+function themeCss() {
+  const decl = (name) => Object.entries(THEMES[name])
+    .map(([key, value]) => '--' + key + ':' + value + ';').join('');
+  return ':root{' + decl('warm') + '}[data-theme="dark"]{' + decl('dark') + '}';
+}
+
+/** 主题切换按钮脚本（localStorage 记忆，默认暖色） */
+function themeToggleScript() {
+  return [
+    '(function () {',
+    'function apply(t) {',
+    '  document.documentElement.setAttribute("data-theme", t);',
+    '  var b = document.getElementById("btnTheme");',
+    '  if (b) b.textContent = (t === "dark") ? "暖色模式" : "深色模式";',
+    '  try { localStorage.setItem("cfb2-theme", t); } catch (e) {}',
+    '}',
+    'var saved = "";',
+    'try { saved = localStorage.getItem("cfb2-theme") || ""; } catch (e) {}',
+    'apply(saved === "dark" ? "dark" : "warm");',
+    'var btn = document.getElementById("btnTheme");',
+    'if (btn) btn.onclick = function () {',
+    '  apply(document.documentElement.getAttribute("data-theme") === "dark" ? "warm" : "dark");',
+    '};',
+    '})();',
+  ].join('\n');
 }
 
 function humanSize(bytes) {
@@ -1042,14 +1114,20 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
     '<title>' + escapeHtml(prefix || '/') + ' - B2 Index</title>',
     '<style>',
-    'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;padding:32px}',
+    themeCss(),
+    'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0;padding:32px}',
     '.wrap{max-width:900px;margin:0 auto}h1{font-size:18px;margin:0 0 4px}',
-    '.sub{color:#8b93a7;font-size:13px;margin-bottom:20px}',
-    'table{width:100%;border-collapse:collapse;background:#161a22;border-radius:10px;overflow:hidden}',
-    'td{padding:10px 14px;border-bottom:1px solid #222836;font-size:14px}',
-    'tr:last-child td{border-bottom:0}a{color:#7cc4ff;text-decoration:none}',
-    'a:hover{text-decoration:underline}.empty{color:#8b93a7;padding:24px;text-align:center}',
+    '.sub{color:var(--dim);font-size:13px;margin-bottom:20px}',
+    '.top{display:flex;align-items:center;gap:10px;margin-bottom:18px}',
+    '.top .grow{flex:1}',
+    'button{font:inherit;color:var(--txt);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer}',
+    'table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}',
+    'td{padding:10px 14px;border-bottom:1px solid var(--line);font-size:14px}',
+    'tr:last-child td{border-bottom:0}tr:hover td{background:var(--hover)}',
+    'a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}',
+    '.empty{color:var(--dim);padding:24px;text-align:center}',
     '</style></head><body><div class="wrap">',
+    '<div class="top"><button id="btnTheme">深色模式</button><span class="grow"></span></div>',
     '<h1>' + escapeHtml(bucketLabel) + ' ' + escapeHtml('/' + prefix) + '</h1>',
     '<div class="sub">' + data.folders.length + ' 个目录 / ' + data.files.length
       + ' 个文件'
@@ -1057,7 +1135,7 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
       + '</div>',
     '<table>' + (rows.join('') || '<tr><td class="empty">（空）</td></tr>') + '</table>',
     '<div style="margin-top:16px">' + nextLink + '</div>',
-    '</div></body></html>',
+    '</div><script>' + themeToggleScript() + '</script></body></html>',
   ].join('\n');
 }
 
@@ -1070,13 +1148,18 @@ function welcomePage(cfg, bucketLabel, prefix, publicPath) {
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
     '<title>B2 资源网关</title>',
     '<style>',
-    'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:#0f1115;color:#e6e6e6;margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}',
-    '.card{max-width:560px;padding:32px 36px;background:#161a22;border:1px solid #222836;border-radius:14px}',
-    'h1{font-size:19px;margin:0 0 10px}p{color:#8b93a7;line-height:1.7;font-size:14px;margin:6px 0}',
-    'code{background:#1d222d;padding:2px 6px;border-radius:5px;color:#7cc4ff}',
-    'a{color:#4c8dff}.btn{display:inline-block;margin-top:18px;padding:9px 16px;background:#4c8dff;color:#fff;border-radius:8px;text-decoration:none;font-size:14px}',
-    'ul{color:#8b93a7;font-size:13px;line-height:1.9;padding-left:18px}',
-    '</style></head><body><div class="card">',
+    themeCss(),
+    'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}',
+    '.card{max-width:560px;padding:32px 36px;background:var(--card);border:1px solid var(--line);border-radius:14px}',
+    '.thm{position:fixed;top:14px;right:14px}',
+    'button{font:inherit;color:var(--txt);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer}',
+    'h1{font-size:19px;margin:0 0 10px}p{color:var(--dim);line-height:1.7;font-size:14px;margin:6px 0}',
+    'code{background:var(--chip);padding:2px 6px;border-radius:5px;color:var(--acc)}',
+    'a{color:var(--acc)}',
+    '.btn{display:inline-block;margin-top:18px;padding:9px 16px;background:var(--acc);color:var(--btn);border-radius:8px;text-decoration:none;font-size:14px}',
+    'ul{color:var(--dim);font-size:13px;line-height:1.9;padding-left:18px}',
+    '</style></head><body>',
+    '<div class="thm"><button id="btnTheme">深色模式</button></div><div class="card">',
     '<h1>📦 Backblaze B2 资源网关</h1>',
     '<p>服务已就绪。请通过<strong>完整对象路径</strong>访问资源：</p>',
     '<p>根路径 <code>/</code> 的目录浏览未对匿名开放。</p>',
@@ -1093,7 +1176,7 @@ function welcomePage(cfg, bucketLabel, prefix, publicPath) {
         + (prefix ? ' · 前缀 <code>' + escapeHtml(prefix) + '</code>' : '')
         + ' · 区域 <code>' + escapeHtml(cfg.region) + '</code></p>'),
     '<a class="btn" href="' + manageUrl + '">进入文件管理器</a>',
-    '</div></body></html>',
+    '</div><script>' + themeToggleScript() + '</script></body></html>',
   ].join('\n');
 }
 
@@ -1135,29 +1218,30 @@ function managePage(cfg, url) {
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
     '<title>B2 文件管理器</title>',
     '<style>',
-    ':root{--bg:#0f1115;--card:#161a22;--line:#222836;--txt:#e6e6e6;--dim:#8b93a7;--acc:#4c8dff}',
+    themeCss(),
     '*{box-sizing:border-box}',
     'body{margin:0;background:var(--bg);color:var(--txt);font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;font-size:14px}',
-    'header{display:flex;align-items:center;gap:10px;padding:12px 20px;border-bottom:1px solid var(--line);background:#12151c;position:sticky;top:0;z-index:5;flex-wrap:wrap}',
+    'code{background:var(--chip);padding:2px 6px;border-radius:5px}',
+    'header{display:flex;align-items:center;gap:10px;padding:12px 20px;border-bottom:1px solid var(--line);background:var(--card);position:sticky;top:0;z-index:5;flex-wrap:wrap}',
     'header h1{font-size:15px;margin:0;font-weight:600}',
     '.grow{flex:1}',
-    'button,input{font:inherit;color:var(--txt);background:#1d222d;border:1px solid var(--line);border-radius:8px;padding:6px 10px}',
-    'button{cursor:pointer;background:var(--acc);border-color:var(--acc);color:#fff}',
-    'button.ghost{background:#1d222d;color:var(--txt);border-color:var(--line)}',
-    'button.mini{padding:3px 7px;font-size:12px;background:#1d222d;border-color:var(--line);color:var(--txt)}',
+    'button,input,select{font:inherit;color:var(--txt);background:var(--chip);border:1px solid var(--line);border-radius:8px;padding:6px 10px}',
+    'button{cursor:pointer;background:var(--acc);border-color:var(--acc);color:var(--btn)}',
+    'button.ghost{background:var(--chip);color:var(--txt);border-color:var(--line)}',
+    'button.mini{padding:3px 7px;font-size:12px;background:var(--chip);border-color:var(--line);color:var(--txt)}',
     'button:disabled{opacity:.45;cursor:not-allowed}',
     'main{max-width:1180px;margin:0 auto;padding:20px}',
-    '#drop{border:1.5px dashed #2c3444;border-radius:12px;padding:20px;text-align:center;color:var(--dim);margin-bottom:16px}',
-    '#drop.over{border-color:var(--acc);color:#fff;background:#151a26}',
-    'table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden}',
+    '#drop{border:1.5px dashed var(--line);border-radius:12px;padding:20px;text-align:center;color:var(--dim);margin-bottom:16px}',
+    '#drop.over{border-color:var(--acc);color:var(--acc);background:var(--hover)}',
+    'table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}',
     'th,td{padding:8px 12px;border-bottom:1px solid var(--line);text-align:left}',
     'th{color:var(--dim);font-weight:500;font-size:12px;letter-spacing:.04em}',
-    'tr:last-child td{border-bottom:0}tr:hover td{background:#1a1f29}',
+    'tr:last-child td{border-bottom:0}tr:hover td{background:var(--hover)}',
     '.muted{color:var(--dim)}',
-    '.bar{height:6px;border-radius:4px;background:#232a38;overflow:hidden;margin-top:6px}',
+    '.bar{height:6px;border-radius:4px;background:var(--chip);overflow:hidden;margin-top:6px}',
     '.bar>i{display:block;height:100%;background:var(--acc);width:0}',
     '#toast{position:fixed;right:18px;bottom:18px;display:flex;flex-direction:column;gap:8px;z-index:20}',
-    '.t{padding:10px 14px;border-radius:8px;background:#1d222d;border:1px solid var(--line);max-width:440px}',
+    '.t{padding:10px 14px;border-radius:8px;background:var(--card);border:1px solid var(--line);max-width:440px}',
     '.t.err{border-color:#ff6b6b;color:#ffb3b3}',
     '.hidden{display:none}',
     '.crumb a{color:var(--acc);cursor:pointer}',
@@ -1171,6 +1255,11 @@ function managePage(cfg, url) {
     '<button class="ghost" id="btnLogin">鉴权</button>',
     '<button class="ghost" id="btnRefresh">刷新</button>',
     '<button class="ghost" id="btnMkdir">新建目录</button>',
+    '<select id="upMode" title="上传方式">',
+    '<option value="direct">直传（推荐）</option>',
+    '<option value="worker">Worker 代理</option>',
+    '</select>',
+    '<button class="ghost" id="btnTheme">深色模式</button>',
     '<button id="btnUpload">上传</button>',
     '<input type="file" id="file" multiple class="hidden">',
     '</header>',
@@ -1187,6 +1276,7 @@ function managePage(cfg, url) {
     '</main>',
     '<div id="toast"></div>',
     '<script id="cfg" type="application/json">' + configJson + '</script>',
+    '<script>' + themeToggleScript() + '</script>',
     '<script>',
     '(function () {',
     'var CFG = JSON.parse(document.getElementById("cfg").textContent);',
@@ -1283,13 +1373,69 @@ function managePage(cfg, url) {
     '  el("btnNext").disabled = !data.truncated;',
     '}',
     'function refresh() { load(PREFIX); }',
+    'var ERR_DIRECT = "直传失败：多半是桶未配置 CORS（需允许本站来源且放行 s3_put）。可改用「Worker 代理」上传，或在 B2 桶的 CORS 规则里加入本站。";',
+    'var ERR_WORKER = "经 Worker 上传失败：网络中断，或单请求超过 MAX_UPLOAD_BYTES（默认 100MB）。";',
+    'function upMode() { return el("upMode") ? el("upMode").value : "direct"; }',
+    'function saveMode() { try { localStorage.setItem("cfb2-upmode", upMode()); } catch (e) {} }',
     'function uploadFiles(files) {',
     '  for (var i = 0; i < files.length; i++) {',
     '    var f = files[i];',
     '    var key = PREFIX + f.name;',
-    '    if (CFG.multipartThreshold > 0 && f.size > CFG.multipartThreshold) mpUpload(f, key);',
+    '    if (upMode() === "worker") workerUpload(f, key);',
+    '    else if (CFG.multipartThreshold > 0 && f.size > CFG.multipartThreshold) mpUpload(f, key);',
     '    else simpleUpload(f, key);',
     '  }',
+    '}',
+    'function workerPartSize() {',
+    '  var p = CFG.multipartPartSize || 25 * 1024 * 1024;',
+    '  var cap = (CFG.maxUploadBytes || 100 * 1024 * 1024) - 1024 * 1024;',
+    '  if (cap < 5 * 1024 * 1024) cap = 5 * 1024 * 1024;',
+    '  return Math.min(p, cap);',
+    '}',
+    'function workerUpload(file, key) {',
+    '  var setPct = progressRow(file);',
+    '  var ct = file.type || "application/octet-stream";',
+    '  if (file.size <= (CFG.maxUploadBytes || 100 * 1024 * 1024)) {',
+    '    return putXHR(API + "object" + q({ key: key }), file, ct, setPct, { direct: false })',
+    '      .then(function () { setPct(100); toast("上传完成（Worker 代理）: " + key); refresh(); })',
+    '      .catch(function (e) { toast("上传失败: " + e.message, true); });',
+    '  }',
+    '  return workerMultipart(file, key, setPct);',
+    '}',
+    'function workerMultipart(file, key, setPct) {',
+    '  var partSize = workerPartSize();',
+    '  var total = Math.ceil(file.size / partSize);',
+    '  var ct = file.type || "application/octet-stream";',
+    '  call("multipart/create" + q({ key: key }), { method: "POST", body: JSON.stringify({ contentType: ct }) })',
+    '    .then(function (r) {',
+    '      if (!r.ok) throw new Error(r.data.error || r.status);',
+    '      var uploadId = r.data.uploadId;',
+    '      var chain = Promise.resolve();',
+    '      var done = 0;',
+    '      for (var n = 1; n <= total; n++) {',
+    '        chain = chain.then(workerStep(n, key, uploadId, partSize, file, function () {',
+    '          done++; setPct(Math.round(done / total * 100));',
+    '        }));',
+    '      }',
+    '      return chain.then(function () {',
+    '        return call("multipart/complete" + q({ key: key }), {',
+    '          method: "POST", body: JSON.stringify({ uploadId: uploadId }),',
+    '        });',
+    '      });',
+    '    })',
+    '    .then(function (r) {',
+    '      toast(r.ok ? "分片上传完成（Worker 代理）: " + key : "合并失败: " + ((r.data && r.data.error) || "未知"), !r.ok);',
+    '      refresh();',
+    '    })',
+    '    .catch(function (e) { toast("分片上传失败: " + e.message, true); });',
+    '}',
+    'function workerStep(n, key, uploadId, partSize, file, done) {',
+    '  return function () {',
+    '    var start = (n - 1) * partSize;',
+    '    var chunk = file.slice(start, Math.min(start + partSize, file.size));',
+    '    var url = API + "multipart/part" + q({ key: key, uploadId: uploadId, partNumber: n });',
+    '    return putXHR(url, chunk, "application/octet-stream", null, { direct: false }).then(done);',
+    '  };',
     '}',
     'function progressRow(file) {',
     '  var tr = document.createElement("tr");',
@@ -1301,12 +1447,18 @@ function managePage(cfg, url) {
     '    if (pct >= 100) tr.children[2].textContent = "处理中";',
     '  };',
     '}',
-    'function putXHR(url, blob, ct, setPct) {',
+    'function putXHR(url, blob, ct, setPct, opts) {',
+    '  opts = opts || { direct: true };',
     '  return new Promise(function (resolve, reject) {',
     '    var xhr = new XMLHttpRequest();',
     '    xhr.open("PUT", url, true);',
     '    xhr.setRequestHeader("Content-Type", ct);',
-    '    xhr.setRequestHeader("x-amz-content-sha256", "UNSIGNED-PAYLOAD");',
+    '    if (opts.direct) {',
+    '      xhr.setRequestHeader("x-amz-content-sha256", "UNSIGNED-PAYLOAD");',
+    '    } else {',
+    '      var h = buildHeaders(false);',
+    '      for (var key in h) { if (Object.prototype.hasOwnProperty.call(h, key)) xhr.setRequestHeader(key, h[key]); }',
+    '    }',
     '    xhr.upload.onprogress = function (e) {',
     '      if (e.lengthComputable && setPct) setPct(Math.round(e.loaded / e.total * 100));',
     '    };',
@@ -1314,7 +1466,7 @@ function managePage(cfg, url) {
     '      if (xhr.status >= 200 && xhr.status < 300) resolve(xhr);',
     '      else reject(new Error("HTTP " + xhr.status + " " + String(xhr.responseText || "").slice(0, 200)));',
     '    };',
-    '    xhr.onerror = function () { reject(new Error("网络错误，请确认桶的 CORS 允许本站 PUT")); };',
+    '    xhr.onerror = function () { reject(new Error(opts.direct ? ERR_DIRECT : ERR_WORKER)); };',
     '    xhr.send(blob);',
     '  });',
     '}',
@@ -1323,8 +1475,8 @@ function managePage(cfg, url) {
     '  var ct = file.type || "application/octet-stream";',
     '  call("presign" + q({ key: key, type: "put", ct: ct })).then(function (r) {',
     '    if (!r.ok) { toast("预签名失败: " + (r.data.error || r.status), true); return; }',
-    '    return putXHR(r.data.url, file, ct, setPct).then(function () {',
-    '      setPct(100); toast("上传完成: " + key); refresh();',
+    '    return putXHR(r.data.url, file, ct, setPct, { direct: true }).then(function () {',
+    '      setPct(100); toast("上传完成（直传）: " + key); refresh();',
     '    });',
     '  }).catch(function (e) { toast("上传失败: " + e.message, true); });',
     '}',
@@ -1362,7 +1514,7 @@ function managePage(cfg, url) {
     '      if (!pr.ok) throw new Error(pr.data.error || pr.status);',
     '      var start = (n - 1) * partSize;',
     '      var chunk = file.slice(start, Math.min(start + partSize, file.size));',
-    '      return putXHR(pr.data.url, chunk, "application/octet-stream", null).then(done);',
+    '      return putXHR(pr.data.url, chunk, "application/octet-stream", null, { direct: true }).then(done);',
     '    });',
     '  };',
     '}',
@@ -1452,8 +1604,19 @@ function managePage(cfg, url) {
     'dz.addEventListener("drop", function (e) {',
     '  if (e.dataTransfer && e.dataTransfer.files) uploadFiles(e.dataTransfer.files);',
     '});',
-    'el("capHint").textContent = "直传不受 Workers 限制；超过 " + size(CFG.multipartThreshold) + " 自动启用分片上传"',
-    '  + (CFG.publicPrefix ? "；匿名只读目录: /" + CFG.publicPrefix + "/" : "") + "（登录后可管理全部文件）";',
+    'function modeHint() {',
+    '  var m = upMode();',
+    '  return m === "worker"',
+    '    ? "Worker 代理：不需要 CORS；单请求上限 " + size(CFG.maxUploadBytes) + "，更大的文件自动按 " + size(workerPartSize()) + " 分片经 Worker 转发"',
+    '    : "直传：浏览器经预签名 URL 直发 B2（需桶配 CORS）；超过 " + size(CFG.multipartThreshold) + " 自动走分片上传";',
+    '}',
+    'function paintHint() { el("capHint").textContent = modeHint(); }',
+    'el("upMode").onchange = function () { saveMode(); paintHint(); };',
+    'try {',
+    '  var sm = localStorage.getItem("cfb2-upmode");',
+    '  if (sm === "worker" || sm === "direct") el("upMode").value = sm;',
+    '} catch (e) {}',
+    'paintHint();',
     'el("bucketLabel").textContent = CFG.bucketMode === "fixed"',
     '  ? ("桶: " + CFG.bucketFixed)',
     '  : (CFG.bucketMode === "path" ? "桶: 按 URL 首段动态解析" : "桶: 按主机名首段动态解析");',
