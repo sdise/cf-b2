@@ -510,6 +510,23 @@ await check('?dl=1 由 Worker 下发附件头（不泄露 B2 端点）', async (
   return cd;
 });
 
+await check('/__api/logout 返回 401 并带 WWW-Authenticate', async () => {
+  const res = await handle(req('/__api/logout', { method: 'POST' }), env, ctx);
+  const body = await res.json();
+  assert(res.status === 401, 'status=' + res.status);
+  assert((res.headers.get('www-authenticate') || '').includes('Basic'), '缺少 WWW-Authenticate');
+  assert(body.ok === true, JSON.stringify(body));
+  return res.headers.get('www-authenticate');
+});
+
+await check('管理器带「退出」按钮且会清理本地凭据', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(page.includes('id="btnLogout"'), '缺少退出按钮');
+  assert(page.includes('sessionStorage.removeItem("cfb2-token")'), '退出未清理本地令牌');
+  assert(page.includes('"logout"'), '退出未调用 logout 端点');
+  return 'ok';
+});
+
 await check('管理器不再出现「直链」按钮，下载走 Worker 路径', async () => {
   const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
   assert(!page.includes('data-act=\\"link\\"'), '直链按钮仍在');

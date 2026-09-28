@@ -157,7 +157,45 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 两者都未配置                 → 写删默认拒绝（fail-closed）
 ```
 
-### 3.2.1 匿名 vs 管理员
+### 3.2.1 登录状态是怎么检查与保持的？
+
+**Worker 侧完全无状态**——没有 Cookie、没有 Session、没有 KV/存储。每个请求独立判定一次：
+
+```
+请求 → 取 Authorization 头
+      ├─ Bearer <token>   → 与 ADMIN_TOKEN 恒定时间比较（先 SHA-256 再逐位异或）
+      ├─ Basic base64(u:p)→ atob 后与 ADMIN_USER / ADMIN_PASS 分别恒定时间比较
+      └─ 无 / 不匹配      → 写操作 401；未配置任何凭据时写操作一律拒绝（fail-closed）
+```
+
+判定发生在 `checkAuth()`，一次请求 1 次比较，JIT 无任何缓存态。
+
+**"保持登录"是谁的功劳？** 是**浏览器**：
+
+1. 首次访问 `/__manage`，Worker 返回 `401 + WWW-Authenticate: Basic realm="B2 Manager"`；
+2. 浏览器弹出原生登录框，输入后**按 origin + realm 缓存凭据**；
+3. 之后同源请求（含 XHR/fetch，默认 `credentials: same-origin`）**浏览器自动带上 `Authorization: Basic ...`**，所以你感觉"一直登录着"。
+
+推论与注意：
+
+- Worker 无法在服务端"踢人"——Basic 凭据是静态环境变量，改 `ADMIN_PASS` 并重新部署才会让旧凭据失效。
+- 管理器在 Bearer 模式下把令牌存在 `sessionStorage`（关标签即失效），Basic 模式下只存在页面内存与浏览器凭据缓存里。
+- `PUBLIC_WRITE=true` 会跳过一切校验（等于公开网盘），不要开。
+- 想让"退出"立刻生效，建议用 **Bearer 令牌模式**（`ADMIN_TOKEN`），退出即清除本地令牌；Basic 模式受浏览器缓存限制（见下）。
+
+### 3.2.2 退出登录
+
+管理器右上角新增 **「退出」** 按钮，点击后：
+
+1. 清空页面内的用户名/密码/令牌与 `sessionStorage` 里的令牌；
+2. 调 `POST /__api/logout`（服务端返回 `401 + WWW-Authenticate`，诱导浏览器丢弃缓存的 Basic 凭据）；
+3. 再发一次带错误凭据（`logout:logout`）的请求，触发浏览器凭据缓存失效；
+4. 0.9 秒后刷新页面 → 若凭据确已清除，会重新弹出登录框。
+
+> 已知限制：**Basic 认证的凭据缓存由浏览器管理**，部分浏览器/版本不会因子资源 401 而清除，退出后可能仍自动登录。
+> 此时可选：① 关闭标签页或浏览器；② 用 Bearer 令牌模式（退出即时生效）；③ Chrome：`chrome://settings/clearBrowserData` 勾选"密码及其他登录数据"，或地址栏左侧锁图标 → 清除站点数据。
+
+### 3.2.3 匿名 vs 管理员
 
 | 操作 | 匿名 | 管理员（登录） |
 | --- | --- | --- |
@@ -234,7 +272,8 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 | `/<prefix>/` | GET | 目录列表（HTML；`?format=json` 返回 JSON；`?cursor=` 翻页；`?limit=` 每页条数） |
 | `/__manage` | GET | 网页文件管理器（需鉴权） |
 | `/<bucket>/__manage` | GET | `$path` 模式下的管理器，自动把 API 前缀带上桶名 |
-| `/__api/*` | 见下节 | 管理 API（需鉴权，`/health` 除外） |
+| `/__api/logout` | POST | 退出登录（返回 401 + `WWW-Authenticate`，促浏览器丢弃缓存凭据） |
+| `/__api/*` | 见下节 | 管理 API（需鉴权，`/health`、`/logout` 除外） |
 | `/<bucket>/__api/*` | 同上 | `$path` 模式下显式指定桶；也可用 `/__api/*?bucket=<桶名>` |
 | 任意 | OPTIONS | CORS 预检，返回 204 |
 
@@ -362,6 +401,7 @@ curl -X PUT -T ./demo.bin \
 - 重命名（服务端复制 + 删除）
 - 新建目录、删除文件/目录
 - 右上角输入 Basic 用户名/密码或 Bearer 令牌后点"鉴权"；若浏览器已完成 Basic 弹窗登录，通常无需再填
+- 右上角 **「退出」**：清除本地凭据并触发浏览器丢弃缓存的 Basic 凭据（详见 3.2.2）
 - 亮色主题下**目录行**为暖色底 + 琥珀色文字，文件行为浅色卡片；深色模式维持单色不变
 
 ### 6.1 两种上传方式怎么选

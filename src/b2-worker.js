@@ -841,6 +841,22 @@ async function apiRouter(request, env, ctx, cfg, url) {
     return new Response(null, { status: 204, headers: corsHeaders(request, cfg) });
   }
 
+  // 退出登录：Worker 本身无会话，这里返回 401 诱导浏览器丢弃缓存的 Basic 凭据
+  if (action === 'logout') {
+    return new Response(
+      JSON.stringify({ ok: true, message: '本地凭据已清除；浏览器缓存的 Basic 凭据可能需要关闭标签页或浏览器' }),
+      {
+        status: 401,
+        headers: {
+          'Content-Type': 'application/json; charset=utf-8',
+          'WWW-Authenticate': 'Basic realm="B2 Manager", charset="UTF-8"',
+          'Cache-Control': 'no-store',
+          ...corsHeaders(request, cfg),
+        },
+      },
+    );
+  }
+
   // health 无需鉴权，但匿名只能拿到最小信息（不暴露区域 / 桶模式）
   if (action === 'health') {
     const authenticated = (await checkAuth(request, cfg)).ok;
@@ -1273,6 +1289,7 @@ function managePage(cfg, url) {
     '<input id="fUser" placeholder="用户名" size="10">',
     '<input id="fPass" type="password" placeholder="密码 / 令牌" size="16">',
     '<button class="ghost" id="btnLogin">鉴权</button>',
+    '<button class="ghost" id="btnLogout">退出</button>',
     '<button class="ghost" id="btnRefresh">刷新</button>',
     '<button class="ghost" id="btnMkdir">新建目录</button>',
     '<select id="upMode" title="上传方式">',
@@ -1597,9 +1614,30 @@ function managePage(cfg, url) {
     '  SELECT = null;',
     '  if (CFG.hasToken) TOKEN = el("fPass").value; else TOKEN = "";',
     '  call("health").then(function (r) {',
-    '    toast(r.data && r.data.authenticated ? "鉴权成功" : "鉴权失败", !(r.data && r.data.authenticated));',
+    '    var okAuth = r.data && r.data.authenticated;',
+    '    if (okAuth) { try { sessionStorage.setItem("cfb2-token", TOKEN || ""); } catch (e) {} }',
+    '    toast(okAuth ? "鉴权成功" : "鉴权失败", !okAuth);',
     '    refresh();',
     '  });',
+    '};',
+    'el("btnLogout").onclick = function () {',
+    '  TOKEN = "";',
+    '  el("fUser").value = "";',
+    '  el("fPass").value = "";',
+    '  try { sessionStorage.removeItem("cfb2-token"); } catch (e) {}',
+    '  fetch(API + "logout", { method: "POST", credentials: "same-origin", headers: { Accept: "application/json" } })',
+    '    .catch(function () {})',
+    '    .then(function () {',
+    '      return fetch(API + "health", {',
+    '        credentials: "same-origin",',
+    '        headers: { Accept: "application/json", Authorization: "Basic " + btoa("logout:logout") },',
+    '      });',
+    '    })',
+    '    .catch(function () {})',
+    '    .then(function () {',
+    '      toast("已退出：本地凭据已清除。若浏览器仍自动登录，请关闭标签页/浏览器，或改用 Bearer 令牌模式（退出即时生效）。");',
+    '      setTimeout(function () { location.reload(); }, 900);',
+    '    });',
     '};',
     'var dz = el("drop");',
     '["dragenter", "dragover"].forEach(function (ev) {',
@@ -1627,7 +1665,11 @@ function managePage(cfg, url) {
     'el("bucketLabel").textContent = CFG.bucketMode === "fixed"',
     '  ? ("桶: " + CFG.bucketFixed)',
     '  : (CFG.bucketMode === "path" ? "桶: 按 URL 首段动态解析" : "桶: 按主机名首段动态解析");',
-    'if (CFG.publicWrite) el("btnLogin").className = "ghost hidden";',
+    'if (CFG.publicWrite) { el("btnLogin").className = "ghost hidden"; el("btnLogout").className = "ghost hidden"; }',
+    'try {',
+    '  var st = sessionStorage.getItem("cfb2-token");',
+    '  if (st && CFG.hasToken) { TOKEN = st; el("fPass").value = st; }',
+    '} catch (e) {}',
     'if (CFG.hasToken) { el("fUser").className = "hidden"; el("fPass").placeholder = "Bearer 令牌"; }',
     'load("");',
     '})();',
