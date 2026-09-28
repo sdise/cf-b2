@@ -576,8 +576,20 @@ B2_KEY_ID=<keyID> B2_APP_KEY=<applicationKey> node tools/setup-b2-cors.mjs
 
 当前桶上两条规则：
 
-1. `restore-download-any-https`：`https` 任意来源、`s3_get`/`s3_head`、`authorization`/`range`（桶上原有规则，已写回）
-2. `allow-worker-b2-upload`：仅 `https://b2.mose19960101.workers.dev`、`s3_put`/`s3_get`/`s3_head`、`content-type`/`x-amz-content-sha256`
+当前 `axyz-bucket` 上两条规则：
+
+1. `restore-download-any-https`：`https` 任意来源、`s3_get`/`s3_head`、`authorization`/`range`（桶上原有规则）
+2. `allow-worker-b2-upload`：`s3_put`/`s3_get`/`s3_head`、`content-type`/`x-amz-content-sha256`，来源为：
+   - `https://b2.mose19960101.workers.dev`
+   - `https://b2.edgeoneai.cc.cd`
+
+两个域名的预检实测均返回 `HTTP 200 + access-control-allow-methods: PUT`。
+
+脚本支持**多来源合并**，新增域名不会覆盖已有来源：
+
+```bash
+B2_ORIGIN='https://b2.mose19960101.workers.dev,https://b2.edgeoneai.cc.cd' node tools/setup-b2-cors.mjs
+```
 
 ---
 

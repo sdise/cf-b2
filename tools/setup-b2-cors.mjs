@@ -11,7 +11,10 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const keyId = process.env.B2_KEY_ID || '';
 const appKey = process.env.B2_APP_KEY || '';
 const bucketName = process.env.B2_BUCKET || 'axyz-bucket';
-const origin = process.env.B2_ORIGIN || 'https://b2.mose19960101.workers.dev';
+// 支持逗号分隔多个来源，脚本会对现有规则做「并集合并」，不会覆盖已有来源
+const origins = (process.env.B2_ORIGIN || 'https://b2.mose19960101.workers.dev')
+  .split(',').map((s) => s.trim()).filter(Boolean);
+const origin = origins[0];
 const dryRun = process.env.B2_DRY_RUN === '1';
 
 if (!keyId || !appKey) {
@@ -23,20 +26,22 @@ const mask = (s) => (s ? s.slice(0, 4) + '***' + s.slice(-4) : '(空)');
 console.log('keyID       :', mask(keyId));
 console.log('application :', mask(appKey));
 console.log('bucket      :', bucketName);
-console.log('origin      :', origin);
+console.log('origins     :', origins.join(' , '));
+
+const UPLOAD_RULE_NAME = 'allow-worker-b2-upload';
 
 /* 注意：实测本桶只接受小写下划线写法 s3_put / s3_get / s3_head / s3_delete，
  * 官方文档里的 "S3 Put Object" 会被 bad_request 拒绝。 */
-const CORS_RULE = {
-  corsRuleName: 'allow-worker-b2-upload',
-  allowedOrigins: [origin],
+const UPLOAD_RULE = {
+  corsRuleName: UPLOAD_RULE_NAME,
+  allowedOrigins: origins,
   allowedOperations: ['s3_put', 's3_get', 's3_head'],
   allowedHeaders: ['content-type', 'x-amz-content-sha256'],
   exposeHeaders: ['ETag'],
   maxAgeSeconds: 3600,
 };
 
-/* 桶上原本就存在的下载规则（探测过程中被覆盖，这里一并写回） */
+/* 桶上原本就存在的下载规则（保留，不删除） */
 const RESTORE_RULE = {
   corsRuleName: 'restore-download-any-https',
   allowedOrigins: ['https'],
@@ -80,7 +85,21 @@ if (!bucket) {
 console.log('[2] 找到桶:', bucket.bucketName, '| bucketId:', bucket.bucketId, '| type:', bucket.bucketType);
 
 /* ---------- 3. Native API 设置 CORS ---------- */
-const RULES = [RESTORE_RULE, CORS_RULE];
+/* 合并策略：保留桶上其他规则；上传规则的 allowedOrigins 与已有来源取并集 */
+const existing = (bucket.corsRules || []).filter((r) => r.corsRuleName !== UPLOAD_RULE_NAME);
+const previousUpload = (bucket.corsRules || []).find((r) => r.corsRuleName === UPLOAD_RULE_NAME);
+if (previousUpload) {
+  console.log('[2b] 已有上传规则，合并来源:', JSON.stringify(previousUpload.allowedOrigins));
+}
+const merged = {
+  ...UPLOAD_RULE,
+  allowedOrigins: [...new Set([...(previousUpload?.allowedOrigins || []), ...origins])],
+};
+const restored = existing.some((r) => r.corsRuleName === RESTORE_RULE.corsRuleName)
+  ? existing
+  : [RESTORE_RULE, ...existing];
+const RULES = [...restored, merged];
+
 console.log('\n[3] 通过 b2_update_bucket 写入 corsRules:');
 console.log(JSON.stringify(RULES, null, 2));
 
@@ -133,20 +152,26 @@ const getText = await getRes.text();
 console.log('    HTTP', getRes.status);
 console.log('   ', getText ? getText.slice(0, 500) : '(空)');
 
-/* ---------- 6. 模拟浏览器预检 ---------- */
+/* ---------- 6. 逐个来源模拟浏览器预检 ---------- */
 console.log('\n[6] 模拟浏览器 OPTIONS 预检（这就是之前被拦的那一步）');
-const probe = await fetch(auth.s3ApiUrl + '/' + bucketName + '/probe.txt', {
-  method: 'OPTIONS',
-  headers: {
-    Origin: origin,
-    'Access-Control-Request-Method': 'PUT',
-    'Access-Control-Request-Headers': 'content-type,x-amz-content-sha256',
-  },
-});
-console.log('    HTTP', probe.status);
-for (const h of ['access-control-allow-origin', 'access-control-allow-methods', 'access-control-allow-headers', 'access-control-max-age']) {
-  console.log('   ', h + ':', probe.headers.get(h) || '(无)');
+let allPass = true;
+for (const o of merged.allowedOrigins) {
+  const probe = await fetch(auth.s3ApiUrl + '/' + bucketName + '/probe.txt', {
+    method: 'OPTIONS',
+    headers: {
+      Origin: o,
+      'Access-Control-Request-Method': 'PUT',
+      'Access-Control-Request-Headers': 'content-type,x-amz-content-sha256',
+    },
+  });
+  const allowOrigin = probe.headers.get('access-control-allow-origin');
+  const pass = allowOrigin === o;
+  if (!pass) allPass = false;
+  console.log('   ', (pass ? '✅' : '❌'), o, '-> HTTP', probe.status,
+    '| allow-origin:', allowOrigin || '(无)',
+    '| allow-methods:', probe.headers.get('access-control-allow-methods') || '(无)',
+    '| allow-headers:', probe.headers.get('access-control-allow-headers') || '(无)');
 }
-console.log('\n' + (probe.headers.get('access-control-allow-origin') === origin
-  ? '✅ CORS 已放行该来源，管理器切回「直传」即可上传'
-  : '❌ 预检仍未放行：检查 allowedOrigins 是否写全（含 https://），或改用「Worker 代理」模式'));
+console.log('\n' + (allPass
+  ? '✅ 全部来源已放行，管理器用「直传」即可上传'
+  : '❌ 部分来源未放行：检查 allowedOrigins 是否写全（含 https://），或改用「Worker 代理」模式'));
