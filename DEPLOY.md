@@ -193,11 +193,32 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 | `MULTIPART_PART_SIZE` | `26214400`（25MB） | 分片大小；B2 要求最后一片外其他片 ≥5MB |
 | `RCLONE_DOWNLOAD` | `false` | 兼容 `rclone --b2-download-url`：剥掉 URL 中 `file/<bucket>/` 前缀 |
 
-### 3.5 调试
+### 3.5 隐私收敛（防信息泄露）
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `HIDE_BUCKET_INFO` | `true` | 匿名视图隐藏桶名/区域；`/__api/health` 对匿名只返回 `{ok,service,authenticated,publicRead}`；匿名遇到上游错误只回状态码、不回 XML 正文（错误详情写 `wrangler tail` 日志） |
+| `STRIP_UPSTREAM_META` | `true` | 删除 `x-bz-*`、`x-amz-request-id`、`x-amz-id-2`、`x-amz-version-id`、`x-amz-server-side-encryption*` 等内部头；`ETag`/`Content-Range`/`Last-Modified` 保留以保证断点续传 |
+
+### 3.6 调试
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `DEBUG` | `false` | 保留项；异常时会在日志输出堆栈（`wrangler tail` 可见），响应体始终只返回简短错误信息 |
+
+### 3.7 匿名可见信息清单（默认配置下）
+
+| 信息 | 匿名能否看到 |
+| --- | --- |
+| 桶名 | ❌（列表页标题显示为「公开目录」） |
+| 区域 / S3 端点 | ❌（`health` 匿名不返回 region） |
+| Application Key / keyID | ❌（仅在**预签名 URL** 里出现，而预签名接口需管理员鉴权） |
+| 对象内容 `/share/**` | ✅（这是公开目录的用途） |
+| 对象内部 ID（`x-bz-file-id` 等） | ❌（已剥离） |
+| 上游错误 XML（含桶名） | ❌（匿名只看到 `Not Found` / `Forbidden`） |
+| 管理器入口 `/__manage` | ❌（匿名视图不给出链接） |
+
+即使知道端点和桶名也无法直连：桶为 Private，S3 请求必须带有效 SigV4 签名，`f00x.backblazeb2.com` 友好 URL 同样需要授权令牌——密钥只存在于 Worker 的 Secret 里。
 
 ---
 
@@ -384,7 +405,20 @@ b2 update-bucket --corsRules '[
 
 ---
 
-## 9. 安全建议
+## 9. 安全建议：信息泄露与防滥用
+
+### 9.1 防刷流量 / 防滥用（重要）
+
+单个匿名请求 = 一次回源到 B2 的请求（若 CDN 未命中）。虽然 CF↔B2 免流量费，但 Worker 请求数与 Backblaze `Class C/D` 事务数是计费的。建议叠加四层：
+
+1. **让缓存挡在最前面**：`CACHE_MAX_AGE=86400`（或更长）、`ENABLE_CACHE=true`，并给 `/share/*` 的对象设置 `UPLOAD_CACHE_CONTROL = "public, max-age=31536000, immutable"`，让基本边缘命中。
+2. **WAF 速率限制**：Security → WAF → Rate limiting rules，例（按 10 秒/IP 阈值，匹配 `hostname = b2.example.com and not starts_with(http.request.uri.path, "/share/")`，动作 Block 或 Managed Challenge）。
+3. **Bot Fight Mode / Under Attack**：控制台 → Bots，打开 Bot Fight Mode；遭遇刷量时临时开 "I'm under attack"。
+4. **Cache Rules**：给 `/share/*` 建一条 Cache Rule（Eligible for cache + Edge TTL），让静态文件在 CDN 边缘直接命中，连 Worker 都不触发。
+
+补充：匿名只能访问 `/share/**`（`PUBLIC_PREFIX`），**本身已经把放大面收敛到一个目录**——这是最重要的一层。
+
+### 9.2 通用加固清单
 
 1. **密钥只放 Secret**：`B2_APPLICATION_KEY`、`ADMIN_PASS`、`ADMIN_TOKEN` 一律用 `wrangler secret put`，绝不写进 `wrangler.toml`/Git。
 2. **最小权限 Key**：Application Key 只授权目标桶和必要的 capabilities；只读场景就别给 `writeFiles`/`deleteFiles`。

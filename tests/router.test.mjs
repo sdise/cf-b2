@@ -59,6 +59,14 @@ globalThis.fetch = async (request, init) => {
       + '<Size>5242880</Size></Part></ListPartsResult>');
   }
 
+  // 模拟不存在的对象：错误体里刻意带上桶名，用于验证脱敏
+  if (request.method === 'GET' && url.pathname.includes('missing')) {
+    return xml('<?xml version="1.0" encoding="UTF-8"?>'
+      + '<Error><Code>NoSuchKey</Code>'
+      + '<Message>The specified key does not exist in bucket my-bucket</Message>'
+      + '<BucketName>my-bucket</BucketName></Error>', 404);
+  }
+
   // CompleteMultipartUpload
   if (request.method === 'POST' && url.searchParams.has('uploadId')) {
     return xml('<?xml version="1.0" encoding="UTF-8"?>'
@@ -68,7 +76,12 @@ globalThis.fetch = async (request, init) => {
 
   return new Response('BODY', {
     status: 200,
-    headers: { 'Content-Type': 'text/plain', 'Content-Length': '4', 'ETag': '"abc123"' },
+    headers: {
+      'Content-Type': 'text/plain', 'Content-Length': '4', 'ETag': '"abc123"',
+      // 上游内部信息，匿名响应必须剥离
+      'x-bz-file-id': '4_z123_c456', 'x-amz-request-id': 'req-abc-123',
+      'x-bz-info-src_last_modified_millis': '1700000000000',
+    },
   });
 };
 
@@ -113,11 +126,20 @@ await check('缺少密钥时返回 500 且不回源', async () => {
   return body.error;
 });
 
-await check('health 返回匿名未鉴权', async () => {
+await check('health：匿名只返回最小信息（不含区域/桶模式）', async () => {
   const res = await handle(req('/__api/health'), env, ctx);
   const body = await res.json();
-  assert(res.status === 200 && body.region === 'us-west-001', 'region=' + body.region);
-  assert(body.authenticated === false, 'anonymous should be false');
+  assert(body.ok === true && body.authenticated === false, JSON.stringify(body));
+  assert(body.region === undefined, '匿名不应泄露 region');
+  assert(body.bucketMode === undefined, '匿名不应泄露 bucketMode');
+  assert(body.publicPrefix === undefined, '匿名不应泄露 publicPrefix');
+  return JSON.stringify(body);
+});
+
+await check('health：管理员可见详细配置', async () => {
+  const res = await handle(req('/__api/health', { headers: { Authorization: basic } }), env, ctx);
+  const body = await res.json();
+  assert(body.authenticated === true && body.region === 'us-west-001', JSON.stringify(body));
   return JSON.stringify(body);
 });
 
@@ -328,11 +350,11 @@ await check('$path 模式：桶名取自 URL 首段', async () => {
 });
 
 await check('$path 模式：目录列表与桶前缀 API', async () => {
-  const res = await handle(req('/my-bucket/docs/'), pathEnv, ctx);
+  const res = await handle(req('/my-bucket/docs/', { headers: { Authorization: basic } }), pathEnv, ctx);
   const body = await res.text();
   assert(res.headers.get('content-type').includes('text/html'), '非 HTML');
   assert(body.includes('readme.txt'), '缺少条目');
-  assert(body.includes('/my-bucket/__manage'), '管理器链接未带桶前缀');
+  assert(body.includes('/my-bucket/__manage'), '管理员视图应给出带桶前缀的管理器入口');
 
   const api = await handle(
     req('/my-bucket/__api/list', { headers: { Authorization: basic } }), pathEnv, ctx,
@@ -376,8 +398,73 @@ await check('匿名根目录：ROOT_ACTION=welcome 渲染引导页', async () =>
   const body = await res.text();
   assert(res.status === 200, 'status=' + res.status);
   assert(res.headers.get('content-type').includes('text/html'), '非 HTML');
-  assert(body.includes('Backblaze B2 资源网关') && body.includes('my-bucket'), '内容不完整');
-  return 'HTML ' + body.length + ' bytes';
+  assert(body.includes('Backblaze B2 资源网关'), '内容不完整');
+  assert(!body.includes('my-bucket'), '引导页泄露了桶名');
+  assert(!body.includes('us-west-001'), '引导页泄露了区域');
+  return 'HTML ' + body.length + ' bytes（已脱敏）';
+});
+
+/* ---------- 信息泄露与防滥用加固 ---------- */
+await check('响应剥离 B2 内部头（x-bz-* / x-amz-request-id）', async () => {
+  const res = await handle(req('/share/photo.jpg'), shareEnv, ctx);
+  assert(res.headers.get('x-bz-file-id') === null, 'x-bz-file-id 未剥离');
+  assert(res.headers.get('x-amz-request-id') === null, 'x-amz-request-id 未剥离');
+  assert(res.headers.get('x-bz-info-src_last_modified_millis') === null, 'x-bz-info-* 未剥离');
+  assert(res.headers.get('etag') === '"abc123"', 'ETag 应保留以支撑断点续传');
+  assert(res.headers.get('x-content-type-options') === 'nosniff', '缺少 nosniff');
+  return '内部头已剥离，ETag 保留';
+});
+
+await check('匿名目录列表不泄露桶名与管理器入口', async () => {
+  const res = await handle(req('/share/'), shareEnv, ctx);
+  const body = await res.text();
+  assert(!body.includes('my-bucket'), '泄露了桶名');
+  assert(!body.includes('__manage'), '匿名视图不应暴露管理器入口');
+  assert(body.includes('readme.txt'), '仍应正常列出文件');
+  return '已脱敏';
+});
+
+await check('管理员目录列表仍可见桶名与管理入口', async () => {
+  const res = await handle(req('/share/', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const body = await res.text();
+  assert(body.includes('my-bucket'), '管理员应能看到桶名');
+  assert(body.includes('__manage'), '管理员应能看到管理器入口');
+  return 'ok';
+});
+
+await check('匿名遇到上游错误不回传 XML 细节', async () => {
+  const res = await handle(req('/share/missing.txt'), shareEnv, ctx);
+  const body = await res.text();
+  assert(res.status === 404, 'status=' + res.status);
+  assert(!body.includes('NoSuchKey') && !body.includes('my-bucket'), '错误体泄露了上游细节: ' + body);
+  return body.trim();
+});
+
+await check('管理员仍能看到上游错误细节用于排错', async () => {
+  const res = await handle(
+    req('/private/missing.txt', { headers: { Authorization: basic } }), shareEnv, ctx,
+  );
+  const body = await res.text();
+  assert(res.status === 404, 'status=' + res.status);
+  assert(body.includes('my-bucket'), '管理员应保留上游错误正文');
+  return '保留排错信息';
+});
+
+await check('匿名 ?redirect=1 不会拿到预签名 URL（含端点/keyID）', async () => {
+  const res = await handle(req('/share/photo.jpg?redirect=1'), { ...shareEnv, ALLOW_REDIRECT: 'true' }, ctx);
+  assert(res.status === 200, 'status=' + res.status);
+  assert(!(res.headers.get('location') || '').includes('X-Amz-Signature'), '匿名拿到了预签名直链');
+  return '已拒绝 302 直链';
+});
+
+await check('管理员 ?redirect=1 可拿到预签名直链', async () => {
+  const res = await handle(
+    req('/private/photo.jpg?redirect=1', { headers: { Authorization: basic } }),
+    { ...shareEnv, ALLOW_REDIRECT: 'true' }, ctx,
+  );
+  assert(res.status === 302, 'status=' + res.status);
+  assert(res.headers.get('location').includes('X-Amz-Signature'), '缺少签名参数');
+  return '管理员可用';
 });
 
 await check('管理器内嵌前端 JS 可解析', async () => {

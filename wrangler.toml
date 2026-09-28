@@ -89,6 +89,12 @@ ALLOWED_ORIGINS = "*"
 # 兼容 rclone --b2-download-url（去掉 URL 中 file/<bucket>/ 前缀）
 RCLONE_DOWNLOAD = "false"
 
+# 匿名信息收敛：隐藏桶名/区域，且对匿名请求隐藏上游错误正文（强烈建议保持 true）
+HIDE_BUCKET_INFO = "true"
+
+# 剥离 B2/S3 内部响应头（x-bz-*、x-amz-request-id、x-amz-version-id 等）
+STRIP_UPSTREAM_META = "true"
+
 # 调试模式：出错时返回详细堆栈（生产环境请保持 false）
 DEBUG = "false"
 

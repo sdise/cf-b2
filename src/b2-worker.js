@@ -274,6 +274,44 @@ function publicBase(cfg, bucket) {
   return cfg.bucketMode === 'path' ? '/' + bucket + '/' : '/';
 }
 
+/** 会暴露后端实现/对象内部信息的响应头，统一剥离 */
+const LEAKY_HEADERS = [
+  'x-amz-request-id', 'x-amz-id-2', 'x-amz-version-id', 'x-amz-expiration',
+  'x-amz-replication-status', 'x-amz-server-side-encryption',
+  'x-amz-server-side-encryption-aws-kms-key-id', 'x-amz-mp-parts-count',
+  'x-bz-content-sha1', 'x-bz-info-src_last_modified_millis',
+];
+
+function sanitizeUpstreamHeaders(headers) {
+  for (const name of LEAKY_HEADERS) headers.delete(name);
+  for (const name of [...headers.keys()]) {
+    if (name.startsWith('x-bz-') || name.startsWith('x-rgw-')) headers.delete(name);
+  }
+  headers.set('X-Content-Type-Options', 'nosniff');
+  headers.delete('Set-Cookie');
+  return headers;
+}
+
+/** 对匿名请求隐藏上游错误细节，避免从 XML 里读出桶名 / 内部标识 */
+function sanitizeUpstreamError(response, cfg, extraHeaders) {
+  const status = response.status;
+  let detail = '';
+  try {
+    detail = String(response.statusText || '');
+  } catch {
+    detail = '';
+  }
+  console.error('[cf-b2-worker] upstream', status, detail);
+  const body = status === 404 ? 'Not Found'
+    : status === 403 ? 'Forbidden'
+      : status === 416 ? 'Range Not Satisfiable'
+        : 'Upstream Error';
+  return new Response(body, {
+    status,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store', ...extraHeaders },
+  });
+}
+
 function loadConfig(env) {
   const rawEndpoint = String(env.B2_ENDPOINT || DEFAULT_ENDPOINT).trim().replace(/\/+$/, '');
   const endpoint = new URL(rawEndpoint);
@@ -310,6 +348,9 @@ function loadConfig(env) {
     enableWrite: readBool(env.ENABLE_WRITE, true),
     enableDelete: readBool(env.ENABLE_DELETE, true),
     enableManage: readBool(env.ENABLE_MANAGE, true),
+    // 匿名信息收敛：隐藏桶名 / 区域，并剥离 B2 内部响应头
+    hideDetails: readBool(env.HIDE_BUCKET_INFO, true),
+    stripUpstreamMeta: readBool(env.STRIP_UPSTREAM_META, true),
     // 匿名访问目录时的行为：deny(返回403 JSON，默认) | redirect(302到管理器) | welcome(渲染引导页)
     rootAction: ['deny', 'redirect', 'welcome'].includes(String(env.ROOT_ACTION || 'deny').toLowerCase())
       ? String(env.ROOT_ACTION).toLowerCase() : 'deny',
@@ -477,7 +518,8 @@ function applyRclone(cfg, key) {
 }
 
 /** 下载代理：Range / 条件请求 / 304 / 缓存 / CF 丢失 content-range 的补偿重试 */
-async function readObject(request, env, ctx, cfg, bucket, key) {
+async function readObject(request, env, ctx, cfg, bucket, key, options = {}) {
+  const { anonymous = false } = options;
   const url = new URL(request.url);
   const upstreamUrl = objectUrl(cfg, bucket, key);
   const method = request.method;
@@ -499,7 +541,8 @@ async function readObject(request, env, ctx, cfg, bucket, key) {
   }
 
   // 2) 可选：302 跳转预签名直链，把大文件流量完全交给 B2（会绕过 CF 缓存）
-  if (cfg.allowRedirect && method === 'GET' && url.searchParams.get('redirect') === '1') {
+  //    该 URL 内含端点、桶名与 keyID，故仅限已登录用户使用
+  if (cfg.allowRedirect && !anonymous && method === 'GET' && url.searchParams.get('redirect') === '1') {
     const signed = await signerOf(cfg).sign('GET', upstreamUrl, {
       headers: {}, unsignedPayload: true, expiresIn: cfg.presignExpires,
     });
@@ -540,21 +583,31 @@ async function readObject(request, env, ctx, cfg, bucket, key) {
     }
   }
 
+  const responseHeaders = new Headers(response.headers);
+  if (cfg.stripUpstreamMeta) sanitizeUpstreamHeaders(responseHeaders);
+
   if (method === 'HEAD') {
+    if (!response.ok && anonymous) return sanitizeUpstreamError(response, cfg, corsHeaders(request, cfg));
     return new Response(null, {
-      status: response.status, statusText: response.statusText, headers: response.headers,
+      status: response.status, statusText: response.statusText, headers: responseHeaders,
     });
   }
 
-  const headers = new Headers(response.headers);
+  // 匿名请求不回传上游错误正文（XML 中可能含桶名/文件 ID），只回状态码
+  if (!response.ok && anonymous) {
+    return sanitizeUpstreamError(response, cfg, {
+      'Cache-Control': 'no-store',
+      ...(request && cfg ? corsHeaders(request, cfg) : {}),
+    });
+  }
+
+  const headers = responseHeaders;
   if (cfg.cacheMaxAge > 0) headers.set('Cache-Control', 'public, max-age=' + cfg.cacheMaxAge);
   if (!headers.has('Accept-Ranges')) headers.set('Accept-Ranges', 'bytes');
   headers.set('X-Content-Type-Options', 'nosniff');
   headers.delete('Set-Cookie');
 
-  const out = new Response(response.body, {
-    status: response.status, statusText: response.statusText, headers,
-  });
+  const out = new Response(response.body, { status: response.status, headers });
 
   if (cacheable && response.status === 200) {
     try {
@@ -779,16 +832,21 @@ async function apiRouter(request, env, ctx, cfg, url) {
     return new Response(null, { status: 204, headers: corsHeaders(request, cfg) });
   }
 
-  // health 无需鉴权，且不泄露任何敏感配置
+  // health 无需鉴权，但匿名只能拿到最小信息（不暴露区域 / 桶模式）
   if (action === 'health') {
+    const authenticated = (await checkAuth(request, cfg)).ok;
+    const details = authenticated || !cfg.hideDetails;
     return json({
       ok: true,
       service: 'cf-b2-worker',
-      bucketMode: cfg.bucketMode,
-      region: cfg.region,
+      authenticated,
       publicRead: cfg.publicRead,
-      publicPrefix: cfg.publicPrefix || '',
-      authenticated: (await checkAuth(request, cfg)).ok,
+      ...(details ? {
+        bucketMode: cfg.bucketMode,
+        region: cfg.region,
+        publicPrefix: cfg.publicPrefix || '',
+        hideDetails: cfg.hideDetails,
+      } : {}),
     }, 200, request, cfg);
   }
 
@@ -950,7 +1008,7 @@ function humanSize(bytes) {
   return value.toFixed(unit === 0 ? 0 : 1) + ' ' + units[unit];
 }
 
-function renderDirectory(data, prefix, base, bucketLabel) {
+function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
   const rows = [];
 
   if (prefix) {
@@ -992,9 +1050,11 @@ function renderDirectory(data, prefix, base, bucketLabel) {
     'tr:last-child td{border-bottom:0}a{color:#7cc4ff;text-decoration:none}',
     'a:hover{text-decoration:underline}.empty{color:#8b93a7;padding:24px;text-align:center}',
     '</style></head><body><div class="wrap">',
-    '<h1>' + escapeHtml(bucketLabel) + ' - /' + escapeHtml(prefix) + '</h1>',
+    '<h1>' + escapeHtml(bucketLabel) + ' ' + escapeHtml('/' + prefix) + '</h1>',
     '<div class="sub">' + data.folders.length + ' 个目录 / ' + data.files.length
-      + ' 个文件 · <a href="' + base + MANAGE_PATH.slice(1) + '">打开管理器</a></div>',
+      + ' 个文件'
+      + (showManage ? ' · <a href="' + base + MANAGE_PATH.slice(1) + '">打开管理器</a>' : '')
+      + '</div>',
     '<table>' + (rows.join('') || '<tr><td class="empty">（空）</td></tr>') + '</table>',
     '<div style="margin-top:16px">' + nextLink + '</div>',
     '</div></body></html>',
@@ -1027,9 +1087,11 @@ function welcomePage(cfg, bucketLabel, prefix, publicPath) {
       : '<li>匿名下载：<code>/&lt;对象key&gt;</code>，例如 <code>/photos/a.jpg</code></li>'
         + '<li>可视化管理：<a href="' + manageUrl + '">打开 ' + manageUrl + '</a></li>'),
     '</ul>',
-    '<p style="margin-top:14px">当前桶：<code>' + escapeHtml(bucketLabel) + '</code>'
-      + (prefix ? ' · 前缀 <code>' + escapeHtml(prefix) + '</code>' : '')
-      + ' · 区域 <code>' + escapeHtml(cfg.region) + '</code></p>',
+    (cfg.hideDetails
+      ? '<p style="margin-top:14px">区域与桶信息已对用户隐藏。</p>'
+      : '<p style="margin-top:14px">当前桶：<code>' + escapeHtml(bucketLabel) + '</code>'
+        + (prefix ? ' · 前缀 <code>' + escapeHtml(prefix) + '</code>' : '')
+        + ' · 区域 <code>' + escapeHtml(cfg.region) + '</code></p>'),
     '<a class="btn" href="' + manageUrl + '">进入文件管理器</a>',
     '</div></body></html>',
   ].join('\n');
@@ -1485,7 +1547,9 @@ async function handle(request, env, ctx) {
           return json({ ok: true, bucket, prefix, ...result }, 200, request, cfg);
         }
         const base = cfg.bucketMode === 'path' ? '/' + bucket + '/' : '/';
-        return html(renderDirectory(result, prefix, base, bucket));
+        // 匿名视图不显示桶名，也不给出管理器入口
+        const label = (auth.ok || !cfg.hideDetails) ? bucket : '公开目录';
+        return html(renderDirectory(result, prefix, base, label, auth.ok));
       }
 
       if (!resolved.key) return deny('缺少对象 key', request, cfg, 400);
@@ -1502,7 +1566,7 @@ async function handle(request, env, ctx) {
         }
       }
 
-      return readObject(request, env, ctx, cfg, bucket, applyRclone(cfg, resolved.key));
+      return readObject(request, env, ctx, cfg, bucket, applyRclone(cfg, resolved.key), { anonymous });
     }
 
     case 'PUT': {
