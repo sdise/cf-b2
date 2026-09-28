@@ -355,7 +355,12 @@ curl -X PUT -T ./demo.bin \
 - 目录浏览、面包屑导航、翻页
 - 拖拽上传、进度条；超过 `MULTIPART_THRESHOLD` 自动切换分片上传
 - **主题切换**（按钮在右上角）：暖色（默认）/ 深色，选择记在 localStorage
-- **上传方式切换**（下拉框）：见 6.1
+- 一键复制临时直链（预签名 GET，默认 1 小时）
+- 下载（带 `attachment` 的预签名链接）
+- 重命名（服务端复制 + 删除）
+- 新建目录、删除文件/目录
+- 右上角输入 Basic 用户名/密码或 Bearer 令牌后点"鉴权"；若浏览器已完成 Basic 弹窗登录，通常无需再填
+- 亮色主题下**目录行**为暖色底 + 琥珀色文字，文件行为浅色卡片；深色模式维持单色不变
 
 ### 6.1 两种上传方式怎么选
 
@@ -378,41 +383,124 @@ curl -X PUT -T ./demo.bin \
 
 > **>100MB 的文件能否经 Worker 上传？** 能，但只能走「Worker 代理 + 分片」：每片 ≤ `multipartPartSize` 且 <100MB，逐片转发。代价是两份带宽套娃、占 CPU/内存、速度慢。
 > 想快的话，请在 B2 桶配好 CORS 后用「直传」，配好后错误信息也就不出现了。
-- 一键复制临时直链（预签名 GET，默认 1 小时）
-- 下载（带 `attachment` 的预签名链接）
-- 重命名（服务端复制 + 删除）
-- 新建目录、删除文件/目录
-- 右上角输入 Basic 用户名/密码或 Bearer 令牌后点"鉴权"；若浏览器已完成 Basic 弹窗登录，通常无需再填
 
 ---
 
-## 7. CORS 配置（直传必须）
+## 7. CORS：到底是谁在限制，怎么解除
 
-管理器运行在你的域名上，但 `PUT` 是发给 `https://s3.<region>.backblazeb2.com` 的预签名 URL，属于跨域请求。必须在 B2 桶上配置 CORS：
+### 7.1 谁限制？
 
-**B2 控制台 → Bucket Settings → CORS Rules**，或命令行：
+**两边都参与了，但角色不同：**
+
+| 角色 | 做了什么 |
+| --- | --- |
+| **浏览器**（强制方） | 同源策略：页面在 `https://xxx.workers.dev`，却要把数据 PUT 到 `https://s3.us-east-005.backblazeb2.com`，属于跨源。带自定义头（`x-amz-content-sha256`）的 PUT 必须先发 `OPTIONS` 预检。浏览器拿不到合法的 CORS 响应头，就直接掐掉请求，只抛一个笼统的 network error（真实原因在 DevTools → Console/Network 里写着 "blocked by CORS policy"） |
+| **Backblaze B2**（授权方） | 官方原话："By default, the Backblaze B2 servers will **deny** preflight requests." 桶上没配 CORS 规则时，B2 就不返回 `Access-Control-Allow-*` 头 → 浏览器拒绝。**配了规则才是解封** |
+
+推论：
+
+- **非浏览器客户端**（curl / rclone / aws-cli / 服务端代码）**完全不受影响**——我一直用它测试就是证据。
+- 所以这不是"能用某种 Hidden 开关绕开"，而是**必须在桶上加 CORS 规则**。
+
+### 7.2 为什么在 Backblaze 网页控制台里找不到？
+
+因为 **Web 控制台没有 CORS 设置界面**。官方只允许三种途径：`b2_create_bucket` / `b2_update_bucket` **API**、**B2 CLI**、或 S3 兼容 API 的 **PutBucketCors**。别再在 B2 网页里翻了。
+
+### 7.3 方案 A：B2 CLI（推荐）
 
 ```bash
-b2 update-bucket --corsRules '[
-  {
-    "corsRuleName": "allowUploadFromMySite",
-    "allowedOrigins": ["https://dl.example.com"],
-    "allowedOperations": ["s3_put", "s3_get", "s3_head"],
-    "allowedHeaders": ["content-type", "x-amz-content-sha256", "x-amz-request-id"],
-    "exposeHeaders": ["ETag"],
-    "maxAgeSeconds": 3600
-  }
-]' your-bucket-name allPrivate
+# 1. 安装（需要 Python）
+pip install b2
+
+# 2. 登录：用你的 Application Key ID + Application Key
+b2 account authorize
+
+# 3. 看当前规则（默认为空）
+b2 get-bucket <你的桶名>
 ```
 
-要点：
+写一条规则。**注意 `allowedOperations` 里的 S3 操作名是这种带空格的人类可读写法**（我之前文档写 `s3_put` 是错的，B2 不认）：
 
-- `allowedOrigins` 必须是完整 Origin（含协议），B2 也支持形如 `https://*.example.com` 的通配形式
-- `allowedOperations` 至少要 `s3_put`
-- `allowedHeaders` 必须包含 `x-amz-content-sha256`，否则预检失败
-- 如果希望自己的 CDN 域也能被 CDN 读取，把 `https://dl.example.com` 一并写入 `allowedOrigins`
+```bash
+b2 update-bucket \
+  --corsRules '[
+    {
+      "corsRuleName": "allow-worker-upload",
+      "allowedOrigins": ["https://b2.mose19960101.workers.dev"],
+      "allowedOperations": ["S3 Put Object", "S3 Get Object", "S3 Head Object"],
+      "allowedHeaders": ["content-type", "x-amz-content-sha256"],
+      "exposeHeaders": ["ETag"],
+      "maxAgeSeconds": 3600
+    }
+  ]' \
+  <你的桶名> allPrivate
+```
 
-> 只做**读取/CDN 代理**时（全部请求经过 Worker），不需要任何 B2 CORS 配置。
+Windows PowerShell（建议写文件避免引号地狱）：
+
+```powershell
+# cors.json
+# [ { "corsRuleName": "allow-worker-upload",
+#     "allowedOrigins": ["https://b2.mose19960101.workers.dev"],
+#     "allowedOperations": ["S3 Put Object","S3 Get Object","S3 Head Object"],
+#     "allowedHeaders": ["content-type","x-amz-content-sha256"],
+#     "exposeHeaders": ["ETag"], "maxAgeSeconds": 3600 } ]
+b2 update-bucket --corsRules (Get-Content .\cors.json -Raw) <你的桶名> allPrivate
+b2 get-bucket <你的桶名>          # 确认 corsRules 已写入
+```
+
+### 7.4 方案 B：S3 API（aws-cli，最贴近我们用的端点）
+
+我们用的是 S3 端点，所以直接用 `PutBucketCors` 更保险（**注意：S3 设置的规则和 Native API 设置的是两套独立命名空间**，别混用查看）：
+
+```json
+/* s3cors.json —— AWS 风格 */
+{
+  "CORSRules": [
+    {
+      "AllowedOrigins": ["https://b2.mose19960101.workers.dev"],
+      "AllowedMethods": ["GET", "PUT", "HEAD"],
+      "AllowedHeaders": ["content-type", "x-amz-content-sha256"],
+      "ExposeHeaders": ["ETag"],
+      "MaxAgeSeconds": 3600
+    }
+  ]
+}
+```
+
+```bash
+aws configure set aws_access_key_id <keyID>
+aws configure set aws_secret_access_key <applicationKey>
+aws s3api put-bucket-cors \
+  --bucket <你的桶名> \
+  --cors-configuration file://s3cors.json \
+  --endpoint-url https://s3.us-east-005.backblazeb2.com
+aws s3api get-bucket-cors --bucket <你的桶名> --endpoint-url https://s3.us-east-005.backblazeb2.com
+```
+
+### 7.5 规则字段速查（官方限制）
+
+| 字段 | 取值 / 限制 |
+| --- | --- |
+| `corsRuleName` | 必填，6–63 位，仅字母数字和连字符，桶内唯一，不能以 `b2-` 开头 |
+| `allowedOrigins` | 必填。`https://域名`、可带端口、`https://*.example.com` 通配、`https`（任意 https 源）、`*`（任意源；**有 `*` 时必须唯一**） |
+| `allowedOperations` | 必填，至少一项。S3 侧只能是：`S3 Put Object` / `S3 Get Object` / `S3 Head Object` / `S3 Delete Object`（**区分大小写、带空格**） |
+| `allowedHeaders` | 可选。`content-type`、`x-amz-content-sha256`，支持后缀通配 `x-bz-info-*`，或单个 `*` |
+| `exposeHeaders` | 可选，必须是完整头名（如 `ETag`） |
+| `maxAgeSeconds` | **必填**，0–86400 |
+| 数量/大小 | 每桶最多 100 条，每条 <1000 字节；**命中第一条匹配规则即止** |
+
+### 7.6 配完怎么验证
+
+1. 管理器里把上传方式保持为「直传」，重传一个小文件。
+2. F12 → Network：应当看到先 `OPTIONS`（返回 200/204 且带 `Access-Control-Allow-Origin`、`Access-Control-Allow-Headers`），随后 `PUT` 返回 200。
+3. 仍失败的话，看 Console 里的具体原因多半是：
+   - `Request header field x-amz-content-sha256 is not allowed` → `allowedHeaders` 少了它（或直接用 `"allowedHeaders": ["*"]` 排错）
+   - `Method PUT is not allowed` → `allowedOperations` 少了 `S3 Put Object`
+   - `No 'Access-Control-Allow-Origin' header` → `allowedOrigins` 没命中（记得带 `https://`，workers.dev 子域也要写全）
+
+> 只做**读取 / CDN 代理**时（请求都经 Worker 转发），浏览器不跨源，**不需要任何 B2 CORS 配置**。
+> 也可以不配 CORS：把界面上传方式切到「Worker 代理」，代价是 100MB/请求上限且大文件更慢。
 
 ---
 

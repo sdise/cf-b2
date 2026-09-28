@@ -505,6 +505,25 @@ await check('GET multipart/part 仍返回预签名 URL（直传路径）', async
   return 'presign ok';
 });
 
+await check('暖色主题：目录行有独立暖色底，深色主题不变', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(page.includes('--folder:#f6e6c8'), '暖色缺少目录行底色');
+  assert(page.includes('--folderTxt:#a75a12'), '暖色缺少目录文字色');
+  assert(page.includes('tr.dir td{background:var(--folder)}'), '缺少目录行样式规则');
+  const darkBlock = page.slice(page.indexOf('[data-theme="dark"]'));
+  assert(darkBlock.includes('--folder:#161a22;'), '深色目录底色应与卡片同色（保持不变）');
+  assert(!darkBlock.includes('--folderTxt:#a75a12'), '深色不应沿用暖色的目录文字色');
+  assert(page.includes('class=\\"dir\\"') || page.includes('class="dir"'), '目录行未打上 dir 类');
+  return 'warm 目录高亮 / dark 不变';
+});
+
+await check('目录索引页的目录行同样带 dir 类', async () => {
+  const res = await handle(req('/share/'), shareEnv, ctx);
+  const body = await res.text();
+  assert(body.includes('<tr class="dir">'), '目录行未着色');
+  return 'ok';
+});
+
 await check('主题：默认暖色且支持深色切换', async () => {
   const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
   assert(page.includes('--bg:#f6f0e4'), '缺少暖色默认值');

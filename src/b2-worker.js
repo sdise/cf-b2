@@ -1033,10 +1033,14 @@ const THEMES = {
   warm: {
     bg: '#f6f0e4', card: '#fffdf7', line: '#e6dcc6', txt: '#3b3327',
     dim: '#8a7d66', acc: '#c2410c', hover: '#f4ecdb', btn: '#ffffff', chip: '#f0e4cd',
+    // 目录行暖色底 + 琥珀色文字，文件行保持卡片浅色（保持不变）
+    folder: '#f6e6c8', folderTxt: '#a75a12',
   },
   dark: {
     bg: '#0f1115', card: '#161a22', line: '#222836', txt: '#e6e6e6',
     dim: '#8b93a7', acc: '#4c8dff', hover: '#1a1f29', btn: '#ffffff', chip: '#1d222d',
+    // 深色模式维持原样：目录行与文件行同色，不做额外着色
+    folder: '#161a22', folderTxt: '#4c8dff',
   },
 };
 
@@ -1091,7 +1095,7 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
 
   for (const folder of data.folders) {
     const name = folder.slice(prefix.length).replace(/\/$/, '');
-    rows.push('<tr><td>[DIR] <a href="' + base + escapeHtml(folder) + '">' + escapeHtml(name) + '/</a></td>'
+    rows.push('<tr class="dir"><td>[DIR] <a href="' + base + escapeHtml(folder) + '">' + escapeHtml(name) + '/</a></td>'
       + '<td>-</td><td>-</td>'
       + '<td><a href="' + base + escapeHtml(folder) + '?format=json">JSON</a></td></tr>');
   }
@@ -1124,6 +1128,8 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
     'table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}',
     'td{padding:10px 14px;border-bottom:1px solid var(--line);font-size:14px}',
     'tr:last-child td{border-bottom:0}tr:hover td{background:var(--hover)}',
+    'tr.dir td{background:var(--folder)}tr.dir:hover td{background:var(--hover)}',
+    'tr.dir td a{color:var(--folderTxt)}tr.dir td [data-act]{color:var(--folderTxt)}',
     'a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}',
     '.empty{color:var(--dim);padding:24px;text-align:center}',
     '</style></head><body><div class="wrap">',
@@ -1237,6 +1243,8 @@ function managePage(cfg, url) {
     'th,td{padding:8px 12px;border-bottom:1px solid var(--line);text-align:left}',
     'th{color:var(--dim);font-weight:500;font-size:12px;letter-spacing:.04em}',
     'tr:last-child td{border-bottom:0}tr:hover td{background:var(--hover)}',
+    'tr.dir td{background:var(--folder)}tr.dir:hover td{background:var(--hover)}',
+    'tr.dir td a{color:var(--folderTxt)}tr.dir td button{color:var(--folderTxt)}',
     '.muted{color:var(--dim)}',
     '.bar{height:6px;border-radius:4px;background:var(--chip);overflow:hidden;margin-top:6px}',
     '.bar>i{display:block;height:100%;background:var(--acc);width:0}',
@@ -1340,11 +1348,11 @@ function managePage(cfg, url) {
     '}',
     'function render(data) {',
     '  var rows = "";',
-    '  if (PREFIX) rows += \'<tr><td><a data-act="up">.. 返回上级</a></td><td></td><td></td><td></td></tr>\';',
+    '  if (PREFIX) rows += \'<tr class="dir"><td><a data-act="up">.. 返回上级</a></td><td></td><td></td><td></td></tr>\';',
     '  (data.folders || []).forEach(function (p) {',
     '    var name = p.slice(PREFIX.length);',
     '    if (name.charAt(name.length - 1) === "/") name = name.slice(0, -1);',
-    '    rows += "<tr><td>[DIR] <a data-act=\\"dir\\" data-p=\\"" + esc(p) + "\\">" + esc(name) + "</a></td>"',
+    '    rows += "<tr class=\\"dir\\"><td>[DIR] <a data-act=\\"dir\\" data-p=\\"" + esc(p) + "\\">" + esc(name) + "</a></td>"',
     '      + "<td class=\\"muted\\">目录</td><td></td>"',
     '      + "<td style=\\"text-align:right\\"><button class=\\"mini\\" data-act=\\"deldir\\" data-k=\\"" + esc(p + ".keep") + "\\">删除</button></td></tr>";',
     '  });',
