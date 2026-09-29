@@ -166,6 +166,8 @@ function buildSandbox(html) {
     setTimeout: (fn) => { fn(); return 0; },
     clearTimeout: () => {},
   };
+  sandbox.setInterval = (fn, ms) => { sandbox.__poll = { fn, ms }; return 1; };
+  sandbox.clearInterval = () => {};
   sandbox.globalThis = sandbox;
 
   const scripts = [...html.matchAll(/<script(?![^>]*type="application\/json")[^>]*>([\s\S]*?)<\/script>/g)]
@@ -220,6 +222,26 @@ await check('用量卡片渲染：空间、进度、Class B/C 计数与重算按
   assert(card.includes('上次 2026-09-30 00:00 UTC'), '未标注上次重置时间');
   assert(card.includes('当日终值扫描'), '未标注窗口扫描');
   return card.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+});
+
+await check('USAGE_POLL_SECONDS=0（默认）：不注册任何定时轮询', async () => {
+  const { sandbox, scripts } = buildSandbox(await render(env));
+  for (const code of scripts) vm.runInNewContext(code, sandbox);
+  assert(!sandbox.__poll, '默认不该有轮询');
+  return '无自动刷新（打开页面读一次）';
+});
+
+await check('USAGE_POLL_SECONDS>0：按间隔轮询，且只在页面可见时拉取', async () => {
+  const { sandbox, scripts } = buildSandbox(await render({ ...env, USAGE_POLL_SECONDS: '60' }));
+  for (const code of scripts) vm.runInNewContext(code, sandbox);
+  assert(sandbox.__poll && sandbox.__poll.ms === 60000, '轮询间隔不对: ' + JSON.stringify(sandbox.__poll && sandbox.__poll.ms));
+  assert(typeof sandbox.__poll.fn === 'function', '轮询回调缺失');
+  // 可见/隐藏两种状态都不应抛错（隐藏时直接跳过）
+  sandbox.document.visibilityState = 'visible';
+  sandbox.__poll.fn();
+  sandbox.document.visibilityState = 'hidden';
+  sandbox.__poll.fn();
+  return '每 60s 回调一次，隐藏时跳过';
 });
 
 await check('默认值来自服务端配置：分片 25 MiB / 并发 3', async () => {

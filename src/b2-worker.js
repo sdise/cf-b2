@@ -420,6 +420,8 @@ function loadConfig(env) {
     usageResetHours: parseHourList(env.USAGE_RESET_HOURS, '23'),
     // Durable Object 计数：每累计多少次增量才落盘（1 = 每次请求都落盘，最精确）
     usageDoWriteEvery: Math.max(1, Math.min(100, readInt(env.USAGE_DO_WRITE_EVERY, 1))),
+    // 管理页自动刷新间隔（秒）：0 = 关闭（默认，打开页面才读一次）
+    usagePollSeconds: Math.max(0, Math.min(3600, readInt(env.USAGE_POLL_SECONDS, 0))),
     // 每日额度（B2 免费账户的 Class B/C 各 2500 次/天，按你账户实际套餐调整）
     classBQuota: Math.max(0, readInt(env.CLASS_B_DAILY_QUOTA, 2500)),
     classCQuota: Math.max(0, readInt(env.CLASS_C_DAILY_QUOTA, 2500)),
@@ -1620,6 +1622,7 @@ async function apiRouter(request, env, ctx, cfg, url) {
         windowHour: cfg.usageRefreshHour,
         minInterval: state.minInterval,
         autoScan: cfg.usageAutoScan,
+        pollSeconds: cfg.usagePollSeconds,
         scheduledBuckets: scheduledBuckets(cfg),
         classA: used.A,
         classB: { used: used.B, quota: cfg.classBQuota, remaining: remaining(used.B, cfg.classBQuota) },
@@ -2095,6 +2098,7 @@ function managePage(cfg, url) {
     multipartPartSize: cfg.multipartPartSize,
     maxUploadBytes: cfg.maxUploadBytes,
     uploadConcurrency: cfg.uploadConcurrency,
+    pollSeconds: cfg.usagePollSeconds,
     apiPrefix: API_PREFIX,
   });
 
@@ -2722,6 +2726,7 @@ function managePage(cfg, url) {
     '    + (d.counterResetAt ? "，上次 " + esc(String(d.counterResetAt).replace("T", " ").slice(0, 16)) + " UTC" : ""));',
     '  if (d.counterBackendLabel) foot.push("计数后端：" + esc(d.counterBackendLabel));',
     '  if (d.autoScan === false) foot.push("空间快照由 Cron 定时刷新（不会自动重扫）");',
+    '  if (d.pollSeconds > 0) foot.push("每 " + d.pollSeconds + " 秒自动刷新（仅本页可见时）");',
     '  if (d.windowed) foot.push("本次是 UTC " + d.windowHour + ":00 窗口内的当日终值扫描");',
     '  if (d.scope) foot.push(esc(d.scope));',
     '  html += \'<div class="foot">\' + foot.map(function (t) { return "<span>" + t + "</span>"; }).join("")',
@@ -2745,6 +2750,13 @@ function managePage(cfg, url) {
     '  if (e.target && e.target.id === "btnUsageRefresh") loadUsage(true);',
     '});',
     'loadUsage(false);',
+    '/* 可选自动刷新：CFG.pollSeconds > 0 时按间隔重读用量（只读，不会触发扫描）；',
+    '   仅在标签页可见时拉取，后台标签页不消耗 DO 请求 */',
+    'if (CFG.pollSeconds > 0) {',
+    '  setInterval(function () {',
+    '    if (document.visibilityState === "visible") loadUsage(false);',
+    '  }, CFG.pollSeconds * 1000);',
+    '}',
     'el("bucketLabel").textContent = CFG.bucketMode === "fixed"',
     '  ? ("桶: " + CFG.bucketFixed)',
     '  : (CFG.bucketMode === "path" ? "桶: 按 URL 首段动态解析" : "桶: 按主机名首段动态解析");',

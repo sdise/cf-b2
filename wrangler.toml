@@ -149,6 +149,10 @@ USAGE_REFRESH_AT_UTC_HOUR = "-1"
 #   · $path / $host 模式无法枚举桶，必须在这里显式列出，例如 "bucket-a,bucket-b"
 USAGE_SCHEDULE_BUCKETS = ""
 
+# 管理页用量卡片自动刷新间隔（秒）：0 = 关闭（默认，只在打开页面时读一次）
+# 开启后仅在标签页可见时轮询；每次轮询 = 1 次 DO 请求（60 秒 ≈ 1440 次/天）
+USAGE_POLL_SECONDS = "0"
+
 # DO 计数每累计多少批才落盘（1 = 每批都写，最精确）
 # 免费计划 SQLite 行写入额度 10 万/天，提高该值可省额度（代价：DO 被驱逐时最多丢 N 批）
 USAGE_DO_WRITE_EVERY = "1"

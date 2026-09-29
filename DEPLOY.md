@@ -341,7 +341,8 @@ npx wrangler deploy
 
 | 动作 | 触发 | 频率 / 成本 |
 | --- | --- | --- |
-| 事务计数 | 每个发往 B2 的请求 | 1 次 DO 调用（或 1 次 Cache 读+写），异步执行 `ctx.waitUntil`，**不额外请求 B2** |
+| 事务计数（写入） | **每个发往 B2 的请求结束时**（`ctx.waitUntil`，异步） | 1 次 DO 调用（或 1 次 Cache 读+写），**不额外请求 B2**；`USAGE_DO_WRITE_EVERY>1` 时按批合并落盘 |
+| 面板数字（读取） | **打开/刷新管理页时读一次** | 无自动轮询（默认）；想自动刷新就设 `USAGE_POLL_SECONDS`（见下） |
 | 打开管理页 | 页面加载 | 只读已有快照；**只有 DO/缓存判定需要时才扫描** |
 | 空间扫描 | **Cron Triggers → `scheduled()`** | 由你在 Worker 上配置的 Cron 决定（推荐每天 23:00 UTC 一次）；**不依赖有人访问页面** |
 | 首次引导 | 第一次打开用量面板且从无快照 | 只扫一次，之后一律只读快照 |
@@ -377,6 +378,7 @@ crons = ["0 23 * * *"]     # 每天 23:00 UTC：同一次触发里「先刷新�
 | `USAGE_REFRESH_AT_UTC_HOUR` | `-1` | 惰性窗口：UTC 进入该小时后当天首次读取强制重扫；默认关闭（已有 Cron） |
 | `USAGE_SCHEDULE_BUCKETS` | 空 | Cron 要统计的桶（逗号分隔）；固定桶模式留空即用 `BUCKET_NAME` |
 | `USAGE_DO_WRITE_EVERY` | `1` | DO 计数每累计多少批才落盘（1 = 每次都写，最精确） |
+| `USAGE_POLL_SECONDS` | `0` | 管理页用量卡片自动刷新间隔（秒）；`0` = 关闭。开启后仅在标签页可见时轮询，每次 = 1 次 DO 请求 |
 | `CLASS_B_DAILY_QUOTA` | `2500` | Class B 每日额度（仅用于算"剩余"） |
 | `CLASS_C_DAILY_QUOTA` | `2500` | Class C 每日额度（仅用于算"剩余"） |
 
