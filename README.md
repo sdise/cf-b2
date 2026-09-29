@@ -192,9 +192,13 @@ npx wrangler login
 npx wrangler secret put B2_KEY_ID
 npx wrangler secret put B2_APPLICATION_KEY
 npx wrangler secret put ADMIN_PASS
-npx wrangler secret put ADMIN_USER        # 非敏感，也可写进 wrangler.toml 的 [vars]
-npx wrangler deploy
+npx wrangler secret put ADMIN_USER        # 非敏感，也可作为明文变量放控制台
+npx wrangler deploy --name <你的 Worker 名>   # 例：--name b2；名字写错会新建一个 Worker
 ```
+
+> **变量沿用控制台**：本仓库的 `wrangler.toml` 已设为「对控制台友好」（`keep_vars = true` + `[vars]` 整段注释），
+> 部署**不会覆盖或删除**你在控制台配置的任何变量；Cron 也交由控制台管理（配置里未声明 `crons` 时 wrangler 不接管）。
+> 想改成「以配置文件为准」：取消 `[vars]` 注释并填真实值即可。详见 `DEPLOY.md` 第 2 节。
 
 方式二：控制台（无需本地环境）
 

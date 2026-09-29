@@ -1,19 +1,50 @@
-# =============================================================
-# cf-b2-worker · Wrangler 配置
-# 部署：npx wrangler deploy
-# 本地：npx wrangler dev
-# 密钥类变量不要写在这里，用 `npx wrangler secret put XXX` 设置
-# =============================================================
+# =============================================================================
+# cf-b2-worker · Wrangler 配置（对控制台友好版：变量全部沿用控制台）
+#
+# 部署：npx wrangler deploy --name <你的 Worker 名>
+# 本地：npx wrangler dev           （变量从 .dev.vars 读，模板见 .dev.vars.example）
+#
+# -----------------------------------------------------------------------------
+# ⚠️ 一、wrangler 部署对变量的覆盖规则（Cloudflare 官方语义）
+#
+#   · 明文变量（控制台里标 Text 的 vars）：
+#       默认 wrangler 会「先清空该 Worker 上所有明文变量，再写入配置文件里的」。
+#       ⇒ 控制台上手动加/改的明文变量会被覆盖甚至删除。
+#   · 密钥（控制台上标 Secret，或用 wrangler secret put 建的）：
+#       官方原文："Secrets are never deleted by a deployment whether this flag is
+#       true or false." ⇒ 部署永远不会删除或覆盖密钥。
+#   · keep_vars = true：保留「配置文件里没有的」变量（同名项仍以配置文件为准）。
+#
+#   本文件已按「对控制台友好」配置：
+#       ① keep_vars = true
+#       ② [vars] 整段注释掉 ⇒ 部署不上传任何明文变量
+#     结果：部署不会改动你控制台里的任何变量，全部沿用控制台的值。
+#     代码里每个变量都有默认值（见 src/b2-worker.js 的 loadConfig），
+#     控制台漏配哪一项就用默认值，不会因此崩溃。
+#
+#   想改成「以配置文件为准」：取消下面 [vars] 的注释并填真实值即可
+#     （同名项会覆盖控制台；未在文件里出现的控制台变量仍被 keep_vars 保留）。
+#   想反过来「部署时清掉控制台多余变量」：把 keep_vars 改成 false。
+# -----------------------------------------------------------------------------
+# ⚠️ 二、name 决定「更新哪个 Worker」，写错会新建一个 Worker 而不是更新现有的
+#
+#   你线上的是 b2 ⇒ 部署请用：npx wrangler deploy --name b2
+#   （或直接把下面的 name 改成 "b2"）
+# -----------------------------------------------------------------------------
+# =============================================================================
 
 name = "cf-b2-worker"
 main = "src/b2-worker.js"
 compatibility_date = "2024-11-01"
 
-# ---------- 自定义域名 / 路由（三选一，按需打开）----------
-# 方式 A：Workers 的 workers.dev 子域（默认就有，无需配置）
+# 保留控制台上已有的明文变量（不因部署被清空/覆盖）——本文件的「对控制台友好」开关
+keep_vars = true
+
+# ---------- 自定义域名 / 路由 ----------
+# 路由由控制台管理时，保持下面 routes 全部注释：wrangler 不会去覆盖控制台的路由。
 workers_dev = true
 
-# 方式 B：Cloudflare 托管域名上的自定义子域（推荐，会自动创建 DNS 记录）
+# 方式 B：Cloudflare 托管域名上的自定义子域（会自动创建 DNS 记录）
 # [[routes]]
 # pattern = "dl.example.com"
 # custom_domain = true
@@ -23,168 +54,95 @@ workers_dev = true
 # pattern = "dl.example.com/*"
 # zone_name = "example.com"
 
-# ---------- 明文环境变量（非敏感）----------
-[vars]
-# Backblaze B2 的 S3 兼容端点，请换成你自己桶的 Endpoint（B2 控制台桶详情页可见）
-B2_ENDPOINT = "https://s3.us-west-001.backblazeb2.com"
-
-# 桶名。三种取值：
-#   "your-bucket"   固定桶（推荐）
-#   "$path"         由 URL 第一段决定桶名：https://host/<bucket>/<key>
-#   "$host"         由主机名第一段决定桶名：https://<bucket>.host/<key>
-BUCKET_NAME = "your-bucket-name"
-
-# 路径样式：path（推荐，兼容性最好）| virtual（<bucket>.s3.xxx.backblazeb2.com）
-URL_STYLE = "path"
-
-# 是否允许匿名读取对象
-PUBLIC_READ = "true"
-
-# 匿名只读目录（公开分享目录）：未登录用户只能下载该前缀下的文件，
-# 其余 key 一律 403；访问根路径会自动 302 跳到这里
-# 留空表示不做前缀限制（整桶匿名可读）
-PUBLIC_PREFIX = "share"
-
-# 是否允许匿名列举 PUBLIC_PREFIX 目录（做成公开目录索引）
-PUBLIC_LIST = "true"
-
-# 是否允许匿名列举任意目录（关闭后，匿名只能看 PUBLIC_PREFIX 内的列表）
-ALLOW_LIST_BUCKET = "false"
-
-# 是否开启写 / 删 / Web 管理器
-ENABLE_WRITE = "true"
-ENABLE_DELETE = "true"
-ENABLE_MANAGE = "true"
-
-# 匿名访问无权查看的目录时的响应：
-#   welcome  = 渲染引导页（推荐，访客友好的用法说明）
-#   redirect = 302 跳到 /__manage（会弹出 Basic 登录框）
-#   deny     = 返回 403 JSON
-# 注意：访问根路径时，若 PUBLIC_PREFIX 非空，优先 302 到 /<PUBLIC_PREFIX>/
-ROOT_ACTION = "welcome"
-
-# 边缘缓存：0 表示不缓存
-CACHE_MAX_AGE = "86400"
-ENABLE_CACHE = "true"
-
-# 「Worker 代理」单请求上限（字节）。Workers 请求体硬上限是十进制 100MB，
-# 这里默认留 4MB 余量；超过该值的文件会自动改为并发分片经 Worker 转发。
-MAX_UPLOAD_BYTES = "96000000"
-
-# 「直传」超过该体积自动改为并发分片（字节）。
-# 实测 B2 对单次 PUT 的上限是 100MiB（104857600 字节），达到/超过会被上游中断
-# （返回 500 InternalError，浏览器表现为 CORS Failed），因此这里默认 100000000
-# 并在代码里强制钳制 < 104857600。
-MULTIPART_THRESHOLD = "100000000"
-
-# 分片上传的并发数（1-10，默认 3），直传与 Worker 代理都适用
-UPLOAD_CONCURRENCY = "3"
-
-# 预签名 URL 有效期（秒）。仅用于「上传直传」；下载直链已强制禁用，必须经 Worker
-PRESIGN_EXPIRES = "3600"
-
-# 分片大小（字节）。仅「Worker 代理」路径使用（直传不分片）。
-# B2 要求除最后一片外 ≥5MB；前端会自动取 min(此值, MAX_UPLOAD_BYTES-1MB)
-MULTIPART_PART_SIZE = "26214400"
-
-# CORS 允许的 Origin，逗号分隔；* 表示全部（直传时需要包含你的站点域名）
-ALLOWED_ORIGINS = "*"
-
-# 上传时写入对象的 Cache-Control（留空表示不设置，使用 B2 桶默认）
-# UPLOAD_CACHE_CONTROL = "public, max-age=31536000, immutable"
-
-# 兼容 rclone --b2-download-url（去掉 URL 中 file/<bucket>/ 前缀）
-RCLONE_DOWNLOAD = "false"
-
-# 匿名信息收敛：隐藏桶名/区域，且对匿名请求隐藏上游错误正文（强烈建议保持 true）
-HIDE_BUCKET_INFO = "true"
-
-# 剥离 B2/S3 内部响应头（x-bz-*、x-amz-request-id、x-amz-version-id 等）
-STRIP_UPSTREAM_META = "true"
-
-# 隐藏目录占位对象 <prefix>/.keep（新建目录时会写入 0 字节占位），
-# 目录页与管理器列表都不显示，并同步修正"N 个文件"的计数
-HIDE_KEEP_FILES = "true"
-
-# ---------------------------------------------------------------------------
-# B2 用量面板（管理页顶部卡片）
-# ---------------------------------------------------------------------------
-# 背景：Backblaze 没有公开的「空间 / 事务次数」查询 API，因此：
-#   · 空间 = 遍历 ListObjectsV2 累加（每 1000 对象消耗 1 次 Class C，只算 current 版本）
-#   · 次数 = 本 Worker 自己按 B2 事务类别计数（存 Cache API，UTC 每日 00:00 归零）
-ENABLE_USAGE_PANEL = "true"
-
-# 「总空间」基准，默认按 B2 免费额度 10 GB（十进制）；改成 0 则不显示比例
-STORAGE_QUOTA_BYTES = "10000000000"
-
-# 空间统计结果缓存时长（秒），默认 6 小时；打开页面只读缓存，不触发回源
-USAGE_CACHE_TTL = "21600"
-
-# 手动点「重新统计」的最小间隔（秒），默认 5 分钟
-USAGE_MIN_INTERVAL = "300"
-
-# 单次扫描最多翻页数（1 页 = 1000 个对象 = 1 次 Class C），默认 20 页 = 2 万对象
-USAGE_SCAN_MAX_PAGES = "20"
-
-# 每日额度（免费账户 Class B / Class C 各 2500 次/天，按你账户实际套餐调整）
-CLASS_B_DAILY_QUOTA = "2500"
-CLASS_C_DAILY_QUOTA = "2500"
-
-# 空间统计与计数重置共用同一个 Cron（scheduled），默认都在 23 点 → 一条 cron 即可：
-#   同一次触发里：先刷新空间快照，再归零 Class A/B/C/D
-# 因此计数区间是「昨天 23:00 → 今天 23:00」，与 B2 官方 00:00 GMT 有 1 小时偏移（可接受）
-# 取值规则：小时逗号分隔（"23" / "11,23"）；"*" = 每次触发都做；"-" = 从不
-USAGE_SCAN_HOURS = "23"
-USAGE_RESET_HOURS = "23"
-
-# 管理页打开时是否允许"惰性自动扫描"空间（默认 false：只在 Cron 与手动「重新统计」时扫描）
-USAGE_AUTO_SCAN = "false"
-
-# 若允许惰性自动扫描，这里是「归零前窗口」：UTC 进入该小时后当天首次读取强制重扫
-# 默认 -1 = 关闭（因为已有 Cron 定时统计）
-USAGE_REFRESH_AT_UTC_HOUR = "-1"
-
-# 定时统计的桶列表（逗号分隔）。
-#   · 固定桶模式（BUCKET_NAME=xxx）留空即可，会自动用 BUCKET_NAME
-#   · $path / $host 模式无法枚举桶，必须在这里显式列出，例如 "bucket-a,bucket-b"
-USAGE_SCHEDULE_BUCKETS = ""
-
-# DO 计数每累计多少批才落盘（1 = 每批都写，最精确）
-# 免费计划 SQLite 行写入额度 10 万/天，提高该值可省额度（代价：DO 被驱逐时最多丢 N 批）
-USAGE_DO_WRITE_EVERY = "1"
-
-# 调试模式：出错时返回详细堆栈（生产环境请保持 false）
-DEBUG = "false"
-
-# ---------- 以下为密钥，禁止写进本文件 ----------
-# 用命令行设置：
-#   npx wrangler secret put B2_KEY_ID              # keyID / applicationKeyId
-#   npx wrangler secret put B2_APPLICATION_KEY     # applicationKey
-#   npx wrangler secret put ADMIN_PASS             # 管理口令（Basic）
-#   npx wrangler secret put ADMIN_TOKEN            # 管理令牌（Bearer，二选一）
-
-# ---------------------------------------------------------------------------
-# Cron Triggers：所有定时任务都由这一个 scheduled() 事件驱动
+# =============================================================================
+# 变量：[vars] 整段注释 = 全部交由控制台管理（Settings → Variables and Secrets）
 #
-#   0 23 * * *  → 同一次触发里：① 归零 Class A/B/C/D ② 刷新空间快照
-#                 （USAGE_RESET_HOURS = USAGE_SCAN_HOURS = "23"）
+# 新部署（控制台还是空的）请按下面清单在控制台补齐；
+# 或取消注释直接写在这里（会成为配置文件的权威值）。
+# 带 ★ 的是「不配就跑不起来」的必需项。
+# =============================================================================
+# [vars]
+# ★ B2_ENDPOINT = "https://s3.us-west-001.backblazeb2.com"   # 换成你桶的 S3 端点，如 https://s3.us-east-005.backblazeb2.com
+# ★ BUCKET_NAME = "your-bucket-name"                          # 固定桶；或 "$path" / "$host"（见下）
+#   URL_STYLE = "path"                                        # path（推荐）| virtual
 #
-# 就一条即可。若想更贴近 B2 官方的 00:00 GMT 归零，把 USAGE_RESET_HOURS 改成 "0"
-# 并在这里补一条 "0 0 * * *"；想加频次同理（例如 "0 11 * * *" + "11,23"）。
-# 注意：用 wrangler 部署时，本节的 crons 会与控制台上的 Cron 触发器保持一致。
-# ---------------------------------------------------------------------------
-[triggers]
-crons = ["0 23 * * *"]
+#   # 桶名三种取值：
+#   #   "your-bucket"  固定桶（推荐）
+#   #   "$path"        由 URL 第一段决定桶名：https://host/<bucket>/<key>
+#   #   "$host"        由主机名第一段决定桶名：https://<bucket>.host/<key>
+#
+#   # --- 访问控制 ---
+#   PUBLIC_READ = "true"                  # 是否允许匿名读取对象
+#   PUBLIC_PREFIX = "share"               # 匿名只读目录；留空 = 整桶匿名可读
+#   PUBLIC_LIST = "true"                  # 是否允许匿名列举 PUBLIC_PREFIX
+#   ALLOW_LIST_BUCKET = "false"           # 是否允许匿名列举任意目录（建议 false）
+#   ENABLE_WRITE = "true"
+#   ENABLE_DELETE = "true"
+#   ENABLE_MANAGE = "true"                # /__manage 管理器
+#   ROOT_ACTION = "welcome"               # 匿名访问无权目录时：welcome | redirect | deny
+#   ALLOWED_ORIGINS = "*"                 # CORS，逗号分隔
+#
+#   # --- 缓存 ---
+#   CACHE_MAX_AGE = "86400"
+#   ENABLE_CACHE = "true"
+#
+#   # --- 上传 ---
+#   MAX_UPLOAD_BYTES = "96000000"         # Worker 代理单请求上限（Workers 硬上限是十进制 100MB）
+#   MULTIPART_THRESHOLD = "100000000"     # 直传超过此值自动分片（实测 B2 单次 PUT 上限 100MiB）
+#   UPLOAD_CONCURRENCY = "3"              # 分片并发（1-10）
+#   MULTIPART_PART_SIZE = "26214400"      # 分片大小（字节）
+#   PRESIGN_EXPIRES = "3600"              # 预签名有效期（秒）
+#   # UPLOAD_CACHE_CONTROL = "public, max-age=31536000, immutable"
+#
+#   # --- 隐私 / 兼容 ---
+#   HIDE_BUCKET_INFO = "true"             # 匿名隐藏桶名/区域、隐藏上游错误正文
+#   STRIP_UPSTREAM_META = "true"          # 剥离 x-bz-* / x-amz-request-id 等内部响应头
+#   HIDE_KEEP_FILES = "true"              # 隐藏目录占位对象 <prefix>/.keep
+#   RCLONE_DOWNLOAD = "false"             # 兼容 rclone --b2-download-url
+#
+#   # --- B2 用量面板（管理页顶部卡片）---
+#   # 背景：Backblaze 没有公开的「空间 / 事务次数」查询 API，所以：
+#   #   空间 = 遍历 ListObjectsV2 累加（每 1000 对象 1 次 Class C，只算 current 版本）
+#   #   次数 = 本 Worker 自己按 B2 事务类别计数（DO 优先，未绑定则 Cache API）
+#   ENABLE_USAGE_PANEL = "true"
+#   STORAGE_QUOTA_BYTES = "10000000000"   # 「总空间」基准（十进制 10 GB）；0 = 不显示比例
+#   USAGE_SCAN_MAX_PAGES = "20"           # 单次扫描最多页数（每页 1000 对象）
+#   CLASS_B_DAILY_QUOTA = "2500"          # 仅用于算「剩余次数」
+#   CLASS_C_DAILY_QUOTA = "2500"
+#   USAGE_SCAN_HOURS = "23"               # scheduled() 里刷新空间快照的 UTC 小时
+#   USAGE_RESET_HOURS = "23"              # scheduled() 里归零计数的 UTC 小时（默认与统计同点）
+#   USAGE_AUTO_SCAN = "false"             # 是否允许"惰性自动扫描"（默认只由 Cron/手动触发）
+#   USAGE_CACHE_TTL = "21600"             # 仅 USAGE_AUTO_SCAN=true 时用作过期判断
+#   USAGE_MIN_INTERVAL = "300"            # 手动「重新统计」的最小间隔（秒）
+#   USAGE_REFRESH_AT_UTC_HOUR = "-1"      # 惰性窗口（默认关闭）
+#   USAGE_SCHEDULE_BUCKETS = ""           # $path/$host 多桶模式必须显式列出，如 "bucket-a,bucket-b"
+#   USAGE_DO_WRITE_EVERY = "1"            # DO 计数每累计多少批落盘（1 = 每批都写）
+#
+#   # --- 其它 ---
+#   DEBUG = "false"
+#
+# 取值说明（USAGE_SCAN_HOURS / USAGE_RESET_HOURS）：小时逗号分隔（"23" / "11,23"）；
+#   "*" = 每次触发都做；"-" = 从不。
 
-# ---------------------------------------------------------------------------
-# Durable Objects：用量计数器（全局单实例 → 所有地区看到同一份数字；原子累加）
+# =============================================================================
+# Cron Triggers：由控制台管理（保持注释 = wrangler 不接管，你控制台配的 cron 保留）
 #
-# 注意：TOML 的表会一直延伸到下一个表头，所以这些「表」必须放在所有 [vars] 之后，
-#       否则后面的 key 会被算进 migrations 表里。
+# 官方语义：把 crons 注释掉不会禁用已有 Cron Trigger；要清空必须显式写 crons = []。
+# 你已在控制台配好：0 23 * * *（每天 23:00 UTC；同一次触发里先刷新空间快照、再归零计数）
 #
-# 未绑定也能跑：代码会自动退化到 Cache API（面板显示"计数后端：Cache API"），
+# 若希望改由 wrangler 统一管理，取消下面注释，并保持与
+# USAGE_SCAN_HOURS / USAGE_RESET_HOURS 一致（想 23 点统计 + 0 点归零就写两条）：
+# [triggers]
+# crons = ["0 23 * * *"]
+# =============================================================================
+
+# =============================================================================
+# Durable Objects：用量计数器（一个桶一个实例 → 所有地区看到同一份数字；原子累加）
+#
+# 注意：TOML 的表会一直延伸到下一个表头，所以这张表要放在所有键值对之后。
+# 未绑定也能跑：代码会自动降级到 Cache API（面板显示"计数后端：Cache API"），
 # 只是数字按数据中心分裂。免费计划只支持 SQLite 后端，故用 new_sqlite_classes。
-# ---------------------------------------------------------------------------
+# =============================================================================
 [[durable_objects.bindings]]
 name = "USAGE_DO"
 class_name = "UsageCounter"
@@ -192,3 +150,14 @@ class_name = "UsageCounter"
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["UsageCounter"]
+
+# =============================================================================
+# 密钥：禁止写进本文件，用命令行或在控制台设置（类型选 Secret）
+#   npx wrangler secret put B2_KEY_ID              # keyID / applicationKeyId
+#   npx wrangler secret put B2_APPLICATION_KEY     # applicationKey
+#   npx wrangler secret put ADMIN_USER             # 管理用户名（Basic），可放 vars
+#   npx wrangler secret put ADMIN_PASS             # 管理口令（Basic）
+#   npx wrangler secret put ADMIN_TOKEN            # 管理令牌（Bearer，与 Basic 二选一）
+#
+# 提示：部署不会删除密钥，但会把「明文变量」按要求同步/清理，所以密码类一律用 Secret。
+# =============================================================================

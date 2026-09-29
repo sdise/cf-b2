@@ -70,25 +70,40 @@ cp .dev.vars.example .dev.vars      # 本地调试用
 # 2. 登录
 npx wrangler login
 
-# 3. 写入密钥（不会进 wrangler.toml，也不会进 Git）
+# 3. 写入密钥（不会进 wrangler.toml，也不会进 Git；部署永不删除 Secrets）
 npx wrangler secret put B2_KEY_ID
 npx wrangler secret put B2_APPLICATION_KEY
 npx wrangler secret put ADMIN_PASS
 npx wrangler secret put ADMIN_TOKEN   # 可选，与 Basic 二选一
 
-# 4. 修改 wrangler.toml 里的 [vars]
+# 4. 变量：本仓库的 wrangler.toml 已设为「对控制台友好」——
+#    keep_vars = true + [vars] 整段注释 ⇒ 部署不会覆盖/删除控制台上的任何变量，
+#    所有值都以控制台（Settings → Variables and Secrets）为准。
+#    若你更想用配置文件当唯一事实来源：取消 [vars] 注释并填真实值。
 
-# 5. 本地预览
+# 5. 本地预览（本地变量读 .dev.vars）
 npx wrangler dev --remote          # 用真实 B2 联调；不带 --remote 时签名仍会发出去
 
-# 6. 部署
-npx wrangler deploy
+# 6. 部署（⚠️ --name 决定更新哪个 Worker；写错会新建一个 Worker）
+npx wrangler deploy --name <你的 Worker 名>     # 例如 --name b2
 
 # 7. 看日志
 npx wrangler tail
 ```
 
 > 本地 `wrangler dev` 建议加 `--remote`，因为 Miniflare 本地模式对 `caches.default` 与流式 Range 的表现与线上不完全一致。
+
+> ⚠️ **部署会怎样对待你控制台上的变量？**（Cloudflare 官方语义）
+>
+> | 类型 | 部署行为 |
+> | --- | --- |
+> | **明文变量**（控制台里标 `Text`） | 默认 wrangler 会**先清空该 Worker 上所有明文变量，再写入配置文件里的** ⇒ 控制台独有的会被删、同名的会被覆盖 |
+> | **密钥**（标 `Secret`，或 `wrangler secret put` 建的） | **永不删除、永不覆盖**（官方原文：*"Secrets are never deleted by a deployment whether this flag is true or false."*） |
+> | `keep_vars = true` | 保留「配置文件里没有的」变量（同名项仍以配置文件为准） |
+> | Cron Triggers | 配置里**没有** `crons`（本仓库已注释）⇒ 不接管，控制台配的 cron 保留；配置里**写了** ⇒ 以配置为准；显式 `crons = []` 才清空 |
+> | 路由 | 配置里未声明 `route`/`routes`（本仓库已注释）⇒ 不会覆盖控制台路由 |
+>
+> 因此本仓库的默认形态是**最安全的**：不碰你的控制台配置。反过来，如果你以后想「以配置文件为准」，取消 `[vars]` 注释即可，但记得先把控制台的真实值（尤其 `B2_ENDPOINT`、`BUCKET_NAME`）抄进文件，否则会被占位值覆盖。
 
 ### 方式 B：Cloudflare 控制台（无需本地环境）
 
@@ -118,6 +133,10 @@ npx wrangler tail
 ## 3. 环境变量参数总表
 
 > 布尔值接受：`true/false`、`1/0`、`yes/no`、`on/off`（大小写不敏感）。未设置时使用下表默认值。
+
+> **这些值放在哪？** 本仓库的 `wrangler.toml` 默认是「对控制台友好」形态（`keep_vars = true` + `[vars]` 整段注释），
+> 因此**所有变量都以控制台为准**（Settings → Variables and Secrets），部署不会覆盖或删除它们。
+> 表中 `vars` 列 = 明文变量，`Secret` 列 = 加密密钥（部署永不改动）。所有项在代码里都有默认值，漏配只是走默认值。
 
 ### 3.1 连接（必需）
 
