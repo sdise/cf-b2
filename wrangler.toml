@@ -102,6 +102,10 @@ HIDE_BUCKET_INFO = "true"
 # 剥离 B2/S3 内部响应头（x-bz-*、x-amz-request-id、x-amz-version-id 等）
 STRIP_UPSTREAM_META = "true"
 
+# 隐藏目录占位对象 <prefix>/.keep（新建目录时会写入 0 字节占位），
+# 目录页与管理器列表都不显示，并同步修正"N 个文件"的计数
+HIDE_KEEP_FILES = "true"
+
 # 调试模式：出错时返回详细堆栈（生产环境请保持 false）
 DEBUG = "false"
 

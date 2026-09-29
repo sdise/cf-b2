@@ -367,6 +367,8 @@ function loadConfig(env) {
     enableManage: readBool(env.ENABLE_MANAGE, true),
     // 匿名信息收敛：隐藏桶名 / 区域，并剥离 B2 内部响应头
     hideDetails: readBool(env.HIDE_BUCKET_INFO, true),
+    // 隐藏目录占位对象（<prefix>/.keep），目录页与管理器列表都不显示
+    hideKeep: readBool(env.HIDE_KEEP_FILES, true),
     stripUpstreamMeta: readBool(env.STRIP_UPSTREAM_META, true),
     // 匿名访问目录时的行为：deny(返回403 JSON，默认) | redirect(302到管理器) | welcome(渲染引导页)
     rootAction: ['deny', 'redirect', 'welcome'].includes(String(env.ROOT_ACTION || 'deny').toLowerCase())
@@ -1121,13 +1123,20 @@ function humanSize(bytes) {
 }
 
 /** 公开目录页：服务端渲染首页 + 滚动到底部自动加载后续页（瀑布流） */
-function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
+function renderDirectory(data, prefix, base, bucketLabel, showManage = true, hideKeep = true) {
   const rows = [];
+  // 目录占位对象（<prefix>/.keep）不参与展示与计数
+  const files = hideKeep ? data.files.filter((f) => f.name !== '.keep') : data.files;
 
   if (prefix) {
-    const parent = prefix.split('/').slice(0, -1).join('/');
-    rows.push('<tr><td colspan="4"><a href="' + base
-      + escapeHtml(parent ? parent + '/' : '') + '">返回上一级</a></td></tr>');
+    // 注意 prefix 形如 "share/images/"，先去尾斜杠再取父级，否则会算成自己
+    const trimmed = prefix.replace(/\/+$/, '');
+    const parent = trimmed.split('/').slice(0, -1).join('/');
+    // 匿名在公开根（如 /share/）已无处可回，管理员仍可回到根
+    if (parent !== '' || showManage) {
+      rows.push('<tr><td colspan="4"><a href="' + base
+        + escapeHtml(parent ? parent + '/' : '') + '">返回上一级</a></td></tr>');
+    }
   }
 
   for (const folder of data.folders) {
@@ -1137,7 +1146,7 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
       + '<td><a href="' + base + escapeHtml(folder) + '?format=json">JSON</a></td></tr>');
   }
 
-  for (const file of data.files) {
+  for (const file of files) {
     const href = base + escapeHtml(prefix + file.name);
     rows.push('<tr><td>[FILE] <a href="' + href + '">' + escapeHtml(file.name) + '</a></td>'
       + '<td>' + humanSize(file.size) + '</td>'
@@ -1145,9 +1154,10 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
       + '<td><a href="' + href + '">下载</a></td></tr>');
   }
 
-  const initCount = data.folders.length + data.files.length;
+  const initCount = data.folders.length + files.length;
   const cfgJson = JSON.stringify({
     prefix, base, next: data.truncated ? (data.nextToken || '') : '', loaded: initCount,
+    hideKeep: !!hideKeep,
   });
 
   const script = [
@@ -1173,7 +1183,8 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
     '      + \'<td>-</td><td>-</td>\'',
     '      + \'<td><a href="\' + C.base + esc(p) + \'?format=json">JSON</a></td></tr>\';',
     '  });',
-    '  (d.files || []).forEach(function (f) {',
+    '  (d.files || []).filter(function (f) { return !(C.hideKeep && f.name === ".keep"); })',
+    '    .forEach(function (f) {',
     '    var href = C.base + esc(C.prefix + f.name);',
     '    out += \'<tr><td>[FILE] <a href="\' + href + \'">\' + esc(f.name) + \'</a></td>\'',
     '      + "<td>" + human(f.size) + "</td>"',
@@ -1197,7 +1208,8 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
     '      if (!d || d.ok === false) { paint(); return; }',
     '      NEXT = d.truncated ? (d.nextToken || "") : "";',
     '      document.getElementById("tb").insertAdjacentHTML("beforeend", rowsHtml(d));',
-    '      LOADED += (d.folders || []).length + (d.files || []).length;',
+    '      LOADED += (d.folders || []).length + (d.files || []).filter(function (f) {',
+    '        return !(C.hideKeep && f.name === ".keep"); }).length;',
     '      paint();',
     '    })',
     '    .catch(function () { LOADING = false; paint(); });',
@@ -1235,7 +1247,7 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
     '</style></head><body><div class="wrap">',
     '<div class="top"><button id="btnTheme">深色模式</button><span class="grow"></span></div>',
     '<h1>' + escapeHtml(bucketLabel) + ' ' + escapeHtml('/' + prefix) + '</h1>',
-    '<div class="sub">' + data.folders.length + ' 个目录 / ' + data.files.length
+    '<div class="sub">' + data.folders.length + ' 个目录 / ' + files.length
       + ' 个文件'
       + (showManage ? ' · <a href="' + base + MANAGE_PATH.slice(1) + '">打开管理器</a>' : '')
       + '</div>',
@@ -1467,7 +1479,7 @@ function managePage(cfg, url) {
     '      + "<td class=\\"muted\\">目录</td><td></td>"',
     '      + "<td style=\\"text-align:right\\"><button class=\\"mini\\" data-act=\\"deldir\\" data-k=\\"" + esc(p + ".keep") + "\\">删除</button></td></tr>";',
     '  });',
-    '  (data.files || []).forEach(function (f) {',
+    '  (data.files || []).filter(function (f) { return f.name !== ".keep"; }).forEach(function (f) {',
     '    var k = esc(PREFIX + f.name);',
     '    rows += "<tr><td>" + esc(f.name) + "</td><td>" + size(f.size) + "</td>"',
     '      + "<td class=\\"muted\\">" + esc(f.lastModified) + "</td>"',
@@ -1804,8 +1816,8 @@ function managePage(cfg, url) {
     '  }',
     '  switch (a.getAttribute("data-act")) {',
     '    case "up":',
-    '      var segs = PREFIX.split("/");',
-    '      segs.pop(); segs.pop();',
+    '      var segs = PREFIX.replace(/\\/+$/, "").split("/");',
+    '      segs.pop();',
     '      load(segs.length ? segs.join("/") + "/" : "");',
     '      break;',
     '    case "dir": load(p); break;',
@@ -1992,7 +2004,7 @@ async function handle(request, env, ctx) {
         const base = cfg.bucketMode === 'path' ? '/' + bucket + '/' : '/';
         // 匿名视图不显示桶名，也不给出管理器入口
         const label = (auth.ok || !cfg.hideDetails) ? bucket : '公开目录';
-        return html(renderDirectory(result, prefix, base, label, auth.ok));
+        return html(renderDirectory(result, prefix, base, label, auth.ok, cfg.hideKeep));
       }
 
       if (!resolved.key) return deny('缺少对象 key', request, cfg, 400);

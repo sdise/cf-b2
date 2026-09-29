@@ -38,6 +38,8 @@ globalThis.fetch = async (request, init) => {
       + '<Delimiter>/</Delimiter><IsTruncated>false</IsTruncated>'
       + '<Contents><Key>' + p + 'a.txt</Key><LastModified>2026-09-27T10:00:00.000Z</LastModified>'
       + '<ETag>&quot;abc123&quot;</ETag><Size>1024</Size><StorageClass>STANDARD</StorageClass></Contents>'
+      + '<Contents><Key>' + p + '.keep</Key><LastModified>2026-09-28T10:51:27.091Z</LastModified>'
+      + '<ETag>&quot;keep&quot;</ETag><Size>0</Size><StorageClass>STANDARD</StorageClass></Contents>'
       +       '<CommonPrefixes><Prefix>' + p + 'sub/</Prefix></CommonPrefixes>'
       + '</ListBucketResult>',
       { status: 200, headers: { 'Content-Type': 'application/xml' } },
@@ -195,9 +197,12 @@ await check('目录列表 JSON', async () => {
   const res = await handle(req('/docs/?format=json', { headers: { Authorization: basic } }), env, ctx);
   const body = await res.json();
   assert(body.ok === true, JSON.stringify(body).slice(0, 120));
-  assert(body.files.length === 1 && body.files[0].size === 1024, 'files 解析异常');
+  // JSON 接口返回原始数据（含 .keep 占位对象），隐藏只发生在渲染层
+  const real = body.files.filter((f) => f.name !== '.keep');
+  assert(real.length === 1 && real[0].size === 1024, 'files 解析异常');
+  assert(body.files.some((f) => f.name === '.keep'), '应保留占位对象原文，便于排查');
   assert(body.folders[0] === 'docs/sub/', 'folders 解析异常');
-  return JSON.stringify({ files: body.files.length, folders: body.folders });
+  return JSON.stringify({ files: body.files.map((f) => f.name), folders: body.folders });
 });
 
 await check('Chinese/space key 编码一致（签名 URL 与 canonical path）', async () => {
@@ -344,6 +349,63 @@ await check('管理员可在 share 之外写入', async () => {
   return '已写入 /private/ok.txt';
 });
 
+/* ---------- 目录页：返回上一级 / 占位对象 ---------- */
+
+await check('子目录的「返回上一级」指向真正的父级（不再自指）', async () => {
+  const res = await handle(req('/share/images/', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const page = await res.text();
+  const up = page.match(/<a href="([^"]+)">返回上一级<\/a>/);
+  assert(up, '页面没有返回上一级链接');
+  assert(up[1] === '/share/', '返回上一级指向了 ' + up[1]);
+  return up[1];
+});
+
+await check('三层目录的「返回上一级」逐级回退', async () => {
+  const res = await handle(req('/share/images/icons/', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const up = (await res.text()).match(/<a href="([^"]+)">返回上一级<\/a>/);
+  assert(up && up[1] === '/share/images/', '返回上一级指向了 ' + (up && up[1]));
+  return up[1];
+});
+
+await check('公开根目录（/share/）匿名不再显示返回上一级，管理员仍可回根', async () => {
+  const anon = await (await handle(req('/share/'), shareEnv, ctx)).text();
+  assert(!anon.includes('返回上一级'), '匿名在公开根不该出现返回上一级');
+
+  const admin = await (await handle(
+    req('/share/', { headers: { Authorization: basic } }), shareEnv, ctx,
+  )).text();
+  const up = admin.match(/<a href="([^"]+)">返回上一级<\/a>/);
+  assert(up && up[1] === '/', '管理员返回上一级应指向 /，实际 ' + (up && up[1]));
+  return '匿名隐藏；管理员 → /';
+});
+
+await check('目录占位对象 .keep 不出现在目录页（含计数与前端渲染逻辑）', async () => {
+  const page = await (await handle(req('/share/', { headers: { Authorization: basic } }), shareEnv, ctx)).text();
+  assert(!page.includes('>.keep<'), '列表里出现了 .keep 行');
+  assert(!/href="[^"]*\.keep"/.test(page.split('<script')[0]), '链接里出现 .keep');
+  assert(page.includes('1 个目录 / 1 个文件'), '计数未排除占位对象');
+  assert(page.includes('C.hideKeep'), '前端滚动加载未过滤占位对象');
+  return '已隐藏，计数=1';
+});
+
+await check('HIDE_KEEP_FILES=false 时 .keep 重新可见（应急开关）', async () => {
+  const page = await (await handle(
+    req('/share/', { headers: { Authorization: basic } }),
+    { ...shareEnv, HIDE_KEEP_FILES: 'false' }, ctx,
+  )).text();
+  assert(page.includes('>.keep<'), '.keep 应可见');
+  assert(page.includes('1 个目录 / 2 个文件'), '计数应包含 .keep');
+  return '可见，计数=2';
+});
+
+await check('管理器列表也不显示 .keep（删除目录走目录行的按钮）', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), shareEnv, ctx)).text();
+  assert(page.includes('function buildRows'), '缺少列表构造');
+  assert(page.includes('return f.name !== ".keep";'), '管理器未过滤 .keep');
+  assert(page.includes('esc(p + ".keep")'), '目录行的删除按钮应删占位对象');
+  return '列表隐藏，删除按钮保留';
+});
+
 /* ---------- $path 多桶模式 ---------- */
 const pathEnv = { ...env, BUCKET_NAME: '$path' };
 
@@ -388,7 +450,7 @@ await check('目录 prefix 必须带尾斜杠（否则子对象被折叠成一�
   const res = await handle(req('/share/?format=json'), shareEnv, ctx);
   const body = await res.json();
   assert(body.prefix === 'share/', 'prefix=' + body.prefix);
-  assert(body.files.length === 1 && body.files[0].name === 'a.txt', JSON.stringify(body.files));
+  assert(body.files.some((f) => f.name === 'a.txt'), JSON.stringify(body.files));
   assert(body.folders[0] === 'share/sub/', JSON.stringify(body.folders));
   const sent0 = sent[sent.length - 1];
   assert(sent0.url.includes('prefix=share%2F'), '回源 prefix 未带尾斜杠: ' + sent0.url);
