@@ -242,7 +242,11 @@ await check('预签名 URL 输出', async () => {
   assert(body.ok === true, JSON.stringify(body));
   assert(body.url.includes('X-Amz-Signature=') && body.url.includes('X-Amz-Credential='), '缺少签名参数');
   const signed = decodeURIComponent(new URL(body.url).search);
-  assert(/SignedHeaders=[^&]*x-amz-content-sha256/.test(signed), 'payload 哈希未进入 SignedHeaders');
+  // 预签名 URL 绝不能把 x-amz-date / x-amz-content-sha256 列为待发送的签名头，
+  // 否则浏览器 PUT 时会被 B2 以 400 "header ... is listed in signed headers, but is not present" 拒绝
+  assert(/SignedHeaders=(content-type;)?host(&|$)/.test(signed), '预签名 SignedHeaders 异常: ' + signed);
+  assert(!/SignedHeaders=[^&]*x-amz-date/.test(signed), '预签名不应要求客户端发送 x-amz-date');
+  assert(!/SignedHeaders=[^&]*x-amz-content-sha256/.test(signed), '预签名不应要求客户端发送 x-amz-content-sha256');
   return body.url.slice(0, 96) + '...';
 });
 

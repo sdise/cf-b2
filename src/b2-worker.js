@@ -196,12 +196,18 @@ class SigV4 {
 
     const h = new Headers(headers);
     h.set('host', url.host);
-    h.set('x-amz-date', amzDate);
 
     // 无请求体时按 AWS 规范用空串哈希；流式或客户端直传用 UNSIGNED-PAYLOAD
     let payload = payloadHash;
     if (!payload) payload = unsignedPayload ? 'UNSIGNED-PAYLOAD' : await sha256Hex(body === null ? '' : body);
-    h.set('x-amz-content-sha256', payload);
+
+    // 预签名（查询串认证）时：日期由 X-Amz-Date 查询参数携带、载荷哈希只写进 canonical request，
+    // 二者都不能作为请求头要求客户端发送，否则 B2 会返回
+    // "header 'x-amz-date' is listed in signed headers, but is not present"（400）
+    if (expiresIn <= 0) {
+      h.set('x-amz-date', amzDate);
+      h.set('x-amz-content-sha256', payload);
+    }
 
     const pairs = [];
     for (const [rawKey, rawValue] of h.entries()) {
