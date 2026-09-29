@@ -389,6 +389,20 @@ function loadConfig(env) {
     multipartThreshold: Math.min(readInt(env.MULTIPART_THRESHOLD, 100 * 1000 * 1000), 100 * 1024 * 1024 - 1),
     multipartPartSize: readInt(env.MULTIPART_PART_SIZE, 25 * 1024 * 1024),
 
+    /* ---- B2 用量面板 ---- */
+    enableUsage: readBool(env.ENABLE_USAGE_PANEL, true),
+    // 「总空间」基准：默认按 B2 免费额度 10 GB（十进制）展示进度
+    storageQuotaBytes: Math.max(0, readInt(env.STORAGE_QUOTA_BYTES, 10 * 1000 * 1000 * 1000)),
+    // 空间扫描结果缓存时长（秒），默认 6 小时
+    usageCacheTtl: Math.max(60, readInt(env.USAGE_CACHE_TTL, 21600)),
+    // 手动「重新统计」的最小间隔（秒），默认 5 分钟
+    usageMinInterval: Math.max(0, readInt(env.USAGE_MIN_INTERVAL, 300)),
+    // 单次扫描最多翻多少页（每页 1000 个对象 = 1 次 Class C）
+    usageScanMaxPages: Math.max(1, Math.min(200, readInt(env.USAGE_SCAN_MAX_PAGES, 20))),
+    // 每日额度（B2 免费账户的 Class B/C 各 2500 次/天，按你账户实际套餐调整）
+    classBQuota: Math.max(0, readInt(env.CLASS_B_DAILY_QUOTA, 2500)),
+    classCQuota: Math.max(0, readInt(env.CLASS_C_DAILY_QUOTA, 2500)),
+
     adminUser: String(env.ADMIN_USER || ''),
     adminPass: String(env.ADMIN_PASS || ''),
     adminToken: String(env.ADMIN_TOKEN || ''),
@@ -527,9 +541,34 @@ function resolveBucketKey(cfg, url) {
   return { bucket: cfg.bucketFixed, key: normalizeKey(pathKey), isDir };
 }
 
+/**
+ * B2 事务分类的近似判定（官方没有对外的用量 API，只能自己数）：
+ *   A = 上传 / 写入（PutObject、CreateMultipartUpload 等，B2 侧免费）
+ *   B = 下载 / 读取（GetObject、HeadObject）
+ *   C = 列举（ListObjectsV2、ListParts、ListMultipartUploads）
+ *   D = 删除等（DeleteObject；multipart abort 归入写入类 A）
+ */
+function classifyB2(method, url) {
+  const query = url.searchParams;
+  const m = String(method || 'GET').toUpperCase();
+  if (m === 'GET' || m === 'HEAD') {
+    if (query.has('list-type') || query.has('uploads') || query.has('uploadId')) return 'C';
+    return 'B';
+  }
+  if (m === 'DELETE') return query.has('uploadId') ? 'A' : 'D';
+  return 'A';
+}
+
+/** 单请求内的计数累加（cfg 是每请求独立对象，不会串请求） */
+function recordUsage(cfg, cls) {
+  if (!cfg || !cfg.usage || !cls) return;
+  cfg.usage.counts[cls] = (cfg.usage.counts[cls] || 0) + 1;
+}
+
 async function b2Fetch(cfg, method, url, options = {}) {
   const { headers = {}, body = null, query = {} } = options;
   const request = await signerOf(cfg).sign(method, url, { headers, body, query });
+  recordUsage(cfg, classifyB2(method, new URL(request.url || url)));
   return fetch(request);
 }
 
@@ -581,6 +620,8 @@ async function readObject(request, env, ctx, cfg, bucket, key, options = {}) {
 
   while (true) {
     const controller = new AbortController();
+    // 下载路径自带 Range 重试补偿，未走 b2Fetch，这里按实际发起的请求补记 Class B
+    recordUsage(cfg, 'B');
     response = await fetch(signedRequest.url, {
       method: signedRequest.method,
       headers: signedRequest.headers,
@@ -815,6 +856,135 @@ async function multipartAbort(cfg, bucket, key, uploadId) {
   return { ok: true };
 }
 
+/* ============================ 5.5 B2 用量面板 ============================ */
+/*
+ * 背景：Backblaze 没有公开的「用量 / 事务次数」查询 API（官方只在 Web 控制台提供
+ * Caps & Alerts，计数器每天 00:00 GMT 重置）。因此这里：
+ *   1) 空间：用 S3 ListObjectsV2 全量遍历累加 Size（每 1000 对象消耗 1 次 Class C）；
+ *      只统计 current 版本，non-current / hidden 版本不计（比账单口径略小）。
+ *   2) 次数：在唯一的出网点 b2Fetch 上按 B2 事务类别计数，写进 Cache API，
+ *      按 UTC 日切；Cache API 没有原子操作，高并发下会丢极少量计数。
+ * 频率控制：扫描结果缓存 usageCacheTtl（默认 6h）；手动刷新受 usageMinInterval
+ * （默认 5min）限流；打开管理页只读缓存、不主动打 B2。
+ */
+
+const USAGE_CACHE_ORIGIN = 'https://usage.internal';
+
+/** UTC 日期戳（与 B2 计数器 00:00 GMT 重置对齐） */
+function utcDayStamp(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
+function counterCacheKey(bucket) {
+  return USAGE_CACHE_ORIGIN + '/counters/' + encodeURIComponent(bucket || '_') + '/' + utcDayStamp();
+}
+
+function storageCacheKey(bucket) {
+  return USAGE_CACHE_ORIGIN + '/storage/' + encodeURIComponent(bucket || '_');
+}
+
+async function cacheGetJson(key) {
+  try {
+    const hit = await caches.default.match(key);
+    return hit ? await hit.json() : null;
+  } catch {
+    return null;
+  }
+}
+
+async function cachePutJson(key, value, maxAge) {
+  try {
+    await caches.default.put(key, new Response(JSON.stringify(value), {
+      headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=' + maxAge },
+    }));
+  } catch {
+    /* Cache API 不可用（或对象过大）时静默跳过，不影响主流程 */
+  }
+}
+
+/** 把本请求产生的 B2 调用次数合并进当天的计数器（尽力而为，不阻塞响应） */
+async function flushCounters(cfg, bucket) {
+  const counts = cfg && cfg.usage && cfg.usage.counts;
+  if (!counts || !Object.keys(counts).length) return;
+  const key = counterCacheKey(bucket);
+  const prev = (await cacheGetJson(key)) || {};
+  const next = { A: prev.A || 0, B: prev.B || 0, C: prev.C || 0, D: prev.D || 0 };
+  for (const [cls, n] of Object.entries(counts)) next[cls] = (next[cls] || 0) + n;
+  next.at = new Date().toISOString();
+  await cachePutJson(key, next, 2 * 86400);
+}
+
+async function readCounters(bucket) {
+  const data = (await cacheGetJson(counterCacheKey(bucket))) || {};
+  return {
+    A: data.A || 0, B: data.B || 0, C: data.C || 0, D: data.D || 0,
+    at: data.at || '',
+    day: utcDayStamp(),
+    resetAt: utcDayStamp() + 'T00:00:00Z',
+  };
+}
+
+/** 遍历整个桶累加对象数与字节数（每 1000 个对象 1 次 Class C） */
+async function computeStorage(cfg, bucket) {
+  let cursor = '';
+  let objects = 0;
+  let bytes = 0;
+  let pages = 0;
+  let truncated = false;
+
+  for (let i = 0; i < cfg.usageScanMaxPages; i++) {
+    const page = await listObjects(cfg, bucket, { prefix: '', delimiter: '', limit: 1000, cursor });
+    if (!page.ok) return { ok: false, status: page.status || 502, error: page.error };
+    pages++;
+    objects += page.files.length;
+    for (const file of page.files) bytes += file.size || 0;
+    cursor = page.nextToken || '';
+    truncated = Boolean(page.truncated && cursor);
+    if (!truncated) break;
+  }
+
+  return { ok: true, objects, bytes, pages, complete: !truncated };
+}
+
+/**
+ * 带缓存与限流的空间统计。
+ * refresh=true 表示用户点了「重新统计」：仍在 usageMinInterval 内则直接回缓存。
+ */
+async function storageUsage(cfg, bucket, refresh) {
+  const now = Date.now();
+  const cached = await cacheGetJson(storageCacheKey(bucket));
+  const cachedAt = cached && cached.at ? Date.parse(cached.at) : 0;
+  const ageMs = cachedAt ? now - cachedAt : Infinity;
+
+  if (cached && ageMs < cfg.usageCacheTtl * 1000 && !refresh) {
+    return { ...cached, cached: true, throttled: false, ageSeconds: Math.round(ageMs / 1000) };
+  }
+  if (refresh && cached && ageMs < cfg.usageMinInterval * 1000) {
+    return {
+      ...cached, cached: true, throttled: true,
+      minInterval: cfg.usageMinInterval, ageSeconds: Math.round(ageMs / 1000),
+    };
+  }
+
+  const scan = await computeStorage(cfg, bucket);
+  if (!scan.ok) return { ok: false, error: scan.error, status: scan.status };
+
+  const result = {
+    ok: true,
+    bucket,
+    usedBytes: scan.bytes,
+    objects: scan.objects,
+    pages: scan.pages,
+    complete: scan.complete,
+    cached: false,
+    throttled: false,
+    ageSeconds: 0,
+    at: new Date().toISOString(),
+  };
+  await cachePutJson(storageCacheKey(bucket), result, Math.max(60, cfg.usageCacheTtl));
+  return result;
+}
+
 /* ============================ 6. 管理 API ============================ */
 
 async function readJsonBody(request) {
@@ -898,6 +1068,42 @@ async function apiRouter(request, env, ctx, cfg, url) {
   }
 
   switch (action) {
+    /* ---- B2 用量（空间 + 事务计数） ---- */
+    case 'usage': {
+      const refresh = url.searchParams.get('refresh') === '1';
+      const storage = cfg.enableUsage
+        ? await storageUsage(cfg, targetBucket, refresh)
+        : { ok: false, error: '用量面板已关闭（ENABLE_USAGE_PANEL=false）' };
+
+      const counters = await readCounters(targetBucket);
+      // 本请求刚发生的 B2 调用（例如本次扫描本身）也一并计入展示
+      const live = (cfg.usage && cfg.usage.counts) || {};
+      for (const cls of ['A', 'B', 'C', 'D']) counters[cls] += live[cls] || 0;
+
+      return json({
+        ok: true,
+        bucket: targetBucket,
+        quotaBytes: cfg.storageQuotaBytes,
+        storage,
+        classA: counters.A,
+        classB: {
+          used: counters.B,
+          quota: cfg.classBQuota,
+          remaining: Math.max(0, cfg.classBQuota - counters.B),
+        },
+        classC: {
+          used: counters.C,
+          quota: cfg.classCQuota,
+          remaining: Math.max(0, cfg.classCQuota - counters.C),
+        },
+        classD: counters.D,
+        resetAt: counters.resetAt,
+        counterUpdatedAt: counters.at,
+        scope: '仅统计本 Worker 发往 B2 的请求；控制台、rclone 等其他客户端不计入',
+        updatedAt: new Date().toISOString(),
+      }, 200, request, cfg);
+    }
+
     /* ---- 列举 ---- */
     case 'list': {
       const result = await listObjects(cfg, targetBucket, {
@@ -1404,6 +1610,14 @@ function managePage(cfg, url) {
     '.set{display:flex;align-items:center;gap:4px;color:var(--dim);font-size:12px;white-space:nowrap}',
     '.set input{width:62px;padding:4px 6px}',
     '.crumb a{color:var(--acc);cursor:pointer}',
+    '.usage{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:14px;font-size:13px}',
+    '.usage .row{display:flex;flex-wrap:wrap;gap:18px;align-items:baseline}',
+    '.usage .kv{display:flex;gap:6px;align-items:baseline}',
+    '.usage .v{font-weight:600;font-size:15px}',
+    '.usage .bar{height:6px;border-radius:4px;background:var(--chip);overflow:hidden;margin-top:8px;max-width:420px}',
+    '.usage .bar>i{display:block;height:100%;background:var(--acc)}',
+    '.usage .over{color:#c2410c}',
+    '.usage .foot{margin-top:8px;color:var(--dim);font-size:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}',
     '</style></head><body>',
     '<header>',
     '<h1>Backblaze B2 文件管理器</h1>',
@@ -1428,6 +1642,7 @@ function managePage(cfg, url) {
     '<input type="file" id="file" multiple class="hidden">',
     '</header>',
     '<main>',
+    '<div id="usage" class="usage"></div>',
     '<nav class="crumb" id="crumb" style="margin-bottom:12px"></nav>',
     '<div class="muted" id="tuneHint" style="margin-bottom:10px;font-size:12px"></div>',
     '<table><thead><tr><th>名称</th><th style="width:110px">大小</th>',
@@ -1928,6 +2143,74 @@ function managePage(cfg, url) {
     'el("partSize").onchange = function () { var r = syncTuning(); toast("分片大小已设为 " + r.part + " MiB"); };',
     'el("conc").onchange = function () { var r = syncTuning(); toast("并发数已设为 " + r.conc); };',
     'syncTuning();',
+    '/* ---------- B2 用量面板（空间自己遍历算，次数只能自己数） ---------- */',
+    'function sizeD(b) {',
+    '  /* 用量卡片用十进制单位（与 B2 控制台一致：10 GB = 10,000,000,000 字节） */',
+    '  if (!b) return "0 B";',
+    '  var u = ["B", "KB", "MB", "GB", "TB"], v = b, i = 0;',
+    '  while (v >= 1000 && i < u.length - 1) { v = v / 1000; i++; }',
+    '  return v.toFixed(i ? 1 : 0) + " " + u[i];',
+    '}',
+    'function pct(used, quota) {',
+    '  if (!quota) return "";',
+    '  var p = used / quota * 100;',
+    '  return (p < 1 ? p.toFixed(2) : p.toFixed(1)) + "%";',
+    '}',
+    'function quotaCell(label, used, quota) {',
+    '  var over = quota > 0 && used >= quota;',
+    '  return "<span class=\\"kv\\"><span class=\\"muted\\">" + label + "</span>"',
+    '    + "<span class=\\"v" + (over ? " over" : "") + "\\">" + used + "</span>"',
+    '    + "<span class=\\"muted\\">/ " + (quota || "-") + (quota ? "（剩 " + Math.max(0, quota - used) + "）" : "") + "</span></span>";',
+    '}',
+    'function renderUsage(d) {',
+    '  var s = (d && d.storage) || {};',
+    '  var quota = d.quotaBytes || 0;',
+    '  var html = "";',
+    '  if (s.ok === false) {',
+    '    html += "<div class=\\"row\\"><span>空间统计失败：" + esc(s.error || "未知错误") + "</span></div>";',
+    '  } else {',
+    '    var used = s.usedBytes || 0;',
+    '    html += "<div class=\\"row\\">"',
+    '      + "<span><span class=\\"muted\\">桶</span> <span class=\\"v\\">" + esc(d.bucket || "") + "</span></span>"',
+    '      + "<span><span class=\\"muted\\">已用空间</span> <span class=\\"v\\">" + sizeD(used) + "</span>"',
+    '      + (quota ? " <span class=\\"muted\\">/ " + sizeD(quota) + "（" + pct(used, quota) + "）</span>" : "") + "</span>"',
+    '      + "<span><span class=\\"muted\\">对象数</span> <span class=\\"v\\">" + (s.objects || 0) + "</span>"',
+    '      + (s.complete === false ? " <span class=\\"over\\">（扫描到上限，实际更多）</span>" : "") + "</span>"',
+    '      + "</div>";',
+    '    if (quota) html += \'<div class="bar"><i style="width:\' + Math.min(100, used / quota * 100) + \'%"></i></div>\';',
+    '  }',
+    '  html += "<div class=\\"row\\" style=\\"margin-top:10px\\">"',
+    '    + quotaCell("Class B（读取）", (d.classB || {}).used || 0, (d.classB || {}).quota || 0)',
+    '    + quotaCell("Class C（列举）", (d.classC || {}).used || 0, (d.classC || {}).quota || 0)',
+    '    + "<span class=\\"kv\\"><span class=\\"muted\\">Class A</span><span class=\\"v\\">" + (d.classA || 0) + "</span></span>"',
+    '    + "</div>";',
+    '  var foot = [];',
+    '  if (s.at) foot.push("空间更新于 " + esc(s.at.replace("T", " ").slice(0, 16)) + " UTC" + (s.cached ? "（缓存）" : ""));',
+    '  if (s.throttled) foot.push("刷新过于频繁，已用缓存（最小间隔 " + (s.minInterval || 0) + " 秒）");',
+    '  if (s.ok !== false && s.pages) foot.push("本次扫描 " + s.pages + " 次 Class C");',
+    '  foot.push("次数按 UTC 每日 00:00 归零" + (d.resetAt ? "（下次 " + esc(d.resetAt) + "）" : ""));',
+    '  if (d.scope) foot.push(esc(d.scope));',
+    '  html += \'<div class="foot">\' + foot.map(function (t) { return "<span>" + t + "</span>"; }).join("")',
+    '    + \'<button class="mini" id="btnUsageRefresh">重新统计</button></div>\';',
+    '  el("usage").innerHTML = html;',
+    '}',
+    'function loadUsage(refresh) {',
+    '  if (!el("usage")) return;',
+    '  el("usage").innerHTML = \'<span class="muted">正在读取用量…</span>\';',
+    '  call("usage" + q(refresh ? { refresh: "1" } : {})).then(function (r) {',
+    '    if (!r.ok || !r.data || r.data.ok === false) {',
+    '      el("usage").innerHTML = \'<span class="muted">用量面板不可用：\' + esc((r.data && r.data.error) || r.status) + "</span>";',
+    '      return;',
+    '    }',
+    '    renderUsage(r.data);',
+    '  }).catch(function (e) {',
+    '    el("usage").innerHTML = \'<span class="muted">用量面板不可用：\' + esc(e.message) + "</span>";',
+    '  });',
+    '}',
+    'el("usage").addEventListener("click", function (e) {',
+    '  if (e.target && e.target.id === "btnUsageRefresh") loadUsage(true);',
+    '});',
+    'loadUsage(false);',
     'el("bucketLabel").textContent = CFG.bucketMode === "fixed"',
     '  ? ("桶: " + CFG.bucketFixed)',
     '  : (CFG.bucketMode === "path" ? "桶: 按 URL 首段动态解析" : "桶: 按主机名首段动态解析");',
@@ -1946,8 +2229,28 @@ function managePage(cfg, url) {
 
 /* ============================ 9. 主入口与路由 ============================ */
 
+/**
+ * 请求入口：准备每请求独立的 cfg 与用量计数器，分发后异步把计数落盘。
+ * 计数落盘放在 finally 里，因此出错路径产生的 B2 调用同样会被统计。
+ */
 async function handle(request, env, ctx) {
   const cfg = loadConfig(env);
+  if (cfg.enableUsage) cfg.usage = { counts: {} };
+
+  try {
+    return await dispatch(request, env, ctx, cfg);
+  } finally {
+    if (cfg.usage && Object.keys(cfg.usage.counts).length) {
+      const url = new URL(request.url);
+      const resolved = resolveBucketKey(cfg, url);
+      const bucket = resolved.bucket || cfg.bucketFixed || '';
+      const pending = flushCounters(cfg, bucket).catch(() => {});
+      if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(pending);
+    }
+  }
+}
+
+async function dispatch(request, env, ctx, cfg) {
   const url = new URL(request.url);
 
   const missing = [];

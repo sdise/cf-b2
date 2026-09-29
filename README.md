@@ -162,7 +162,8 @@ cron(每周) → b2_authorize_account → b2_get_download_authorization(validDur
 | 目录层级 | 目录页顶部是**可点击面包屑**（匿名：`公开目录 / images / icons`，管理员：`桶名 / share / …`），另有「返回上一级」；匿名在公开根不显示返回入口 |
 | 目录占位 | 新建目录会写 0 字节 `<prefix>/.keep` 作为占位（对象存储没有真目录）；列表默认隐藏它（`HIDE_KEEP_FILES`） |
 | Web 管理器 | `GET /__manage`（Basic/Bearer 鉴权） |
-| 管理 API | `/__api/list`、`/presign`、`/object`、`/copy`、`/mkdir`、`/multipart/*`、`/health` |
+| 管理 API | `/__api/list`、`/presign`、`/object`、`/copy`、`/mkdir`、`/multipart/*`、`/usage`、`/health` |
+| B2 用量面板 | 管理页顶部：桶名、已用空间/额度（进度条）、对象数、Class B/C 已用与剩余、更新时间与「重新统计」。空间靠遍历列举算，次数靠自计数（B2 无公开用量 API），频率受限流与缓存控制 |
 | 上传 | 代理 `PUT /<key>`（≤100MB）；浏览器默认走预签名直传；超限自动分片 |
 | 兼容性 | `$path` / `$host` / 固定桶；`RCLONE_DOWNLOAD=true` 兼容 `rclone --b2-download-url` |
 

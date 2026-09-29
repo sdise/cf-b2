@@ -254,20 +254,69 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 - 需要改全局默认值 → 改 Workers 变量 `MULTIPART_PART_SIZE` / `UPLOAD_CONCURRENCY` 后重新部署。
 - Worker 代理模式下每片都要过 Worker，建议分片不要太大（25MiB 左右较稳）；直传模式下可酌情调大以减少请求数。
 
-### 3.5 隐私收敛（防信息泄露）
+### 3.5 B2 用量面板
+
+管理页顶部会显示一张卡片：桶名、已用空间 / 总额度（含进度条）、对象数、Class B/C 已用与剩余、以及数据更新时间与「重新统计」按钮。
+
+```
+桶 ayxz-bucket   已用空间 3.2 GB / 10.0 GB（32.1%）   对象数 1,284
+Class B（读取） 128 / 2500（剩 2372）   Class C（列举） 12 / 2500（剩 2488）   Class A 47
+空间更新于 2026-09-30 07:12 UTC（缓存） · 本次扫描 2 次 Class C · 次数按 UTC 每日 00:00 归零
+```
+
+#### 这些数字是怎么来的（重要）
+
+Backblaze **没有公开的用量 / 事务次数查询 API**：官方只在 Web 控制台提供 **Caps & Alerts**（可对 Storage / Class A / B / C 设每日上限，Class D 不可设；到达上限 75% 与 100% 发告警），且**用量计数器每天 `00:00 GMT` 重置**。社区里想要这些数字的工具，要么遍历列举自己算（`b2-stats`、`backblaze-b2-exporter`），要么用 Selenium 抓控制台页面（`b2-transaction-tracker`）——因为没有 API 可用。
+
+因此本项目的口径是：
+
+| 指标 | 来源 | 说明 |
+| --- | --- | --- |
+| 已用空间 | **遍历 `ListObjectsV2` 累加 `Size`** | 只统计 **current 版本**；B2 计费还包含 non-current / hidden 版本，所以这个数**比账单口径略小** |
+| 对象数 | 同上 | 含 `.keep` 占位对象（0 字节） |
+| Class B / C / A / D | **本 Worker 自己计数** | 在唯一的出网点上按请求分类累计；**只含本 Worker**，控制台、rclone、其他客户端不计入 |
+| 总空间 | `STORAGE_QUOTA_BYTES` | 默认按免费额度 10 GB（十进制）展示；设 0 则不显示比例 |
+
+> 计数是**尽力而为的近似值**：存在 Cache API 里（读-改-写没有原子性），高并发下会丢极少量计数；但每个请求只做 1 次读 + 1 次写，且异步执行（`ctx.waitUntil`），不影响响应速度。
+
+#### 查询频率与成本控制
+
+| 动作 | 触发 | 频率 / 成本 |
+| --- | --- | --- |
+| 事务计数 | 每个发往 B2 的请求 | 1 次 Cache 读 + 1 次写（异步），**不额外请求 B2** |
+| 空间扫描 | 缓存过期后的第一次读取 | 默认 6 小时一次（`USAGE_CACHE_TTL`） |
+| 打开管理页 | 页面加载 | **只读缓存**，不扫 B2 |
+| 点「重新统计」 | 手动 | 受 `USAGE_MIN_INTERVAL` 限流（默认 5 分钟），超频直接回缓存并提示 |
+| 每日归零 | UTC 00:00 | 与官方计数器对齐，自动切换到新一天的 key |
+
+**成本**：一次全量扫描 = ⌈对象数 ÷ 1000⌉ 次 Class C。1 万对象 = 10 次，约占每日免费额度（2,500 次）的 0.4%；默认单次扫描上限 20 页（2 万对象），超出会标注"扫描到上限，实际更多"。
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `ENABLE_USAGE_PANEL` | `true` | 是否启用用量面板与 `/__api/usage` |
+| `STORAGE_QUOTA_BYTES` | `10000000000` | 「总空间」基准（十进制 10 GB）；设 `0` 不显示比例 |
+| `USAGE_CACHE_TTL` | `21600`（6h） | 空间统计缓存时长 |
+| `USAGE_MIN_INTERVAL` | `300`（5min） | 手动重新统计的最小间隔 |
+| `USAGE_SCAN_MAX_PAGES` | `20` | 单次扫描最多页数（每页 1000 对象） |
+| `CLASS_B_DAILY_QUOTA` | `2500` | Class B 每日额度（仅用于算"剩余"） |
+| `CLASS_C_DAILY_QUOTA` | `2500` | Class C 每日额度（仅用于算"剩余"） |
+
+> 想拿到**账单级**的空间数字（含 non-current/hidden 版本），需要改用 B2 Native API 的 `b2_list_file_versions`（本 Worker 目前只用 S3 签名，没有 native 授权流程）；控制台 Caps & Alerts 页面看到的数字才是官方口径。
+
+### 3.6 隐私收敛（防信息泄露）
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `HIDE_BUCKET_INFO` | `true` | 匿名视图隐藏桶名/区域；`/__api/health` 对匿名只返回 `{ok,service,authenticated,publicRead}`；匿名遇到上游错误只回状态码、不回 XML 正文（错误详情写 `wrangler tail` 日志） |
 | `STRIP_UPSTREAM_META` | `true` | 删除 `x-bz-*`、`x-amz-request-id`、`x-amz-id-2`、`x-amz-version-id`、`x-amz-server-side-encryption*` 等内部头；`ETag`/`Content-Range`/`Last-Modified` 保留以保证断点续传 |
 
-### 3.6 调试
+### 3.7 调试
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `DEBUG` | `false` | 保留项；异常时会在日志输出堆栈（`wrangler tail` 可见），响应体始终只返回简短错误信息 |
 
-### 3.7 匿名可见信息清单（默认配置下）
+### 3.8 匿名可见信息清单（默认配置下）
 
 | 信息 | 匿名能否看到 |
 | --- | --- |
@@ -298,6 +347,7 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 | `/__api/logout` | POST | 退出登录（返回 401 + `WWW-Authenticate`，促浏览器丢弃缓存凭据） |
 | `/__api/*` | 见下节 | 管理 API（需鉴权，`/health`、`/logout` 除外） |
 | `/<bucket>/__api/*` | 同上 | `$path` 模式下显式指定桶；也可用 `/__api/*?bucket=<桶名>` |
+| `/__api/usage` | GET | B2 用量：空间统计 + Class A/B/C/D 计数；`?refresh=1` 手动重算（受 `USAGE_MIN_INTERVAL` 限流）。需管理员鉴权 |
 | 任意 | OPTIONS | CORS 预检，返回 204 |
 
 > **判断规则**：路径以 `/` 结尾视为"目录"→ 返回列表；否则视为"对象"→ 走下载/上传/删除。

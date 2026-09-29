@@ -11,7 +11,8 @@ const { handle, loadConfig } = await import(pathToFileURL(path.join(here, '..', 
 const cacheStore = new Map();
 globalThis.caches = {
   default: {
-    async match(key) { return cacheStore.get(key); },
+    // 真实 Cache API 每次 match 都会给一个可重新读取的响应，这里用 clone 模拟
+    async match(key) { const hit = cacheStore.get(key); return hit ? hit.clone() : undefined; },
     async put(key, res) { cacheStore.set(key, res.clone ? res.clone() : res); },
   },
 };
@@ -102,7 +103,13 @@ const env = {
   CACHE_MAX_AGE: '60',
 };
 
-const ctx = { waitUntil() {} };
+/* ctx.waitUntil 收集成 promise，便于用例等待「计数落盘」等异步副作用 */
+const ctxPending = [];
+const ctx = {
+  waitUntil(p) { if (p && typeof p.then === 'function') ctxPending.push(p); },
+  passThroughOnException() {},
+};
+const settle = () => Promise.all(ctxPending.splice(0));
 function req(url, init = {}) {
   return new Request('https://dl.example.com' + url, init);
 }
@@ -347,6 +354,111 @@ await check('管理员可在 share 之外写入', async () => {
   const body = await res.json();
   assert(res.status === 200 && body.ok === true, 'status=' + res.status);
   return '已写入 /private/ok.txt';
+});
+
+/* ---------- B2 用量面板 ---------- */
+
+await settle();
+cacheStore.clear();
+
+await check('usage 端点需要鉴权（匿名 401）', async () => {
+  const res = await handle(req('/__api/usage'), shareEnv, ctx);
+  assert(res.status === 401, 'status=' + res.status);
+  return '401';
+});
+
+await check('usage：空间由列举累加，默认额度 10 GB', async () => {
+  cacheStore.clear();
+  const res = await handle(req('/__api/usage', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const body = await res.json();
+  assert(body.ok === true, JSON.stringify(body).slice(0, 140));
+  assert(body.bucket === 'my-bucket', 'bucket=' + body.bucket);
+  assert(body.quotaBytes === 10000000000, 'quotaBytes=' + body.quotaBytes);
+  // 桩返回 a.txt(1024B) + .keep(0B)
+  assert(body.storage.usedBytes === 1024, 'usedBytes=' + body.storage.usedBytes);
+  assert(body.storage.objects === 2, 'objects=' + body.storage.objects);
+  assert(body.storage.cached === false, '首次应回源扫描');
+  assert(body.storage.pages === 1, 'pages=' + body.storage.pages);
+  assert(body.classB.quota === 2500 && body.classC.quota === 2500, '缺省每日额度不对');
+  assert(/仅统计本 Worker/.test(body.scope), '缺少口径说明');
+  return body.storage.usedBytes + ' B / ' + body.storage.objects + ' 对象，额度 ' + body.quotaBytes;
+});
+
+await check('usage：第二次读取走缓存，不再回源 B2', async () => {
+  const before = sent.length;
+  const res = await handle(req('/__api/usage', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const body = await res.json();
+  assert(body.storage.cached === true, JSON.stringify(body.storage));
+  assert(sent.length === before, '缓存命中时不应回源，实际多出 ' + (sent.length - before) + ' 次');
+  return 'cached=true，回源 0 次';
+});
+
+await check('usage：手动刷新受 USAGE_MIN_INTERVAL 限流', async () => {
+  const res = await handle(req('/__api/usage?refresh=1', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const body = await res.json();
+  assert(body.storage.throttled === true, JSON.stringify(body.storage));
+  assert(body.storage.minInterval === 300, 'minInterval=' + body.storage.minInterval);
+  return 'throttled=true（最小间隔 ' + body.storage.minInterval + 's）';
+});
+
+await check('事务计数：读取→B、列举→C、写入→A、删除→D', async () => {
+  await settle();
+  cacheStore.clear();
+
+  await handle(req('/share/count-b.bin'), shareEnv, ctx);                                   // GET 对象 → B
+  await handle(req('/__api/list', { headers: { Authorization: basic } }), shareEnv, ctx);    // 列举 → C
+  await handle(req('/private/count-a.bin', {
+    method: 'PUT', body: 'x', headers: { Authorization: basic },
+  }), shareEnv, ctx);                                                                        // 写入 → A
+  await handle(req('/private/count-d.bin', {
+    method: 'DELETE', headers: { Authorization: basic },
+  }), shareEnv, ctx);                                                                        // 删除 → D
+  await settle();
+
+  const body = await (await handle(
+    req('/__api/usage', { headers: { Authorization: basic } }), shareEnv, ctx,
+  )).json();
+
+  assert(body.classB.used === 1, 'classB=' + body.classB.used);
+  assert(body.classA === 1, 'classA=' + body.classA);
+  assert(body.classD === 1, 'classD=' + body.classD);
+  // 1 次 /__api/list + 本次 usage 触发的 1 页扫描
+  assert(body.classC.used === 2, 'classC=' + body.classC.used);
+  assert(body.classB.remaining === 2499, 'remaining=' + body.classB.remaining);
+  return 'A=1 B=1 C=2 D=1，Class B 剩 ' + body.classB.remaining;
+});
+
+await check('计数按 UTC 日切，key 里带当天日期', async () => {
+  await settle();   // 等最后一次计数落盘
+  const day = new Date().toISOString().slice(0, 10);
+  const keys = [...cacheStore.keys()].filter((k) => String(k).includes('/counters/'));
+  assert(keys.length === 1, '计数器 key 数量异常: ' + keys.length);
+  assert(String(keys[0]).endsWith('/' + day), 'key 未按 UTC 日期分桶: ' + keys[0]);
+  const stored = await cacheStore.get(keys[0]).clone().json();
+  assert(stored.B === 1 && stored.C === 2, JSON.stringify(stored));
+  return String(keys[0]).replace('https://usage.internal', 'usage');
+});
+
+await check('ENABLE_USAGE_PANEL=false 时端点明确报关闭', async () => {
+  const res = await handle(
+    req('/__api/usage', { headers: { Authorization: basic } }),
+    { ...shareEnv, ENABLE_USAGE_PANEL: 'false' }, ctx,
+  );
+  const body = await res.json();
+  assert(body.storage.ok === false && /ENABLE_USAGE_PANEL/.test(body.storage.error), JSON.stringify(body.storage));
+  return body.storage.error;
+});
+
+await check('管理器页面带用量卡片', async () => {
+  const page = await (await handle(
+    req('/__manage', { headers: { Authorization: basic } }), shareEnv, ctx,
+  )).text();
+  assert(page.includes('id="usage"'), '缺少用量容器');
+  assert(page.includes('function loadUsage'), '缺少加载逻辑');
+  assert(page.includes('btnUsageRefresh'), '缺少「重新统计」按钮');
+  assert(page.includes('Class B（读取）') && page.includes('Class C（列举）'), '缺少事务分类展示');
+  assert(page.includes('loadUsage(false)'), '页面应只读缓存地加载一次');
+  return '卡片就位';
 });
 
 /* ---------- 目录页：返回上一级 / 占位对象 ---------- */

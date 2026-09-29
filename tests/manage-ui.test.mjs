@@ -80,13 +80,34 @@ function buildSandbox(html) {
   };
   document.getElementById('cfg').textContent = cfgJson;
 
-  const fetchStub = async () => ({
+  const okJson = (data) => ({
     ok: true,
     status: 200,
     headers: { get: () => null },
-    json: async () => ({ ok: true, files: [], folders: [], truncated: false, nextToken: '' }),
-    text: async () => '',
+    json: async () => data,
+    text: async () => JSON.stringify(data),
   });
+  const fetchStub = async (input) => {
+    const target = String(typeof input === 'string' ? input : (input && input.url) || '');
+    if (target.includes('/usage')) {
+      return okJson({
+        ok: true,
+        bucket: 'demo-bucket',
+        quotaBytes: 10000000000,
+        storage: {
+          ok: true, usedBytes: 2147483648, objects: 12, pages: 3,
+          complete: true, cached: true, throttled: false, at: '2026-09-30T02:00:00.000Z',
+        },
+        classA: 7,
+        classB: { used: 128, quota: 2500, remaining: 2372 },
+        classC: { used: 12, quota: 2500, remaining: 2488 },
+        classD: 0,
+        resetAt: '2026-10-01T00:00:00Z',
+        scope: '仅统计本 Worker 发往 B2 的请求；控制台、rclone 等其他客户端不计入',
+      });
+    }
+    return okJson({ ok: true, files: [], folders: [], truncated: false, nextToken: '' });
+  };
 
   const location = { origin: 'https://x', href: 'https://x/__manage', reload() {} };
   const winData = {
@@ -169,6 +190,25 @@ await check('内联脚本可在假 DOM 中完整执行（初始化不抛错）',
   const { sandbox, scripts } = buildSandbox(await render(env));
   for (const code of scripts) vm.runInNewContext(code, sandbox);
   return scripts.length + ' 个脚本块执行通过';
+});
+
+await check('用量卡片渲染：空间、进度、Class B/C 计数与重算按钮', async () => {
+  const { sandbox, els, scripts } = buildSandbox(await render(env));
+  for (const code of scripts) vm.runInNewContext(code, sandbox);
+  await new Promise((resolve) => setImmediate(resolve));   // 等 loadUsage 的异步链跑完
+
+  const card = String(els.get('usage').innerHTML || '');
+  assert(card.includes('demo-bucket'), '缺少桶名: ' + card.slice(0, 160));
+  assert(card.includes('2.1 GB'), '已用空间未格式化（十进制单位）: ' + card.slice(0, 160));
+  assert(card.includes('10.0 GB'), '缺少总额度');
+  assert(/21\.5%/.test(card), '缺少占用百分比: ' + (card.match(/[\d.]+%/) || []).join());
+  assert(card.includes('Class B（读取）') && card.includes('128'), 'Class B 计数缺失');
+  assert(card.includes('Class C（列举）') && card.includes('12'), 'Class C 计数缺失');
+  assert(card.includes('剩 2372'), '缺少剩余次数');
+  assert(card.includes('btnUsageRefresh'), '缺少重新统计按钮');
+  assert(card.includes('本次扫描 3 次 Class C'), '缺少扫描成本提示');
+  assert(card.includes('缓存'), '未标注数据来自缓存');
+  return card.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
 });
 
 await check('默认值来自服务端配置：分片 25 MiB / 并发 3', async () => {
