@@ -102,6 +102,11 @@ function buildSandbox(html) {
         classB: { used: 128, quota: 2500, remaining: 2372 },
         classC: { used: 12, quota: 2500, remaining: 2488 },
         classD: 0,
+        counterBackend: 'do',
+        counterBackendLabel: 'Durable Object（全局一致、原子）',
+        windowed: true,
+        windowHour: 23,
+        minInterval: 300,
         resetAt: '2026-10-01T00:00:00Z',
         scope: '仅统计本 Worker 发往 B2 的请求；控制台、rclone 等其他客户端不计入',
       });
@@ -208,6 +213,8 @@ await check('用量卡片渲染：空间、进度、Class B/C 计数与重算按
   assert(card.includes('btnUsageRefresh'), '缺少重新统计按钮');
   assert(card.includes('本次扫描 3 次 Class C'), '缺少扫描成本提示');
   assert(card.includes('缓存'), '未标注数据来自缓存');
+  assert(card.includes('计数后端：Durable Object'), '未标注计数后端');
+  assert(card.includes('当日终值扫描'), '未标注窗口扫描');
   return card.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
 });
 

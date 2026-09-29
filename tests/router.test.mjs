@@ -5,7 +5,9 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const { handle, loadConfig } = await import(pathToFileURL(path.join(here, '..', 'src', 'b2-worker.js')).href);
+const {
+  handle, loadConfig, UsageCounter, shouldWindowScan,
+} = await import(pathToFileURL(path.join(here, '..', 'src', 'b2-worker.js')).href);
 
 /* ---------- 桩：Cache API 与 fetch ---------- */
 const cacheStore = new Map();
@@ -397,8 +399,8 @@ await check('usage：手动刷新受 USAGE_MIN_INTERVAL 限流', async () => {
   const res = await handle(req('/__api/usage?refresh=1', { headers: { Authorization: basic } }), shareEnv, ctx);
   const body = await res.json();
   assert(body.storage.throttled === true, JSON.stringify(body.storage));
-  assert(body.storage.minInterval === 300, 'minInterval=' + body.storage.minInterval);
-  return 'throttled=true（最小间隔 ' + body.storage.minInterval + 's）';
+  assert(body.minInterval === 300, 'minInterval=' + body.minInterval);
+  return 'throttled=true（最小间隔 ' + body.minInterval + 's）';
 });
 
 await check('事务计数：读取→B、列举→C、写入→A、删除→D', async () => {
@@ -459,6 +461,194 @@ await check('管理器页面带用量卡片', async () => {
   assert(page.includes('Class B（读取）') && page.includes('Class C（列举）'), '缺少事务分类展示');
   assert(page.includes('loadUsage(false)'), '页面应只读缓存地加载一次');
   return '卡片就位';
+});
+
+/* ---------- Durable Object 计数：单元 + 集成 + 23:00 窗口 ---------- */
+
+const ctrlCtx = { waitUntil(p) { if (p && p.then) ctxPending.push(p); }, passThroughOnException() {} };
+
+const utcToday = () => new Date().toISOString().slice(0, 10);
+
+/** 以「今天(UTC)」为基准构造时间，避免测试日期与真实时钟错位触发跨日归零 */
+const doAt = (hour, minute = 0, dayOffset = 0) => {
+  const now = new Date();
+  return new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + dayOffset, hour, minute, 0,
+  ));
+};
+
+const doReq = (action, body) => new Request('https://usage.do/' + action, {
+  method: body === undefined ? 'GET' : 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: body === undefined ? undefined : JSON.stringify(body),
+});
+
+function fakeDoState(initial) {
+  const store = new Map();
+  if (initial) store.set('usage', structuredClone(initial));
+  let writes = 0;
+  return {
+    store,
+    get writes() { return writes; },
+    storage: {
+      async get(key) { return store.get(key); },
+      async put(key, value) { writes++; store.set(key, structuredClone(value)); },
+    },
+  };
+}
+
+/** 把真实 UsageCounter 包成 DO stub（模拟 env.USAGE_DO 的 fetch 接口） */
+function fakeDoNamespace(created = []) {
+  const stubs = new Map();
+  return {
+    created,
+    idFromName(name) { created.push(name); return name; },
+    get(id) {
+      if (!stubs.has(id)) {
+        const counter = new UsageCounter(fakeDoState(), {});
+        stubs.set(id, {
+          counter,
+          fetch: (url, init) => counter.fetch(new Request(url, init)),
+        });
+      }
+      return stubs.get(id);
+    },
+    stubs,
+  };
+}
+
+await check('DO：累加计数并按 UTC 日切归零', async () => {
+  const counter = new UsageCounter(fakeDoState(), {});
+  const day1 = doAt(10, 0);
+  await counter.onAdd(doReq('add', { A: 2, B: 3 }), day1);
+  await counter.onAdd(doReq('add', { B: 1 }), day1);
+  const res = await (await counter.onSync(doReq('sync', { ttl: 21600 }), doAt(10, 1))).json();
+  assert(res.counters.A === 2 && res.counters.B === 4, JSON.stringify(res.counters));
+  assert(res.day === utcToday(), 'day=' + res.day);
+
+  // 跨 UTC 日：计数归零
+  const body = await (await counter.onAdd(doReq('add', { C: 1 }), doAt(0, 1, 1))).json();
+  assert(body.day !== res.day, '未跨日: ' + body.day);
+  assert(body.counters.A === 0 && body.counters.B === 0 && body.counters.C === 1, JSON.stringify(body.counters));
+  return '当天 A=2 B=4；次日归零后 A=0 B=0 C=1';
+});
+
+await check('DO：首次读取要求扫描，之后不再重复要求', async () => {
+  const counter = new UsageCounter(fakeDoState(), {});
+  const now = doAt(10, 0);
+  const first = await (await counter.onSync(doReq('sync', { ttl: 21600, windowHour: 23 }), now)).json();
+  assert(first.shouldScan === true, '首次应要求扫描');
+  assert(first.storage === null, '首次没有快照');
+
+  await counter.onSnapshot(doReq('snapshot', { bucket: 'b', usedBytes: 2048, objects: 3, pages: 1 }), now);
+  const second = await (await counter.onSync(doReq('sync', { ttl: 21600, windowHour: 23 }), doAt(10, 1))).json();
+  assert(second.shouldScan === false, '刚存完快照不应再扫: ' + JSON.stringify(second.storage));
+  assert(second.storage.usedBytes === 2048, JSON.stringify(second.storage));
+  return '首次 shouldScan=true → 存快照后 false（2 KB / 3 对象）';
+});
+
+await check('DO：手动刷新受最小间隔限流，超时后可再扫', async () => {
+  const counter = new UsageCounter(fakeDoState(), {});
+  await counter.onSnapshot(doReq('snapshot', { usedBytes: 100 }), doAt(10, 0));
+
+  const immediate = await (await counter.onSync(doReq('sync', {
+    ttl: 21600, minInterval: 300, refresh: true, windowHour: 23,
+  }), doAt(10, 1))).json();
+  assert(immediate.shouldScan === false && immediate.throttled === true, JSON.stringify(immediate));
+
+  const later = await (await counter.onSync(doReq('sync', {
+    ttl: 21600, minInterval: 300, refresh: true, windowHour: 23,
+  }), doAt(10, 6))).json();
+  assert(later.shouldScan === true, JSON.stringify(later));
+  return '60s 内 throttled=true；6 分钟后放行';
+});
+
+await check('DO：UTC 23 点窗口内补扫一次，全天只补一次', async () => {
+  const counter = new UsageCounter(fakeDoState(), {});
+  await counter.onSnapshot(doReq('snapshot', { usedBytes: 500 }), doAt(22, 59));
+
+  const inWindow = await (await counter.onSync(doReq('sync', {
+    ttl: 21600, minInterval: 300, windowHour: 23,
+  }), doAt(23, 5))).json();
+  assert(inWindow.shouldScan === true, '窗口内应补扫: ' + JSON.stringify(inWindow));
+  assert(inWindow.windowed === true, 'windowed 标记缺失');
+
+  await counter.onSnapshot(doReq('snapshot', { usedBytes: 900 }), doAt(23, 6));
+  const again = await (await counter.onSync(doReq('sync', {
+    ttl: 21600, minInterval: 300, windowHour: 23,
+  }), doAt(23, 30))).json();
+  assert(again.shouldScan === false, '同一天窗口内不应重复扫: ' + JSON.stringify(again));
+
+  const tomorrow = await (await counter.onSync(doReq('sync', {
+    ttl: 21600, minInterval: 300, windowHour: 23,
+  }), doAt(23, 10, 1))).json();
+  assert(tomorrow.shouldScan === true, '新的一天应再次补扫');
+  return '22:59 不补 → 23:05 补 → 23:30 不补 → 次日 23:10 再补';
+});
+
+await check('DO：writeEvery 合并落盘以减少 SQLite 行写入', async () => {
+  const state = fakeDoState();
+  const counter = new UsageCounter(state, {});
+  const now = doAt(10, 0);
+  for (let i = 0; i < 4; i++) await counter.onAdd(doReq('add', { B: 1, writeEvery: 3 }), now);
+  assert(state.writes === 1, '每 3 次才落盘，实际写 ' + state.writes + ' 次');
+  const body = await (await counter.onSync(doReq('sync', { ttl: 0 }), doAt(10, 1))).json();
+  assert(body.counters.B === 4, '内存计数应为 4，实际 ' + body.counters.B);
+  return '4 次累计 → 1 次落盘，计数仍为 4';
+});
+
+await check('shouldWindowScan 纯函数边界', async () => {
+  const at = (iso) => new Date(iso);
+  assert(shouldWindowScan(at('2026-09-30T22:59:00Z'), 23, '') === false, '22:59 不该触发');
+  assert(shouldWindowScan(at('2026-09-30T23:00:00Z'), 23, '') === true, '23:00 应触发');
+  assert(shouldWindowScan(at('2026-09-30T23:00:00Z'), 23, '2026-09-30') === false, '当天已扫过不重复');
+  assert(shouldWindowScan(at('2026-10-01T23:00:00Z'), 23, '2026-09-30') === true, '隔天应触发');
+  assert(shouldWindowScan(at('2026-09-30T23:00:00Z'), -1, '') === false, '关闭后不触发');
+  assert(shouldWindowScan(at('2026-09-30T05:00:00Z'), 0, '') === true, 'windowHour=0 表示整个 UTC 日');
+  return '6 个边界全部符合预期';
+});
+
+await check('绑定 USAGE_DO 后：Worker 走 DO 后端并在面板标注', async () => {
+  await settle();
+  cacheStore.clear();
+  const ns = fakeDoNamespace();
+  const doEnv = { ...shareEnv, USAGE_DO: ns };
+
+  await handle(req('/share/do-count.bin'), doEnv, ctrlCtx);      // → B
+  await settle();                                                // 等计数写入 DO
+
+  const res = await handle(req('/__api/usage', { headers: { Authorization: basic } }), doEnv, ctrlCtx);
+  const body = await res.json();
+  assert(body.counterBackend === 'do', 'backend=' + body.counterBackend);
+  assert(/Durable Object/.test(body.counterBackendLabel), body.counterBackendLabel);
+  assert(body.classB.used === 1, 'classB=' + body.classB.used);
+  assert(body.storage.usedBytes === 1024, 'DO 后端快照应为 1024，实际 ' + body.storage.usedBytes);
+  assert(ns.created.some((n) => n === 'usage:my-bucket'), 'DO 实例名不对: ' + JSON.stringify(ns.created));
+
+  // 再读一次：DO 已存快照 → 不应再扫 B2
+  const before = sent.length;
+  const second = await (await handle(req('/__api/usage', { headers: { Authorization: basic } }), doEnv, ctrlCtx)).json();
+  assert(second.storage.cached === true, 'DO 快照应命中: ' + JSON.stringify(second.storage));
+  assert(sent.length === before, 'DO 命中快照时不应回源');
+  return 'backend=do，B=1，快照 1024B，二次读取零回源';
+});
+
+await check('DO 调用失败时自动降级到 Cache API，不影响面板可用', async () => {
+  await settle();
+  cacheStore.clear();
+  const brokenEnv = {
+    ...shareEnv,
+    USAGE_DO: {
+      idFromName: () => 'x',
+      get: () => ({ fetch: async () => { throw new Error('DO 炸了'); } }),
+    },
+  };
+  const body = await (await handle(
+    req('/__api/usage', { headers: { Authorization: basic } }), brokenEnv, ctrlCtx,
+  )).json();
+  assert(body.ok === true && body.counterBackend === 'cache', JSON.stringify(body).slice(0, 160));
+  assert(body.storage.ok === true, '降级后仍应给出空间数据');
+  return 'backend=cache，空间仍可用';
 });
 
 /* ---------- 目录页：返回上一级 / 占位对象 ---------- */

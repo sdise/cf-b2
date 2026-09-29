@@ -399,6 +399,13 @@ function loadConfig(env) {
     usageMinInterval: Math.max(0, readInt(env.USAGE_MIN_INTERVAL, 300)),
     // 单次扫描最多翻多少页（每页 1000 个对象 = 1 次 Class C）
     usageScanMaxPages: Math.max(1, Math.min(200, readInt(env.USAGE_SCAN_MAX_PAGES, 20))),
+    // 惰性窗口：UTC 进入该小时后，当天第一次读取会强制重扫一次（-1 关闭）
+    usageRefreshHour: (() => {
+      const hour = readInt(env.USAGE_REFRESH_AT_UTC_HOUR, 23);
+      return hour >= 0 && hour <= 23 ? hour : -1;
+    })(),
+    // Durable Object 计数：每累计多少次增量才落盘（1 = 每次请求都落盘，最精确）
+    usageDoWriteEvery: Math.max(1, Math.min(100, readInt(env.USAGE_DO_WRITE_EVERY, 1))),
     // 每日额度（B2 免费账户的 Class B/C 各 2500 次/天，按你账户实际套餐调整）
     classBQuota: Math.max(0, readInt(env.CLASS_B_DAILY_QUOTA, 2500)),
     classCQuota: Math.max(0, readInt(env.CLASS_C_DAILY_QUOTA, 2500)),
@@ -875,6 +882,16 @@ function utcDayStamp(date = new Date()) {
   return date.toISOString().slice(0, 10);
 }
 
+/**
+ * 是否该在「归零前窗口」补一次空间扫描：UTC 进入 windowHour 之后，
+ * 且当天还没有做过窗口扫描。每天最多一次。
+ */
+function shouldWindowScan(now, windowHour, windowDay) {
+  if (!(windowHour >= 0 && windowHour <= 23)) return false;
+  if (now.getUTCHours() < windowHour) return false;
+  return windowDay !== utcDayStamp(now);
+}
+
 function counterCacheKey(bucket) {
   return USAGE_CACHE_ORIGIN + '/counters/' + encodeURIComponent(bucket || '_') + '/' + utcDayStamp();
 }
@@ -902,26 +919,212 @@ async function cachePutJson(key, value, maxAge) {
   }
 }
 
-/** 把本请求产生的 B2 调用次数合并进当天的计数器（尽力而为，不阻塞响应） */
-async function flushCounters(cfg, bucket) {
+/* ---------- 计数后端一：Durable Object（全局单实例、原子） ---------- */
+
+/** 取计数用的 DO stub；未绑定或不可用时返回 null，调用方退化到 Cache API */
+function usageDoStub(env, bucket) {
+  if (!env || !env.USAGE_DO) return null;
+  try {
+    return env.USAGE_DO.get(env.USAGE_DO.idFromName('usage:' + (bucket || '_')));
+  } catch (error) {
+    console.error('[cf-b2-worker] USAGE_DO 不可用，改用 Cache API 口径:', error && error.message);
+    return null;
+  }
+}
+
+async function doCall(stub, action, payload) {
+  const init = payload === undefined
+    ? { method: 'GET' }
+    : {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    };
+  const response = await stub.fetch('https://usage.do/' + action, init);
+  if (!response.ok) throw new Error('DO ' + action + ' → HTTP ' + response.status);
+  return response.json();
+}
+
+/**
+ * 用量计数器（Durable Object）。
+ * 同一个桶共用一个实例 → 所有数据中心看到同一份数字；DO 对同一实例的请求
+ * 串行处理，所以「跨日归零 + 累加」天然是原子操作，不会丢计数。
+ */
+export class UsageCounter {
+  constructor(state, env) {
+    this.state = state;
+    this.env = env;
+    this.data = null;
+    this.pending = 0;
+  }
+
+  async load() {
+    if (!this.data) {
+      const stored = await this.state.storage.get('usage');
+      this.data = stored || {
+        day: utcDayStamp(), A: 0, B: 0, C: 0, D: 0, at: '',
+        storage: null, windowDay: '', lastAttempt: 0,
+      };
+    }
+    return this.data;
+  }
+
+  /** 落盘；所有时间戳都以传入的 now 为准（便于测试与推理，只用一处时钟） */
+  async save(now) {
+    this.data.at = (now || new Date()).toISOString();
+    await this.state.storage.put('usage', this.data);
+  }
+
+  /** 跨 UTC 日归零（与 B2 官方计数器 00:00 GMT 对齐） */
+  rollover(now) {
+    const today = utcDayStamp(now);
+    if (this.data.day !== today) {
+      this.data.day = today;
+      this.data.A = 0;
+      this.data.B = 0;
+      this.data.C = 0;
+      this.data.D = 0;
+      this.data.windowDay = '';
+    }
+    return today;
+  }
+
+  counters() {
+    return { A: this.data.A, B: this.data.B, C: this.data.C, D: this.data.D, at: this.data.at || '' };
+  }
+
+  async fetch(request) {
+    const action = new URL(request.url).pathname.replace(/\/+$/, '').split('/').pop();
+    await this.load();
+    const now = new Date();
+    if (action === 'add') return this.onAdd(request, now);
+    if (action === 'sync') return this.onSync(request, now);
+    if (action === 'snapshot') return this.onSnapshot(request, now);
+    return json({ ok: false, error: '未知的 DO 动作: ' + action }, 404);
+  }
+
+  /** 累加本批 B2 调用次数；writeEvery > 1 时合并落盘以减少 SQLite 行写入 */
+  async onAdd(request, now) {
+    await this.load();
+    const body = await request.json().catch(() => ({}));
+    this.rollover(now);
+    let changed = false;
+    for (const cls of ['A', 'B', 'C', 'D']) {
+      const n = Number(body[cls]) || 0;
+      if (n > 0) {
+        this.data[cls] += n;
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.data.at = now.toISOString();
+      this.pending += 1;
+      const every = Math.max(1, Number(body.writeEvery) || 1);
+      if (this.pending >= every) {
+        this.pending = 0;
+        await this.save(now);
+      }
+    }
+    return json({ ok: true, day: this.data.day, counters: this.counters() }, 200);
+  }
+
+  /**
+   * 一次调用同时完成「读计数器」与「是否该重扫空间」的仲裁。
+   * 仲裁在 DO 内串行执行 → 多个数据中心同时打开页面也只会有一个真正去扫。
+   */
+  async onSync(request, now) {
+    await this.load();
+    const body = await request.json().catch(() => ({}));
+    const today = this.rollover(now);
+    const ttlMs = Math.max(0, Number(body.ttl) || 0) * 1000;
+    const minIntervalMs = Math.max(0, Number(body.minInterval) || 0) * 1000;
+    const windowHour = Number.isFinite(body.windowHour) ? body.windowHour : -1;
+
+    const snapshot = this.data.storage;
+    const snapshotAt = snapshot && snapshot.at ? Date.parse(snapshot.at) : 0;
+    const ageMs = snapshotAt ? now.getTime() - snapshotAt : Infinity;
+
+    let shouldScan = false;
+    let throttled = false;
+    let windowed = false;
+
+    if (!snapshotAt) {
+      shouldScan = true;
+    } else if (body.refresh === true) {
+      if (ageMs < minIntervalMs) throttled = true;
+      else shouldScan = true;
+    } else if (ttlMs > 0 && ageMs >= ttlMs) {
+      shouldScan = true;
+    } else if (shouldWindowScan(now, windowHour, this.data.windowDay)) {
+      shouldScan = true;
+    }
+
+    if (shouldScan) {
+      this.data.lastAttempt = now.getTime();
+      if (windowHour >= 0 && now.getUTCHours() >= windowHour) {
+        this.data.windowDay = today;
+        windowed = true;
+      }
+      await this.save(now);
+    }
+
+    return json({
+      ok: true,
+      day: today,
+      counters: this.counters(),
+      storage: snapshot || null,
+      shouldScan,
+      throttled,
+      windowed,
+      minInterval: Math.round(minIntervalMs / 1000),
+      ageSeconds: Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : -1,
+    }, 200);
+  }
+
+  /** 保存空间扫描结果 */
+  async onSnapshot(request, now) {
+    await this.load();
+    const body = await request.json().catch(() => ({}));
+    this.rollover(now);
+    this.data.storage = {
+      ok: true,
+      bucket: String(body.bucket || ''),
+      usedBytes: Number(body.usedBytes) || 0,
+      objects: Number(body.objects) || 0,
+      pages: Number(body.pages) || 0,
+      complete: body.complete !== false,
+      at: now.toISOString(),
+    };
+    await this.save(now);
+    return json({ ok: true, day: this.data.day, counters: this.counters(), storage: this.data.storage }, 200);
+  }
+}
+
+/* ---------- 计数后端二：Cache API（未绑定 DO 时的降级，按数据中心分裂） ---------- */
+
+/** 把本请求产生的 B2 调用次数合并进计数器（尽力而为，不阻塞响应） */
+async function flushCounters(cfg, env, bucket) {
   const counts = cfg && cfg.usage && cfg.usage.counts;
   if (!counts || !Object.keys(counts).length) return;
+
+  const stub = usageDoStub(env, bucket);
+  if (stub) {
+    try {
+      await doCall(stub, 'add', { ...counts, writeEvery: cfg.usageDoWriteEvery });
+      return;
+    } catch (error) {
+      // 绑定存在但调用失败时不再写 Cache，避免两套后端数字分裂
+      console.error('[cf-b2-worker] DO 计数失败，丢弃本次增量:', error && error.message);
+      return;
+    }
+  }
+
   const key = counterCacheKey(bucket);
   const prev = (await cacheGetJson(key)) || {};
   const next = { A: prev.A || 0, B: prev.B || 0, C: prev.C || 0, D: prev.D || 0 };
   for (const [cls, n] of Object.entries(counts)) next[cls] = (next[cls] || 0) + n;
   next.at = new Date().toISOString();
   await cachePutJson(key, next, 2 * 86400);
-}
-
-async function readCounters(bucket) {
-  const data = (await cacheGetJson(counterCacheKey(bucket))) || {};
-  return {
-    A: data.A || 0, B: data.B || 0, C: data.C || 0, D: data.D || 0,
-    at: data.at || '',
-    day: utcDayStamp(),
-    resetAt: utcDayStamp() + 'T00:00:00Z',
-  };
 }
 
 /** 遍历整个桶累加对象数与字节数（每 1000 个对象 1 次 Class C） */
@@ -946,43 +1149,143 @@ async function computeStorage(cfg, bucket) {
   return { ok: true, objects, bytes, pages, complete: !truncated };
 }
 
-/**
- * 带缓存与限流的空间统计。
- * refresh=true 表示用户点了「重新统计」：仍在 usageMinInterval 内则直接回缓存。
- */
-async function storageUsage(cfg, bucket, refresh) {
-  const now = Date.now();
+async function readCountersViaCache(bucket) {
+  const data = (await cacheGetJson(counterCacheKey(bucket))) || {};
+  return { A: data.A || 0, B: data.B || 0, C: data.C || 0, D: data.D || 0, at: data.at || '' };
+}
+
+/** 空间快照（对外统一形状） */
+function snapshotShape(bucket, source, { cached, throttled, ageSeconds }) {
+  return {
+    ok: true,
+    bucket,
+    usedBytes: source.usedBytes || 0,
+    objects: source.objects || 0,
+    pages: source.pages || 0,
+    complete: source.complete !== false,
+    at: source.at || '',
+    cached: Boolean(cached),
+    throttled: Boolean(throttled),
+    ageSeconds: Number.isFinite(ageSeconds) ? ageSeconds : 0,
+  };
+}
+
+/** 降级后端：Cache API（按数据中心独立，读-改-写非原子） */
+async function usageStateViaCache(cfg, bucket, refresh) {
   const cached = await cacheGetJson(storageCacheKey(bucket));
   const cachedAt = cached && cached.at ? Date.parse(cached.at) : 0;
-  const ageMs = cachedAt ? now - cachedAt : Infinity;
+  const ageMs = cachedAt ? Date.now() - cachedAt : Infinity;
+  const inWindow = cfg.usageRefreshHour >= 0
+    && new Date().getUTCHours() >= cfg.usageRefreshHour;
+  const windowed = Boolean(cached) && shouldWindowScan(new Date(), cfg.usageRefreshHour, cached.windowDay);
 
-  if (cached && ageMs < cfg.usageCacheTtl * 1000 && !refresh) {
-    return { ...cached, cached: true, throttled: false, ageSeconds: Math.round(ageMs / 1000) };
-  }
-  if (refresh && cached && ageMs < cfg.usageMinInterval * 1000) {
+  let shouldScan = false;
+  let throttled = false;
+  if (!cachedAt) shouldScan = true;
+  else if (refresh && ageMs < cfg.usageMinInterval * 1000) throttled = true;
+  else if (refresh) shouldScan = true;
+  else if (ageMs >= cfg.usageCacheTtl * 1000) shouldScan = true;
+  else if (windowed) shouldScan = true;
+
+  const counters = await readCountersViaCache(bucket);
+  if (!shouldScan) {
     return {
-      ...cached, cached: true, throttled: true,
-      minInterval: cfg.usageMinInterval, ageSeconds: Math.round(ageMs / 1000),
+      backend: 'cache',
+      counters,
+      storage: snapshotShape(bucket, cached, { cached: true, throttled, ageSeconds: Math.round(ageMs / 1000) }),
+      throttled, windowed, minInterval: cfg.usageMinInterval,
     };
   }
 
   const scan = await computeStorage(cfg, bucket);
-  if (!scan.ok) return { ok: false, error: scan.error, status: scan.status };
+  if (!scan.ok) {
+    return {
+      backend: 'cache',
+      counters,
+      storage: { ok: false, error: scan.error, status: scan.status },
+      throttled, windowed, minInterval: cfg.usageMinInterval,
+    };
+  }
 
-  const result = {
-    ok: true,
+  const stored = {
+    usedBytes: scan.bytes, objects: scan.objects, pages: scan.pages,
+    complete: scan.complete, at: new Date().toISOString(),
+    windowDay: inWindow ? utcDayStamp() : ((cached && cached.windowDay) || ''),
+  };
+  await cachePutJson(storageCacheKey(bucket), stored, Math.max(60, cfg.usageCacheTtl));
+  return {
+    backend: 'cache',
+    counters,
+    storage: snapshotShape(bucket, stored, { cached: false, throttled, ageSeconds: 0 }),
+    throttled, windowed, minInterval: cfg.usageMinInterval,
+  };
+}
+
+/**
+ * 用量统一入口：绑定了 USAGE_DO 就走 Durable Object（全局一致 + 原子），
+ * 否则退化到 Cache API。refresh=true 表示用户点了「重新统计」。
+ */
+async function usageState(cfg, env, bucket, refresh) {
+  const stub = usageDoStub(env, bucket);
+  if (!stub) return usageStateViaCache(cfg, bucket, refresh);
+
+  let state;
+  try {
+    state = await doCall(stub, 'sync', {
+      ttl: cfg.usageCacheTtl,
+      minInterval: cfg.usageMinInterval,
+      refresh,
+      windowHour: cfg.usageRefreshHour,
+    });
+  } catch (error) {
+    console.error('[cf-b2-worker] DO 读取失败，本次改用 Cache API 口径:', error && error.message);
+    return usageStateViaCache(cfg, bucket, refresh);
+  }
+
+  if (!state.shouldScan) {
+    return {
+      backend: 'do',
+      counters: state.counters,
+      storage: state.storage
+        ? snapshotShape(bucket, state.storage, {
+          cached: true, throttled: state.throttled, ageSeconds: state.ageSeconds,
+        })
+        : { ok: false, error: '暂无快照' },
+      throttled: state.throttled,
+      windowed: state.windowed,
+      minInterval: state.minInterval,
+    };
+  }
+
+  const scan = await computeStorage(cfg, bucket);
+  if (!scan.ok) {
+    return {
+      backend: 'do',
+      counters: state.counters,
+      storage: { ok: false, error: scan.error, status: scan.status },
+      throttled: state.throttled,
+      windowed: state.windowed,
+      minInterval: state.minInterval,
+    };
+  }
+
+  const saved = await doCall(stub, 'snapshot', {
     bucket,
     usedBytes: scan.bytes,
     objects: scan.objects,
     pages: scan.pages,
     complete: scan.complete,
-    cached: false,
-    throttled: false,
-    ageSeconds: 0,
-    at: new Date().toISOString(),
+  });
+  return {
+    backend: 'do',
+    counters: saved.counters,
+    storage: snapshotShape(bucket, saved.storage, {
+      cached: false, throttled: state.throttled, ageSeconds: 0,
+    }),
+    throttled: state.throttled,
+    windowed: state.windowed,
+    minInterval: state.minInterval,
   };
-  await cachePutJson(storageCacheKey(bucket), result, Math.max(60, cfg.usageCacheTtl));
-  return result;
 }
 
 /* ============================ 6. 管理 API ============================ */
@@ -1071,34 +1374,45 @@ async function apiRouter(request, env, ctx, cfg, url) {
     /* ---- B2 用量（空间 + 事务计数） ---- */
     case 'usage': {
       const refresh = url.searchParams.get('refresh') === '1';
-      const storage = cfg.enableUsage
-        ? await storageUsage(cfg, targetBucket, refresh)
-        : { ok: false, error: '用量面板已关闭（ENABLE_USAGE_PANEL=false）' };
+      const state = cfg.enableUsage
+        ? await usageState(cfg, env, targetBucket, refresh)
+        : {
+          backend: 'off',
+          counters: { A: 0, B: 0, C: 0, D: 0, at: '' },
+          storage: { ok: false, error: '用量面板已关闭（ENABLE_USAGE_PANEL=false）' },
+          throttled: false,
+          windowed: false,
+          minInterval: cfg.usageMinInterval,
+        };
 
-      const counters = await readCounters(targetBucket);
       // 本请求刚发生的 B2 调用（例如本次扫描本身）也一并计入展示
       const live = (cfg.usage && cfg.usage.counts) || {};
-      for (const cls of ['A', 'B', 'C', 'D']) counters[cls] += live[cls] || 0;
+      const used = {
+        A: (state.counters.A || 0) + (live.A || 0),
+        B: (state.counters.B || 0) + (live.B || 0),
+        C: (state.counters.C || 0) + (live.C || 0),
+        D: (state.counters.D || 0) + (live.D || 0),
+      };
+      const remaining = (total, quota) => Math.max(0, quota - total);
 
       return json({
         ok: true,
         bucket: targetBucket,
         quotaBytes: cfg.storageQuotaBytes,
-        storage,
-        classA: counters.A,
-        classB: {
-          used: counters.B,
-          quota: cfg.classBQuota,
-          remaining: Math.max(0, cfg.classBQuota - counters.B),
-        },
-        classC: {
-          used: counters.C,
-          quota: cfg.classCQuota,
-          remaining: Math.max(0, cfg.classCQuota - counters.C),
-        },
-        classD: counters.D,
-        resetAt: counters.resetAt,
-        counterUpdatedAt: counters.at,
+        storage: state.storage,
+        counterBackend: state.backend,
+        counterBackendLabel: state.backend === 'do'
+          ? 'Durable Object（全局一致、原子）'
+          : (state.backend === 'cache' ? 'Cache API（按数据中心独立，近似）' : '已关闭'),
+        windowed: state.windowed,
+        windowHour: cfg.usageRefreshHour,
+        minInterval: state.minInterval,
+        classA: used.A,
+        classB: { used: used.B, quota: cfg.classBQuota, remaining: remaining(used.B, cfg.classBQuota) },
+        classC: { used: used.C, quota: cfg.classCQuota, remaining: remaining(used.C, cfg.classCQuota) },
+        classD: used.D,
+        resetAt: utcDayStamp() + 'T00:00:00Z',
+        counterUpdatedAt: state.counters.at || '',
         scope: '仅统计本 Worker 发往 B2 的请求；控制台、rclone 等其他客户端不计入',
         updatedAt: new Date().toISOString(),
       }, 200, request, cfg);
@@ -2186,9 +2500,11 @@ function managePage(cfg, url) {
     '    + "</div>";',
     '  var foot = [];',
     '  if (s.at) foot.push("空间更新于 " + esc(s.at.replace("T", " ").slice(0, 16)) + " UTC" + (s.cached ? "（缓存）" : ""));',
-    '  if (s.throttled) foot.push("刷新过于频繁，已用缓存（最小间隔 " + (s.minInterval || 0) + " 秒）");',
+    '  if (s.throttled) foot.push("刷新过于频繁，已用缓存（最小间隔 " + (d.minInterval || 0) + " 秒）");',
     '  if (s.ok !== false && s.pages) foot.push("本次扫描 " + s.pages + " 次 Class C");',
     '  foot.push("次数按 UTC 每日 00:00 归零" + (d.resetAt ? "（下次 " + esc(d.resetAt) + "）" : ""));',
+    '  if (d.counterBackendLabel) foot.push("计数后端：" + esc(d.counterBackendLabel));',
+    '  if (d.windowed) foot.push("本次是 UTC " + d.windowHour + ":00 窗口内的当日终值扫描");',
     '  if (d.scope) foot.push(esc(d.scope));',
     '  html += \'<div class="foot">\' + foot.map(function (t) { return "<span>" + t + "</span>"; }).join("")',
     '    + \'<button class="mini" id="btnUsageRefresh">重新统计</button></div>\';',
@@ -2244,7 +2560,7 @@ async function handle(request, env, ctx) {
       const url = new URL(request.url);
       const resolved = resolveBucketKey(cfg, url);
       const bucket = resolved.bucket || cfg.bucketFixed || '';
-      const pending = flushCounters(cfg, bucket).catch(() => {});
+      const pending = flushCounters(cfg, env, bucket).catch(() => {});
       if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(pending);
     }
   }
@@ -2403,4 +2719,5 @@ export default {
 export {
   SigV4, loadConfig, resolveBucketKey, objectUrl, bucketUrl, normalizeKey,
   uriEncode, canonicalPath, safeEqual, handle, managePage, listObjects,
+  shouldWindowScan, utcDayStamp, computeStorage, usageState,
 };

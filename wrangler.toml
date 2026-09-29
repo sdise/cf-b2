@@ -130,6 +130,27 @@ USAGE_SCAN_MAX_PAGES = "20"
 CLASS_B_DAILY_QUOTA = "2500"
 CLASS_C_DAILY_QUOTA = "2500"
 
+# 惰性窗口：UTC 进入该小时后，当天第一次打开用量面板会强制重扫一次空间
+# 默认 23 = 在 B2 计数器 00:00 GMT 归零前一小时拿到「当日终值」；-1 关闭
+USAGE_REFRESH_AT_UTC_HOUR = "23"
+
+# DO 计数每累计多少批才落盘（1 = 每批都写，最精确）
+# 免费计划 SQLite 行写入额度 10 万/天，提高该值可省额度（代价：DO 被驱逐时最多丢 N 批）
+USAGE_DO_WRITE_EVERY = "1"
+
+# ---------------------------------------------------------------------------
+# Durable Objects：用量计数器（全局单实例 → 所有地区看到同一份数字；原子累加）
+# 未绑定也可运行（自动退化到 Cache API，但数字按数据中心分裂）
+# 免费计划只支持 SQLite 后端，因此用 new_sqlite_classes
+# ---------------------------------------------------------------------------
+[[durable_objects.bindings]]
+name = "USAGE_DO"
+class_name = "UsageCounter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UsageCounter"]
+
 # 调试模式：出错时返回详细堆栈（生产环境请保持 false）
 DEBUG = "false"
 
