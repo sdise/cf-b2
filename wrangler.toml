@@ -138,19 +138,6 @@ USAGE_REFRESH_AT_UTC_HOUR = "23"
 # 免费计划 SQLite 行写入额度 10 万/天，提高该值可省额度（代价：DO 被驱逐时最多丢 N 批）
 USAGE_DO_WRITE_EVERY = "1"
 
-# ---------------------------------------------------------------------------
-# Durable Objects：用量计数器（全局单实例 → 所有地区看到同一份数字；原子累加）
-# 未绑定也可运行（自动退化到 Cache API，但数字按数据中心分裂）
-# 免费计划只支持 SQLite 后端，因此用 new_sqlite_classes
-# ---------------------------------------------------------------------------
-[[durable_objects.bindings]]
-name = "USAGE_DO"
-class_name = "UsageCounter"
-
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["UsageCounter"]
-
 # 调试模式：出错时返回详细堆栈（生产环境请保持 false）
 DEBUG = "false"
 
@@ -160,3 +147,20 @@ DEBUG = "false"
 #   npx wrangler secret put B2_APPLICATION_KEY     # applicationKey
 #   npx wrangler secret put ADMIN_PASS             # 管理口令（Basic）
 #   npx wrangler secret put ADMIN_TOKEN            # 管理令牌（Bearer，二选一）
+
+# ---------------------------------------------------------------------------
+# Durable Objects：用量计数器（全局单实例 → 所有地区看到同一份数字；原子累加）
+#
+# 注意：TOML 的表会一直延伸到下一个表头，所以这些「表」必须放在所有 [vars] 之后，
+#       否则后面的 key 会被算进 migrations 表里。
+#
+# 未绑定也能跑：代码会自动退化到 Cache API（面板显示"计数后端：Cache API"），
+# 只是数字按数据中心分裂。免费计划只支持 SQLite 后端，故用 new_sqlite_classes。
+# ---------------------------------------------------------------------------
+[[durable_objects.bindings]]
+name = "USAGE_DO"
+class_name = "UsageCounter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["UsageCounter"]
