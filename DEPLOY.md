@@ -225,11 +225,13 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `MAX_UPLOAD_BYTES` | `104857600`（100MB） | 经 Worker 代理上传的体积上限（Workers 硬上限就是 100MB） |
+| `MAX_UPLOAD_BYTES` | `96000000`（96MB） | **「Worker 代理」**单请求上限。Workers 请求体硬上限是十进制 100MB，这里留 4MB 余量；超过该值自动改为**并发分片**经 Worker 转发。**直传路径不走 Worker，不受此值限制** |
+| `UPLOAD_CONCURRENCY` | `3` | Worker 代理分片上传的并发数（1–10） |
 | `PRESIGN_EXPIRES` | `3600` | 预签名 URL 有效期（秒） |
-| `MULTIPART_THRESHOLD` | `104857600` | 超过该体积自动走 S3 分片上传 |
-| `MULTIPART_PART_SIZE` | `26214400`（25MB） | 分片大小；B2 要求最后一片外其他片 ≥5MB。**Worker 代理模式下必须小于 `MAX_UPLOAD_BYTES`**（前端会自动取两者较小值并留出 1MB 余量） |
+| `MULTIPART_PART_SIZE` | `26214400`（25MB） | 分片大小，**仅 Worker 代理路径使用**；B2 要求最后一片外其他片 ≥5MB，前端会自动取 `min(此值, MAX_UPLOAD_BYTES-1MB)` |
 | `RCLONE_DOWNLOAD` | `false` | 兼容 `rclone --b2-download-url`：剥掉 URL 中 `file/<bucket>/` 前缀 |
+
+> **直传恒为单次 PUT、永不分片**（`MULTIPART_THRESHOLD` 已移除）。代价：单次上传要受 B2 自身的单操作上限约束（约 5GB 量级），且中断需整体重传；超大文件请改用「Worker 代理」自动并发分片。
 
 ### 3.5 隐私收敛（防信息泄露）
 
@@ -394,9 +396,10 @@ curl -X PUT -T ./demo.bin \
 
 访问 `https://<你的域名>/__manage`（需 Basic/Bearer 鉴权）。
 
-- 目录浏览、面包屑导航、翻页
-- 拖拽上传、进度条；超过 `MULTIPART_THRESHOLD` 自动切换分片上传
+- 目录浏览、面包屑导航；列表为**瀑布流**（滚动到底部自动续接下一页，无上下页按钮）
+- 上传只通过右上角 **「上传」** 按钮选择文件（不再有拖拽区）；带进度条
 - **主题切换**（按钮在右上角）：暖色（默认）/ 深色，选择记在 localStorage
+- **复制**：把该文件的 Worker 分享链接写入剪贴板（与「下载」同一路径，附加 `?dl=1` 即强制另存）
 - 下载（走 Worker：`/<key>?dl=1`，由 Worker 下发 `Content-Disposition: attachment`；**不再提供 B2 直链**）
 - 重命名（服务端复制 + 删除）
 - 新建目录、删除文件/目录
@@ -410,21 +413,18 @@ curl -X PUT -T ./demo.bin \
 | --- | --- | --- |
 | 数据路径 | 浏览器 → 预签名 URL → B2 | 浏览器 → Worker → B2 |
 | 是否需要桶配 CORS | **需要** | 不需要 |
-| 单请求体积上限 | 无（旁路 Worker） | **100MB**（Workers 请求体硬限） |
-| 大文件（>100MB） | 分片直传，速度最快 | 分片经 Worker 中继，稳定但慢（两跳） |
-| 适用 | 生产环境、大文件 | 临时救急、或不方便配 CORS 时 |
-
-切到任一种模式，**超过阈值都会自动走 S3 分片上传**，只是分片的落地点不同：
+| 分片 | **永不分片**，恒为单次 PUT | 超过 `MAX_UPLOAD_BYTES` 自动分片（**并发**，默认 3） |
+| 单请求体积上限 | 无（旁路 Worker），但受 B2 单操作上限约束（约 5GB 量级） | 96MB/请求 |
+| 中断代价 | 需整体重传 | 只重传失败分片（已自动 abort 清理碎片） |
+| 适用 | 生产环境、常规大文件 | 不方便配 CORS，或文件超过 B2 单次上限时 |
 
 | 场景 | 行为 |
 | --- | --- |
-| 直传 + 小文件（`≤MULTIPART_THRESHOLD`） | 签一张预签名 PUT URL，浏览器一次 PUT 到 B2 |
-| 直传 + 大文件 | 分片：`create` → 逐片取预签名 URL → `complete` |
-| Worker 代理 + 小文件（`≤MAX_UPLOAD_BYTES`） | 一次 PUT 到 `/__api/object` |
-| Worker 代理 + 大文件 | 分片：`create` → 逐片 PUT 到 `/__api/multipart/part`（Worker 中继）→ `complete` |
+| 直传（任意体积） | 签一张预签名 PUT URL，浏览器**一次 PUT** 到 B2 |
+| Worker 代理 + `≤MAX_UPLOAD_BYTES` | 一次 PUT 到 `/__api/object` |
+| Worker 代理 + `>MAX_UPLOAD_BYTES` | `create` → 按 `UPLOAD_CONCURRENCY` **并发** PUT `/__api/multipart/part`（Worker 中继）→ `complete`，失败自动 `abort` |
 
-> **>100MB 的文件能否经 Worker 上传？** 能，但只能走「Worker 代理 + 分片」：每片 ≤ `multipartPartSize` 且 <100MB，逐片转发。代价是两份带宽套娃、占 CPU/内存、速度慢。
-> 想快的话，请在 B2 桶配好 CORS 后用「直传」，配好后错误信息也就不出现了。
+> **直传 5GB 以上怎么办？** 单次 PUT 会撞 B2 的单操作上限，此时请切到「Worker 代理」——它会自动并发分片，不受单次上限影响。
 
 ---
 

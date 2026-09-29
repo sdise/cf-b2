@@ -67,17 +67,19 @@ ROOT_ACTION = "welcome"
 CACHE_MAX_AGE = "86400"
 ENABLE_CACHE = "true"
 
-# 单个 proxy 上传大小上限（字节）。Workers 请求体上限为 100MB，更大请走直传/分片
-MAX_UPLOAD_BYTES = "104857600"
+# 「Worker 代理」单请求上限（字节）。Workers 请求体硬上限是十进制 100MB，
+# 这里默认留 4MB 余量；超过该值的文件会自动改为并发分片经 Worker 转发。
+# 注意：直传（预签名）路径不走 Worker，不受此值限制，且恒为单次 PUT、不分片。
+MAX_UPLOAD_BYTES = "96000000"
+
+# Worker 代理分片上传的并发数（1-10，默认 3）
+UPLOAD_CONCURRENCY = "3"
 
 # 预签名 URL 有效期（秒）。仅用于「上传直传」；下载直链已强制禁用，必须经 Worker
 PRESIGN_EXPIRES = "3600"
 
-# 超过该大小自动切换到 S3 分片上传（字节）
-MULTIPART_THRESHOLD = "104857600"
-
-# 分片大小（字节）。B2 要求除最后一片外 ≥5MB；
-# 走「Worker 代理」上传时必须小于 MAX_UPLOAD_BYTES（前端会自动取两者较小值）
+# 分片大小（字节）。仅「Worker 代理」路径使用（直传不分片）。
+# B2 要求除最后一片外 ≥5MB；前端会自动取 min(此值, MAX_UPLOAD_BYTES-1MB)
 MULTIPART_PART_SIZE = "26214400"
 
 # CORS 允许的 Origin，逗号分隔；* 表示全部（直传时需要包含你的站点域名）

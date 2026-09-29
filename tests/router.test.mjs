@@ -622,6 +622,44 @@ await check('匿名目录页也带主题切换', async () => {
   return 'ok';
 });
 
+await check('直传不再分片；只有 Worker 代理超过上限才并发分片', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(!page.includes('mpUpload'), '直传分片函数应已删除');
+  assert(!page.includes('multipartThreshold'), '不应再依赖 MULTIPART_THRESHOLD');
+  assert(page.includes('runPool'), '缺少并发池');
+  assert(page.includes('uploadConcurrency'), '缺少并发数配置');
+  assert(page.includes('CFG.maxUploadBytes'), 'Worker 代理应以上限作为分片阈值');
+  assert(/file\.size <= \(CFG\.maxUploadBytes/.test(page), 'Worker 代理应在上限内走单次转发');
+  return '直传=单次 PUT；Worker>上限=并发分片';
+});
+
+await check('提供「复制」按钮（经 Worker 的分享链接）', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(page.includes('data-act="copy"'), '缺少复制按钮');
+  assert(page.includes('navigator.clipboard'), '缺少剪贴板写入');
+  assert(page.includes('function objUrl'), '复制应使用 Worker 路径');
+  return 'copy → objUrl(key)';
+});
+
+await check('取消拖拽区与页内提示文案', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(!page.includes('id="drop"'), '拖拽区仍在');
+  assert(!page.includes('capHint'), '提示文案仍在');
+  assert(!page.includes('拖到这里上传'), '拖拽提示仍在');
+  return '已移除';
+});
+
+await check('列表改为瀑布流（无上下页按钮，滚动加载）', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(!page.includes('btnPrev') && !page.includes('btnNext'), '翻页按钮仍在');
+  assert(!page.includes('>上一页<') && !page.includes('>下一页<'), '翻页按钮文案仍在');
+  assert(page.includes('function loadMore'), '缺少加载更多');
+  assert(page.includes('window.addEventListener("scroll"'), '缺少滚动监听');
+  assert(page.includes('insertAdjacentHTML'), '缺少追加渲染');
+  assert(page.includes('id="status"'), '缺少加载状态区');
+  return '无限滚动 + 追加渲染';
+});
+
 await check('管理器内嵌前端 JS 可解析', async () => {
   const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
   const scripts = [...page.matchAll(/<script(?![^>]*type="application\/json")[^>]*>([\s\S]*?)<\/script>/g)];
