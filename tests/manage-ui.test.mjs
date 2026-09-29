@@ -107,7 +107,9 @@ function buildSandbox(html) {
         windowed: true,
         windowHour: 23,
         minInterval: 300,
-        resetAt: '2026-10-01T00:00:00Z',
+        scanSchedule: '23:00 UTC',
+        resetSchedule: '0:00 UTC',
+        counterResetAt: '2026-09-30T00:00:12.000Z',
         scope: '仅统计本 Worker 发往 B2 的请求；控制台、rclone 等其他客户端不计入',
       });
     }
@@ -214,6 +216,8 @@ await check('用量卡片渲染：空间、进度、Class B/C 计数与重算按
   assert(card.includes('本次扫描 3 次 Class C'), '缺少扫描成本提示');
   assert(card.includes('缓存'), '未标注数据来自缓存');
   assert(card.includes('计数后端：Durable Object'), '未标注计数后端');
+  assert(card.includes('计数重置：0:00 UTC'), '未标注重置排期: ' + (card.match(/计数重置[^<]*/) || []).join());
+  assert(card.includes('上次 2026-09-30 00:00 UTC'), '未标注上次重置时间');
   assert(card.includes('当日终值扫描'), '未标注窗口扫描');
   return card.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
 });

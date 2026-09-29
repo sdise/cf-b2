@@ -293,21 +293,33 @@ DO 侧的键：`usage`（`state.storage`，SQLite），内容 `{day, A, B, C, D,
 | **存在哪里** | DO 实例的 `state.storage`，键 `usage`（SQLite 后端）；一个桶一个实例 `idFromName('usage:<bucket>')` | `caches.default`，键 `https://usage.internal/counters/<bucket>/<UTC 日期>` |
 | **多久统计一次** | **每个发往 B2 的请求结束时累加一次**（`ctx.waitUntil` 异步执行，不阻塞响应、不额外请求 B2）；不是定时统计 | 同左 |
 | **聚合粒度** | 按 B2 事务类别 A/B/C/D 累计"当日次数"，并记录 `at` 最后更新时间 | 同左 |
-| **何时清除（归零）** | 跨 UTC 日时**同一个键内的字段直接置 0**（`day` 一变即归零），旧值不留 | 键按 UTC 日期分桶，跨日自动读新键；旧键靠 `Cache-Control: max-age=172800` 在 **2 天后**过期 |
-| **占用** | 一条几十字节的 JSON；DO 免费额度含 5 GB 存储，无压力 | 单条 JSON，随 TTL 自动清理 |
-| **重置基准** | UTC 00:00（与 B2 官方计数器 00:00 GMT 对齐） | 同左 |
+| **何时清除（归零）** | **只有 `scheduled()`（Cron）调用 `reset` 时才清零**；请求路径不会自动归零 | 同左：Cron 的 `reset` 把固定键重写成 0 |
+| **占用** | 一条几十字节的 JSON；DO 免费额度含 5 GB 存储，无压力 | 单条 JSON，随 TTL（2 天）自动清理 |
+| **重置基准** | 由 `USAGE_RESET_HOURS` 指定的 UTC 小时（默认 `0` = 00:00，与 B2 官方 00:00 GMT 对齐） | 同左 |
 
 > 注意：**计数本身不消耗 B2 事务**（不加任何 B2 请求），消耗的是 DO 请求/行写入（免费额度 10 万/天）或 Cache 读写。页面上的"剩余次数"= `CLASS_B_DAILY_QUOTA / CLASS_C_DAILY_QUOTA` 减去当日累计，纯粹是给你对照 B2 控制台用的提醒值。
 
-**重置（归零）的触发条件 —— 惰性 + 按 UTC 日期寻址，不依赖访问量：**
+**重置（归零）的触发条件 —— 完全由 `scheduled()`（Cron）驱动：**
 
-- **DO 后端**：每次调用（有 B2 请求 → `add`；打开用量面板 → `sync`；Cron 写快照 → `snapshot`）进来时都会先跑一次 `rollover()`：发现存着的 `day !== 今天的 UTC 日期`，就**就地清零**再继续处理。所以**一整晚甚至好几天没有任何请求也不会错**——下一次任何调用进来时先归零，读到/累加的数字永远是"今天"的。代价只是"那天没有请求"这件事不会留下单独的 0 记录（本来也不做历史归档）。
-- **Cache 后端**：键里带 UTC 日期（`counters/<bucket>/<日期>`），跨日等于**换了一个键**：新键不存在 ⇒ 从 0 开始，旧键 2 天后自然过期。
-- **跨 00:00 的瞬间**：23:59:59 与 00:00:01 两个请求会分别记入前一天/后一天；DO 对同一实例串行处理，不会互相污染。
-- **Cron 与归零无关**：`scheduled()` 只负责刷新空间快照（顺带也会触发一次 `rollover`），并不需要它来"重置计数"。
+- **空间统计与计数归零共用同一个 `scheduled()` 事件**，按触发时刻的 UTC 小时分派：
+  | 配置 | 默认 | 含义 |
+  | --- | --- | --- |
+  | `USAGE_SCAN_HOURS` | `23` | 命中该小时 → 刷新空间快照 |
+  | `USAGE_RESET_HOURS` | `0` | 命中该小时 → 把 Class A/B/C/D 清零 |
 
-> 想验证：`npx wrangler tail` 看 `定时统计完成 … via do`；或在测试里跑 `npm test` 中的
-> "DO：跨日期间没有任何调用，下次调用时也会正确归零"（昨天 B=5,C=2 → 隔天首笔后 B=1,C=0）。
+  取值规则：小时列表（`"23"` / `"11,23"`）、`*` = 每次触发都做、`-` = 从不。配套的 cron：
+
+  ```toml
+  [triggers]
+  crons = ["0 23 * * *", "0 0 * * *"]   # 23 点统计、0 点归零
+  ```
+- **不再有"惰性归零"**：请求路径（`add`/`sync`）不会因为"日期变了"而清零；**也不再用日期分键**，Cache 后端的计数器是固定键 `counters/<bucket>`。
+- 含义与代价：**如果 Cron 没配、没跑或被删掉，计数会一直累加不清零**。这是刻意的设计取舍（归零时机完全由你掌控、与 B2 官方 00:00 GMT 对齐），所以请确认 `[triggers]` 里至少有一条覆盖 `USAGE_RESET_HOURS` 的 cron。
+- 归零动作在 DO 内是原子且串行的；DO 侧还会记录 `resetAt`（上次归零时刻），管理页会显示"计数重置：0:00 UTC（由 Cron scheduled 触发），上次 …"。
+
+> 想验证：`npx wrangler tail` 分别能看到 `定时统计完成 … via do` 与 `当日计数已归零 … via do`；
+> 本地则看 `npm test` 里的 "scheduled 按 UTC 小时分派：扫描与重置各管一段"、
+> "DO：只有 reset（scheduled 调用）才会把计数清零"、"Cache 降级后端：固定键累加，只有 scheduled 的重置才会清零"。
 
 > **免费计划的 DO 额度**（官方口径，超额即报错，每日 00:00 UTC 重置）：**10 万请求/天**、13,000 GB-s/天、500 万行读/天、**10 万行写/天**、5 GB 存储；免费计划只能用 SQLite 后端，所以绑定用 `new_sqlite_classes`。每个"有 B2 调用的 Worker 请求"会带来 1 次 DO 请求 + 1 次行写入；量很大时可用 `USAGE_DO_WRITE_EVERY` 合并落盘来省写入额度。
 
@@ -356,6 +368,8 @@ crons = ["0 23 * * *"]     # 每天 23:00 UTC（B2 计数器 00:00 GMT 归零前
 | `USAGE_CACHE_TTL` | `21600`（6h） | 仅 `USAGE_AUTO_SCAN=true` 时用作"多久算过期"；Cron 模式不用它（快照默认留 2 天） |
 | `USAGE_MIN_INTERVAL` | `300`（5min） | 手动重新统计的最小间隔 |
 | `USAGE_SCAN_MAX_PAGES` | `20` | 单次扫描最多页数（每页 1000 对象） |
+| `USAGE_SCAN_HOURS` | `23` | `scheduled()` 里刷新空间快照的 UTC 小时（`*`=每次，`-`=从不） |
+| `USAGE_RESET_HOURS` | `0` | `scheduled()` 里重置 Class A/B/C/D 的 UTC 小时（默认与 B2 官方 00:00 GMT 对齐） |
 | `USAGE_AUTO_SCAN` | `false` | `false` = 只由 Cron 与手动触发（推荐）；`true` = 额外允许惰性自动扫描 |
 | `USAGE_REFRESH_AT_UTC_HOUR` | `-1` | 惰性窗口：UTC 进入该小时后当天首次读取强制重扫；默认关闭（已有 Cron） |
 | `USAGE_SCHEDULE_BUCKETS` | 空 | Cron 要统计的桶（逗号分隔）；固定桶模式留空即用 `BUCKET_NAME` |

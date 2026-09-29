@@ -130,9 +130,14 @@ USAGE_SCAN_MAX_PAGES = "20"
 CLASS_B_DAILY_QUOTA = "2500"
 CLASS_C_DAILY_QUOTA = "2500"
 
-# 空间统计由 Cron（scheduled）驱动：每天刷新一次快照，管理页只读快照
-#   USAGE_AUTO_SCAN = "false"（默认）：只在 Cron 与手动「重新统计」时扫描
-#   USAGE_AUTO_SCAN = "true"         ：额外允许惰性自动扫描（TTL 过期 / 窗口触发）
+# 空间统计与计数重置都由 Cron（scheduled）驱动，按触发时刻的 UTC 小时分派：
+#   USAGE_SCAN_HOURS  = "23"  → 23 点刷新空间快照（在 B2 计数器 00:00 GMT 归零前拿到当日终值）
+#   USAGE_RESET_HOURS = "0"   → 0 点把 Class A/B/C/D 计数清零
+# 取值规则：小时逗号分隔（"23" / "11,23"）；"*" = 每次触发都做；"-" = 从不
+USAGE_SCAN_HOURS = "23"
+USAGE_RESET_HOURS = "0"
+
+# 管理页打开时是否允许"惰性自动扫描"空间（默认 false：只在 Cron 与手动「重新统计」时扫描）
 USAGE_AUTO_SCAN = "false"
 
 # 若允许惰性自动扫描，这里是「归零前窗口」：UTC 进入该小时后当天首次读取强制重扫
@@ -159,15 +164,17 @@ DEBUG = "false"
 #   npx wrangler secret put ADMIN_TOKEN            # 管理令牌（Bearer，二选一）
 
 # ---------------------------------------------------------------------------
-# Cron Triggers：空间统计定时刷新
+# Cron Triggers：所有定时任务都由这一个 scheduled() 事件驱动
 #
-# 每天 23:00 UTC 触发 scheduled() → 扫描桶并写入空间快照（DO 优先）。
-# 选 23:00 是因为 B2 的用量计数器在 00:00 GMT 归零，这样归零前一定有一份当日终值。
-# 需要多个时间点可写多条，例如 ["0 23 * * *", "0 11 * * *"]。
+#   0 23 * * *  → 刷新空间快照（USAGE_SCAN_HOURS = "23"）
+#   0  0 * * *  → 重置 Class A/B/C/D 计数（USAGE_RESET_HOURS = "0"，与 B2 官方 00:00 GMT 对齐）
+#
+# 想加频次就同时加 cron 与对应小时（例如再加 "0 11 * * *" 并把
+# USAGE_SCAN_HOURS 改成 "11,23"）。想"每次触发都做"就写 "*"。
 # 注意：用 wrangler 部署时，本节的 crons 会与控制台上的 Cron 触发器保持一致。
 # ---------------------------------------------------------------------------
 [triggers]
-crons = ["0 23 * * *"]
+crons = ["0 23 * * *", "0 0 * * *"]
 
 # ---------------------------------------------------------------------------
 # Durable Objects：用量计数器（全局单实例 → 所有地区看到同一份数字；原子累加）

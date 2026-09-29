@@ -412,6 +412,10 @@ function loadConfig(env) {
     // $path / $host 模式无法枚举桶，必须显式列出才会在 scheduled 里统计
     usageScheduleBuckets: String(env.USAGE_SCHEDULE_BUCKETS || '')
       .split(',').map((s) => s.trim()).filter(Boolean),
+    // scheduled() 里「刷新空间快照」的 UTC 小时（逗号分隔；* = 每次触发都做；- = 从不）
+    usageScanHours: parseHourList(env.USAGE_SCAN_HOURS, '23'),
+    // scheduled() 里「重置 Class A/B/C/D 计数」的 UTC 小时（默认 0 点，与 B2 官方 00:00 GMT 对齐）
+    usageResetHours: parseHourList(env.USAGE_RESET_HOURS, '0'),
     // Durable Object 计数：每累计多少次增量才落盘（1 = 每次请求都落盘，最精确）
     usageDoWriteEvery: Math.max(1, Math.min(100, readInt(env.USAGE_DO_WRITE_EVERY, 1))),
     // 每日额度（B2 免费账户的 Class B/C 各 2500 次/天，按你账户实际套餐调整）
@@ -891,6 +895,35 @@ function utcDayStamp(date = new Date()) {
 }
 
 /**
+ * 解析 scheduled() 里的小时列表：
+ *   "23"    → 只在 UTC 23 点执行
+ *   "23,11" → 11 点与 23 点都执行
+ *   "*"     → 每次触发都执行
+ *   "-" 或空 → 从不执行
+ */
+function parseHourList(value, fallback) {
+  const raw = String(value === undefined || value === '' ? fallback : value).trim();
+  if (raw === '*') return { mode: 'always' };
+  if (raw === '-') return { mode: 'never' };
+  const hours = raw.split(',')
+    .map((s) => Number.parseInt(s.trim(), 10))
+    .filter((h) => Number.isInteger(h) && h >= 0 && h <= 23);
+  return hours.length ? { mode: 'hours', hours } : { mode: 'never' };
+}
+
+function hourMatches(spec, hour) {
+  if (!spec || spec.mode === 'never') return false;
+  if (spec.mode === 'always') return true;
+  return spec.hours.includes(hour);
+}
+
+function hourListLabel(spec) {
+  if (!spec || spec.mode === 'never') return '从不';
+  if (spec.mode === 'always') return '每次触发';
+  return spec.hours.slice().sort((a, b) => a - b).map((h) => h + ':00').join('、') + ' UTC';
+}
+
+/**
  * 是否该在「归零前窗口」补一次空间扫描：UTC 进入 windowHour 之后，
  * 且当天还没有做过窗口扫描。每天最多一次。
  */
@@ -900,8 +933,12 @@ function shouldWindowScan(now, windowHour, windowDay) {
   return windowDay !== utcDayStamp(now);
 }
 
+/**
+ * 计数器使用**固定键**（不含日期）：归零完全由 scheduled() 显式执行，
+ * 不再靠"键里带日期"来隔离不同天。
+ */
 function counterCacheKey(bucket) {
-  return USAGE_CACHE_ORIGIN + '/counters/' + encodeURIComponent(bucket || '_') + '/' + utcDayStamp();
+  return USAGE_CACHE_ORIGIN + '/counters/' + encodeURIComponent(bucket || '_');
 }
 
 function storageCacheKey(bucket) {
@@ -956,7 +993,11 @@ async function doCall(stub, action, payload) {
 /**
  * 用量计数器（Durable Object）。
  * 同一个桶共用一个实例 → 所有数据中心看到同一份数字；DO 对同一实例的请求
- * 串行处理，所以「跨日归零 + 累加」天然是原子操作，不会丢计数。
+ * 串行处理，所以「累加」与「重置」都是原子的。
+ *
+ * 归零方式：**完全由 scheduled()（Cron）显式调用 reset 动作**，
+ * 不做「下次请求发现日期变了就归零」的惰性归零，也不用日期分键。
+ * 含义：如果 Cron 没配/没跑，计数会持续累加不清零（要靠 Cron 保证）。
  */
 export class UsageCounter {
   constructor(state, env) {
@@ -970,7 +1011,7 @@ export class UsageCounter {
     if (!this.data) {
       const stored = await this.state.storage.get('usage');
       this.data = stored || {
-        day: utcDayStamp(), A: 0, B: 0, C: 0, D: 0, at: '',
+        day: utcDayStamp(), A: 0, B: 0, C: 0, D: 0, at: '', resetAt: '',
         storage: null, windowDay: '', lastAttempt: 0,
       };
     }
@@ -981,20 +1022,6 @@ export class UsageCounter {
   async save(now) {
     this.data.at = (now || new Date()).toISOString();
     await this.state.storage.put('usage', this.data);
-  }
-
-  /** 跨 UTC 日归零（与 B2 官方计数器 00:00 GMT 对齐） */
-  rollover(now) {
-    const today = utcDayStamp(now);
-    if (this.data.day !== today) {
-      this.data.day = today;
-      this.data.A = 0;
-      this.data.B = 0;
-      this.data.C = 0;
-      this.data.D = 0;
-      this.data.windowDay = '';
-    }
-    return today;
   }
 
   counters() {
@@ -1008,14 +1035,36 @@ export class UsageCounter {
     if (action === 'add') return this.onAdd(request, now);
     if (action === 'sync') return this.onSync(request, now);
     if (action === 'snapshot') return this.onSnapshot(request, now);
+    if (action === 'reset') return this.onReset(request, now);
     return json({ ok: false, error: '未知的 DO 动作: ' + action }, 404);
+  }
+
+  /** 由 scheduled() 调用的显式归零 */
+  async onReset(request, now) {
+    await this.load();
+    return this.reset(now);
+  }
+
+  /** 把当日计数清 0（只在 Cron 触发时执行） */
+  async reset(now) {
+    const stamp = now.toISOString();
+    this.data.A = 0;
+    this.data.B = 0;
+    this.data.C = 0;
+    this.data.D = 0;
+    this.data.day = utcDayStamp(now);
+    this.data.resetAt = stamp;
+    this.data.windowDay = '';
+    await this.save(now);
+    return json({
+      ok: true, resetAt: stamp, day: this.data.day, counters: this.counters(),
+    }, 200);
   }
 
   /** 累加本批 B2 调用次数；writeEvery > 1 时合并落盘以减少 SQLite 行写入 */
   async onAdd(request, now) {
     await this.load();
     const body = await request.json().catch(() => ({}));
-    this.rollover(now);
     let changed = false;
     for (const cls of ['A', 'B', 'C', 'D']) {
       const n = Number(body[cls]) || 0;
@@ -1043,7 +1092,6 @@ export class UsageCounter {
   async onSync(request, now) {
     await this.load();
     const body = await request.json().catch(() => ({}));
-    const today = this.rollover(now);
     const ttlMs = Math.max(0, Number(body.ttl) || 0) * 1000;
     const minIntervalMs = Math.max(0, Number(body.minInterval) || 0) * 1000;
     const windowHour = Number.isFinite(body.windowHour) ? body.windowHour : -1;
@@ -1073,7 +1121,7 @@ export class UsageCounter {
     if (shouldScan) {
       this.data.lastAttempt = now.getTime();
       if (windowHour >= 0 && now.getUTCHours() >= windowHour) {
-        this.data.windowDay = today;
+        this.data.windowDay = utcDayStamp(now);
         windowed = true;
       }
       await this.save(now);
@@ -1081,7 +1129,8 @@ export class UsageCounter {
 
     return json({
       ok: true,
-      day: today,
+      day: this.data.day,
+      resetAt: this.data.resetAt || '',
       counters: this.counters(),
       storage: snapshot || null,
       shouldScan,
@@ -1097,7 +1146,6 @@ export class UsageCounter {
   async onSnapshot(request, now) {
     await this.load();
     const body = await request.json().catch(() => ({}));
-    this.rollover(now);
     this.data.storage = {
       ok: true,
       bucket: String(body.bucket || ''),
@@ -1163,7 +1211,36 @@ async function computeStorage(cfg, bucket) {
 
 async function readCountersViaCache(bucket) {
   const data = (await cacheGetJson(counterCacheKey(bucket))) || {};
-  return { A: data.A || 0, B: data.B || 0, C: data.C || 0, D: data.D || 0, at: data.at || '' };
+  return {
+    A: data.A || 0, B: data.B || 0, C: data.C || 0, D: data.D || 0,
+    at: data.at || '', resetAt: data.resetAt || '',
+  };
+}
+
+/** 降级后端的归零：把固定键重写成 0（由 scheduled 调用） */
+async function resetCountersViaCache(bucket) {
+  const now = new Date().toISOString();
+  await cachePutJson(counterCacheKey(bucket), {
+    A: 0, B: 0, C: 0, D: 0, at: now, resetAt: now,
+  }, 2 * 86400);
+  return { backend: 'cache', resetAt: now };
+}
+
+/**
+ * 归零当日计数（与 scheduled() 共用）：DO 优先，未绑定则重写 Cache 键。
+ * 只有 Cron 触发时才会调用，请求路径不做任何按日期的自动归零。
+ */
+async function resetCounters(cfg, env, bucket) {
+  const stub = usageDoStub(env, bucket);
+  if (stub) {
+    try {
+      const out = await doCall(stub, 'reset', {});
+      return { backend: 'do', resetAt: out.resetAt, day: out.day };
+    } catch (error) {
+      console.error('[cf-b2-worker] DO 归零失败，改写 Cache 键:', error && error.message);
+    }
+  }
+  return resetCountersViaCache(bucket);
 }
 
 /** 空间快照（对外统一形状） */
@@ -1261,6 +1338,7 @@ async function usageState(cfg, env, bucket, refresh) {
     return {
       backend: 'do',
       counters: state.counters,
+      resetAt: state.resetAt || '',
       storage: state.storage
         ? snapshotShape(bucket, state.storage, {
           cached: true, throttled: state.throttled, ageSeconds: state.ageSeconds,
@@ -1277,6 +1355,7 @@ async function usageState(cfg, env, bucket, refresh) {
     return {
       backend: 'do',
       counters: state.counters,
+      resetAt: state.resetAt || '',
       storage: { ok: false, error: scan.error, status: scan.status },
       throttled: state.throttled,
       windowed: state.windowed,
@@ -1294,6 +1373,7 @@ async function usageState(cfg, env, bucket, refresh) {
   return {
     backend: 'do',
     counters: saved.counters,
+    resetAt: state.resetAt || '',
     storage: snapshotShape(bucket, saved.storage, {
       cached: false, throttled: state.throttled, ageSeconds: 0,
     }),
@@ -1338,33 +1418,65 @@ async function refreshSnapshot(cfg, env, bucket) {
 }
 
 /**
- * Cron（scheduled）入口：为每个配置的桶刷新一次空间快照。
- * 由 Cloudflare Cron Triggers 触发（例如每天 23:00 UTC），不依赖有人访问页面。
+ * Cron（scheduled）统一入口：既是空间统计的触发点，也是计数归零的触发点。
+ * 按触发时刻的 UTC 小时分派：
+ *   USAGE_SCAN_HOURS  （默认 "23"）→ 刷新空间快照（归零前拿到当日终值）
+ *   USAGE_RESET_HOURS （默认 "0"） → 把 Class A/B/C/D 计数清零
+ * 典型的 cron 配置：["0 23 * * *", "0 0 * * *"] —— 23 点统计、0 点归零。
  */
 async function runScheduled(event, env) {
   const cfg = loadConfig(env);
-  if (!cfg.enableUsage) return { ok: false, skipped: '用量面板已关闭（ENABLE_USAGE_PANEL=false）' };
+  const when = new Date((event && event.scheduledTime) || Date.now());
+  const hour = when.getUTCHours();
 
+  const doScan = hourMatches(cfg.usageScanHours, hour);
+  const doReset = hourMatches(cfg.usageResetHours, hour);
   const buckets = scheduledBuckets(cfg);
+
   if (!buckets.length) {
-    console.warn('[cf-b2-worker] 定时统计缺少桶名：$path / $host 模式请设置 USAGE_SCHEDULE_BUCKETS');
-    return { ok: false, skipped: '未确定桶名（请配置 USAGE_SCHEDULE_BUCKETS）' };
+    console.warn('[cf-b2-worker] scheduled 缺少桶名：$path / $host 模式请设置 USAGE_SCHEDULE_BUCKETS');
+    return { ok: false, skipped: '未确定桶名（请配置 USAGE_SCHEDULE_BUCKETS）', hour, doScan, doReset };
+  }
+  if (!cfg.enableUsage) {
+    return { ok: false, skipped: '用量面板已关闭（ENABLE_USAGE_PANEL=false）', hour };
   }
 
   const results = [];
   for (const bucket of buckets) {
-    try {
-      const record = await refreshSnapshot(cfg, env, bucket);
-      results.push({ bucket, ok: true, usedBytes: record.usedBytes, objects: record.objects, backend: record.backend });
-      console.log('[cf-b2-worker] 定时统计完成',
-        bucket, record.usedBytes + 'B', record.objects + ' objects', 'via', record.backend);
-    } catch (error) {
-      results.push({ bucket, ok: false, error: String((error && error.message) || error) });
-      console.error('[cf-b2-worker] 定时统计失败', bucket, error && error.message);
+    const item = { bucket, scan: null, reset: null };
+    if (doScan) {
+      try {
+        const record = await refreshSnapshot(cfg, env, bucket);
+        item.scan = { ok: true, usedBytes: record.usedBytes, objects: record.objects, backend: record.backend };
+        console.log('[cf-b2-worker] 定时统计完成',
+          bucket, record.usedBytes + 'B', record.objects + ' objects', 'via', record.backend);
+      } catch (error) {
+        item.scan = { ok: false, error: String((error && error.message) || error) };
+        console.error('[cf-b2-worker] 定时统计失败', bucket, error && error.message);
+      }
     }
+    if (doReset) {
+      try {
+        const out = await resetCounters(cfg, env, bucket);
+        item.reset = { ok: true, backend: out.backend, resetAt: out.resetAt };
+        console.log('[cf-b2-worker] 当日计数已归零', bucket, 'via', out.backend);
+      } catch (error) {
+        item.reset = { ok: false, error: String((error && error.message) || error) };
+        console.error('[cf-b2-worker] 计数归零失败', bucket, error && error.message);
+      }
+    }
+    results.push(item);
   }
 
-  return { ok: results.every((r) => r.ok), cron: (event && event.cron) || '', results };
+  const ok = results.every((r) => (!r.scan || r.scan.ok) && (!r.reset || r.reset.ok));
+  return {
+    ok,
+    cron: (event && event.cron) || '',
+    hour,
+    didScan: doScan,
+    didReset: doReset,
+    results,
+  };
 }
 
 /* ============================ 6. 管理 API ============================ */
@@ -1492,7 +1604,9 @@ async function apiRouter(request, env, ctx, cfg, url) {
         classB: { used: used.B, quota: cfg.classBQuota, remaining: remaining(used.B, cfg.classBQuota) },
         classC: { used: used.C, quota: cfg.classCQuota, remaining: remaining(used.C, cfg.classCQuota) },
         classD: used.D,
-        resetAt: utcDayStamp() + 'T00:00:00Z',
+        scanSchedule: hourListLabel(cfg.usageScanHours),
+        resetSchedule: hourListLabel(cfg.usageResetHours),
+        counterResetAt: state.resetAt || state.counters.resetAt || '',
         counterUpdatedAt: state.counters.at || '',
         scope: '仅统计本 Worker 发往 B2 的请求；控制台、rclone 等其他客户端不计入',
         updatedAt: new Date().toISOString(),
@@ -2583,7 +2697,8 @@ function managePage(cfg, url) {
     '  if (s.at) foot.push("空间更新于 " + esc(s.at.replace("T", " ").slice(0, 16)) + " UTC" + (s.cached ? "（缓存）" : ""));',
     '  if (s.throttled) foot.push("刷新过于频繁，已用缓存（最小间隔 " + (d.minInterval || 0) + " 秒）");',
     '  if (s.ok !== false && s.pages) foot.push("本次扫描 " + s.pages + " 次 Class C");',
-    '  foot.push("次数按 UTC 每日 00:00 归零" + (d.resetAt ? "（下次 " + esc(d.resetAt) + "）" : ""));',
+    '  foot.push("计数重置：" + esc(d.resetSchedule || "-") + "（由 Cron scheduled 触发）"',
+    '    + (d.counterResetAt ? "，上次 " + esc(String(d.counterResetAt).replace("T", " ").slice(0, 16)) + " UTC" : ""));',
     '  if (d.counterBackendLabel) foot.push("计数后端：" + esc(d.counterBackendLabel));',
     '  if (d.autoScan === false) foot.push("空间快照由 Cron 定时刷新（不会自动重扫）");',
     '  if (d.windowed) foot.push("本次是 UTC " + d.windowHour + ":00 窗口内的当日终值扫描");',

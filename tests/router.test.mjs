@@ -112,6 +112,24 @@ const ctx = {
   passThroughOnException() {},
 };
 const settle = () => Promise.all(ctxPending.splice(0));
+
+/* ---------- 测试公用小工具（时间/事件构造） ---------- */
+
+const utcToday = () => new Date().toISOString().slice(0, 10);
+
+/** 以「今天(UTC)」为基准构造时间，避免测试日期与真实时钟错位 */
+const doAt = (hour, minute = 0, dayOffset = 0) => {
+  const now = new Date();
+  return new Date(Date.UTC(
+    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + dayOffset, hour, minute, 0,
+  ));
+};
+
+/** 构造 Cron 事件：hour 决定 scheduled() 会分派哪件事（默认 23 = 只扫空间） */
+const cronEvent = (cron = '0 23 * * *', hour = 23) => ({ cron, scheduledTime: doAt(hour, 0).getTime() });
+
+/** 与 ctx 同款，但会收集 waitUntil 的 promise，便于断言异步副作用 */
+const ctrlCtx = { waitUntil(p) { if (p && p.then) ctxPending.push(p); }, passThroughOnException() {} };
 function req(url, init = {}) {
   return new Request('https://dl.example.com' + url, init);
 }
@@ -430,37 +448,37 @@ await check('事务计数：读取→B、列举→C、写入→A、删除→D', 
   return 'A=1 B=1 C=2 D=1，Class B 剩 ' + body.classB.remaining;
 });
 
-await check('计数按 UTC 日切，key 里带当天日期', async () => {
+await check('计数器使用固定键（不再按 UTC 日期寻址）', async () => {
   await settle();   // 等最后一次计数落盘
-  const day = new Date().toISOString().slice(0, 10);
   const keys = [...cacheStore.keys()].filter((k) => String(k).includes('/counters/'));
   assert(keys.length === 1, '计数器 key 数量异常: ' + keys.length);
-  assert(String(keys[0]).endsWith('/' + day), 'key 未按 UTC 日期分桶: ' + keys[0]);
+  assert(String(keys[0]).endsWith('/my-bucket'), 'key 不应带日期段: ' + keys[0]);
   const stored = await cacheStore.get(keys[0]).clone().json();
   assert(stored.B === 1 && stored.C === 2, JSON.stringify(stored));
   return String(keys[0]).replace('https://usage.internal', 'usage');
 });
 
-await check('Cache 降级后端：换日即换键，昨天/今天互不影响', async () => {
+await check('Cache 降级后端：固定键累加，只有 scheduled 的重置才会清零', async () => {
   await settle();
   cacheStore.clear();
-  const counterKey = (day) => 'https://usage.internal/counters/my-bucket/' + day;
-  const today = new Date().toISOString().slice(0, 10);
-  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+  const key = 'https://usage.internal/counters/my-bucket';
 
-  cacheStore.set(counterKey(yesterday), new Response(
-    JSON.stringify({ A: 9, B: 30, C: 7, D: 1, at: yesterday + 'T12:00:00.000Z' }),
-    { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=172800' } },
-  ));
-
-  await handle(req('/share/reset-b.bin'), shareEnv, ctx);   // 一笔 Class B，落到"今天"的键
+  await handle(req('/share/reset-b.bin'), shareEnv, ctx);       // B=1
+  await handle(req('/share/reset-c.bin'), shareEnv, ctx);       // B=2
   await settle();
+  assert((await cacheStore.get(key).clone().json()).B === 2, '固定键应累加到 2');
 
-  const todayCounters = await cacheStore.get(counterKey(today)).clone().json();
-  const oldCounters = await cacheStore.get(counterKey(yesterday)).clone().json();
-  assert(todayCounters.B === 1, '今天的键应从 0 开始，实际 ' + JSON.stringify(todayCounters));
-  assert(oldCounters.B === 30, '昨天的记录不应被改写: ' + JSON.stringify(oldCounters));
-  return '今天 B=1；昨天仍是 B=30（键按 UTC 日期分桶）';
+  // 默认配置下只有 0 点的 cron 会重置；23 点的 cron 不重置
+  const scanOnly = await workerDefault.scheduled(cronEvent('0 23 * * *', 23), shareEnv, ctrlCtx);
+  assert(scanOnly.didReset === false, '23 点不该重置: ' + JSON.stringify(scanOnly));
+  assert((await cacheStore.get(key).clone().json()).B === 2, '23 点后计数应保持 2');
+
+  const resetRun = await workerDefault.scheduled(cronEvent('0 0 * * *', 0), shareEnv, ctrlCtx);
+  assert(resetRun.didReset === true && resetRun.didScan === false, JSON.stringify(resetRun));
+  const cleared = await cacheStore.get(key).clone().json();
+  assert(cleared.A === 0 && cleared.B === 0 && cleared.C === 0 && cleared.D === 0, JSON.stringify(cleared));
+  assert(cleared.resetAt, '缺少 resetAt');
+  return '累加到 2 → 23 点不动 → 0 点归零（resetAt=' + String(cleared.resetAt).slice(11, 16) + 'Z）';
 });
 
 await check('ENABLE_USAGE_PANEL=false 时端点明确报关闭', async () => {
@@ -486,18 +504,6 @@ await check('管理器页面带用量卡片', async () => {
 });
 
 /* ---------- Durable Object 计数：单元 + 集成 + 23:00 窗口 ---------- */
-
-const ctrlCtx = { waitUntil(p) { if (p && p.then) ctxPending.push(p); }, passThroughOnException() {} };
-
-const utcToday = () => new Date().toISOString().slice(0, 10);
-
-/** 以「今天(UTC)」为基准构造时间，避免测试日期与真实时钟错位触发跨日归零 */
-const doAt = (hour, minute = 0, dayOffset = 0) => {
-  const now = new Date();
-  return new Date(Date.UTC(
-    now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + dayOffset, hour, minute, 0,
-  ));
-};
 
 const doReq = (action, body) => new Request('https://usage.do/' + action, {
   method: body === undefined ? 'GET' : 'POST',
@@ -539,40 +545,50 @@ function fakeDoNamespace(created = []) {
   };
 }
 
-await check('DO：累加计数并按 UTC 日切归零', async () => {
+await check('DO：累加计数，且不会因跨日自动归零（归零只由 scheduled 触发）', async () => {
   const counter = new UsageCounter(fakeDoState(), {});
   const day1 = doAt(10, 0);
   await counter.onAdd(doReq('add', { A: 2, B: 3 }), day1);
   await counter.onAdd(doReq('add', { B: 1 }), day1);
   const res = await (await counter.onSync(doReq('sync', { ttl: 21600 }), doAt(10, 1))).json();
   assert(res.counters.A === 2 && res.counters.B === 4, JSON.stringify(res.counters));
-  assert(res.day === utcToday(), 'day=' + res.day);
 
-  // 跨 UTC 日：计数归零
+  // 跨 UTC 日：不再自动归零，继续累加（体现"归零只由 Cron 触发"的语义）
   const body = await (await counter.onAdd(doReq('add', { C: 1 }), doAt(0, 1, 1))).json();
-  assert(body.day !== res.day, '未跨日: ' + body.day);
-  assert(body.counters.A === 0 && body.counters.B === 0 && body.counters.C === 1, JSON.stringify(body.counters));
-  return '当天 A=2 B=4；次日归零后 A=0 B=0 C=1';
+  assert(body.counters.B === 4, '跨日不应自动清零，实际 B=' + body.counters.B);
+  assert(body.counters.C === 1, JSON.stringify(body.counters));
+  return 'A=2 B=4 → 跨日再 +C=1 → B 仍为 4（不自动归零）';
 });
 
-await check('DO：跨日期间没有任何调用，下次调用时也会正确归零', async () => {
+await check('DO：只有 reset（scheduled 调用）才会把计数清零', async () => {
   const counter = new UsageCounter(fakeDoState(), {});
-  // 昨天 23:59 记两笔
+  await counter.onAdd(doReq('add', { A: 2, B: 5, C: 1, D: 1 }), doAt(23, 50));
+  const before = await (await counter.onSync(doReq('sync', { ttl: 21600 }), doAt(23, 55))).json();
+  assert(before.counters.B === 5, JSON.stringify(before.counters));
+
+  const resetOut = await (await counter.fetch(doReq('reset', {}))).json();
+  assert(resetOut.counters.A === 0 && resetOut.counters.B === 0, JSON.stringify(resetOut.counters));
+  assert(resetOut.resetAt, '缺少 resetAt 时间戳');
+
+  const after = await (await counter.onSync(doReq('sync', { ttl: 21600 }), doAt(0, 1, 1))).json();
+  assert(after.counters.B === 0 && after.counters.C === 0, JSON.stringify(after.counters));
+  assert(after.resetAt === resetOut.resetAt, 'resetAt 应透出给面板: ' + after.resetAt);
+  return 'reset 后 A/B/C/D 全 0，resetAt=' + resetOut.resetAt.slice(0, 16) + 'Z';
+});
+
+await check('DO：跨日无请求也不会"自己归零"，计数保持到 Cron 重置为止', async () => {
+  const counter = new UsageCounter(fakeDoState(), {});
   await counter.onAdd(doReq('add', { B: 5, C: 2 }), doAt(23, 59, 0));
   // 中间整段时间没有任何请求；隔天 00:30 才来第一笔
   const next = await (await counter.onAdd(doReq('add', { B: 1 }), doAt(0, 30, 1))).json();
-  assert(next.counters.B === 1, '应只剩今天的 1 次，实际 ' + next.counters.B);
-  assert(next.counters.C === 0, '昨天的 C=2 不应带入今天，实际 ' + next.counters.C);
-  assert(next.day === new Date(doAt(0, 30, 1)).toISOString().slice(0, 10), 'day=' + next.day);
-  return '昨天 B=5,C=2 → 隔天首笔后 B=1,C=0';
-});
+  assert(next.counters.B === 6, '未重置前应继续累加，实际 B=' + next.counters.B);
+  assert(next.counters.C === 2, 'C 应保持 2，实际 ' + next.counters.C);
 
-await check('DO：跨日但只读（打开面板）也会先归零再返回', async () => {
-  const counter = new UsageCounter(fakeDoState(), {});
-  await counter.onAdd(doReq('add', { B: 7 }), doAt(23, 58, 0));
-  const read = await (await counter.onSync(doReq('sync', { ttl: 21600, windowHour: -1 }), doAt(0, 5, 1))).json();
-  assert(read.counters.B === 0, '隔天读取应显示 0，实际 ' + read.counters.B);
-  return '昨天 B=7 → 隔天打开面板读到 B=0';
+  // 00:00 的 Cron 跑过之后才归零
+  await counter.fetch(doReq('reset', {}));
+  const afterCron = await (await counter.onAdd(doReq('add', { B: 1 }), doAt(0, 31, 1))).json();
+  assert(afterCron.counters.B === 1, '重置后应重新从 1 开始，实际 ' + afterCron.counters.B);
+  return 'B=5 → 跨日累加到 6 → Cron reset 后归零 → 再来一笔 B=1';
 });
 
 await check('DO：首次读取要求扫描，之后不再重复要求', async () => {
@@ -704,8 +720,6 @@ const seedSnapshot = (bucket, obj) => cacheStore.set(
     headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=172800' },
   }),
 );
-const cronEvent = (cron = '0 23 * * *') => ({ cron, scheduledTime: Date.now() });
-
 await check('scheduled() 被导出，且会扫描并落快照', async () => {
   await settle();
   cacheStore.clear();
@@ -713,7 +727,8 @@ await check('scheduled() 被导出，且会扫描并落快照', async () => {
 
   const out = await workerDefault.scheduled(cronEvent(), shareEnv, ctrlCtx);
   assert(out.ok === true, JSON.stringify(out));
-  assert(out.results[0].bucket === 'my-bucket' && out.results[0].backend === 'cache', JSON.stringify(out.results));
+  assert(out.didScan === true && out.didReset === false, JSON.stringify(out));
+  assert(out.results[0].bucket === 'my-bucket' && out.results[0].scan.backend === 'cache', JSON.stringify(out.results));
   assert(sent.length > before, '定时统计应发起列举');
 
   const snap = await cacheStore.get('https://usage.internal/storage/my-bucket').clone().json();
@@ -800,6 +815,52 @@ await check('定时统计支持多桶（$path 模式需显式列出）', async (
   return 'bucket-a / bucket-b 各扫一次';
 });
 
+await check('scheduled 按 UTC 小时分派：扫描与重置各管一段', async () => {
+  await settle();
+  cacheStore.clear();
+  const scanRun = await workerDefault.scheduled(cronEvent('0 23 * * *', 23), shareEnv, ctrlCtx);
+  assert(scanRun.didScan === true && scanRun.didReset === false, JSON.stringify(scanRun));
+
+  const resetRun = await workerDefault.scheduled(cronEvent('0 0 * * *', 0), shareEnv, ctrlCtx);
+  assert(resetRun.didScan === false && resetRun.didReset === true, JSON.stringify(resetRun));
+
+  const both = await workerDefault.scheduled(
+    cronEvent('0 7 * * *', 7), { ...shareEnv, USAGE_SCAN_HOURS: '*', USAGE_RESET_HOURS: '*' }, ctrlCtx,
+  );
+  assert(both.didScan === true && both.didReset === true, JSON.stringify(both));
+
+  const never = await workerDefault.scheduled(
+    cronEvent('0 7 * * *', 7), { ...shareEnv, USAGE_SCAN_HOURS: '-', USAGE_RESET_HOURS: '-' }, ctrlCtx,
+  );
+  assert(never.didScan === false && never.didReset === false, JSON.stringify(never));
+
+  const multi = await workerDefault.scheduled(
+    cronEvent('0 11 * * *', 11), { ...shareEnv, USAGE_SCAN_HOURS: '11,23', USAGE_RESET_HOURS: '0' }, ctrlCtx,
+  );
+  assert(multi.didScan === true && multi.didReset === false, JSON.stringify(multi));
+  return '23 点只扫；0 点只重置；* 两者都做；- 都不做；"11,23" 命中 11 点';
+});
+
+await check('DO 后端：0 点 cron 通过 DO 的 reset 归零', async () => {
+  await settle();
+  const ns = fakeDoNamespace();
+  const doEnv = { ...shareEnv, USAGE_DO: ns };
+
+  await handle(req('/share/do-reset.bin'), doEnv, ctrlCtx);   // 先记一笔 B
+  await settle();
+  const before = await (await handle(req('/__api/usage', { headers: { Authorization: basic } }), doEnv, ctrlCtx)).json();
+  assert(before.classB.used === 1, 'classB=' + before.classB.used);
+
+  const run = await workerDefault.scheduled(cronEvent('0 0 * * *', 0), doEnv, ctrlCtx);
+  assert(run.didReset === true && run.results[0].reset.backend === 'do', JSON.stringify(run.results));
+
+  const after = await (await handle(req('/__api/usage', { headers: { Authorization: basic } }), doEnv, ctrlCtx)).json();
+  assert(after.classB.used === 0, 'reset 后应为 0，实际 ' + after.classB.used);
+  assert(after.counterResetAt, '缺少 resetAt');
+  assert(/0:00 UTC/.test(after.resetSchedule), 'resetSchedule=' + after.resetSchedule);
+  return 'B=1 → Cron(0 点) → B=0（via do），面板显示重置排期 ' + after.resetSchedule;
+});
+
 await check('$path 模式未配置 USAGE_SCHEDULE_BUCKETS 时跳过并给出原因', async () => {
   const out = await workerDefault.scheduled(cronEvent(), { ...shareEnv, BUCKET_NAME: '$path' }, ctrlCtx);
   assert(out.ok === false && /USAGE_SCHEDULE_BUCKETS/.test(out.skipped), JSON.stringify(out));
@@ -810,7 +871,7 @@ await check('定时统计走 DO 后端时写入 DO 快照', async () => {
   await settle();
   const ns = fakeDoNamespace();
   const out = await workerDefault.scheduled(cronEvent(), { ...shareEnv, USAGE_DO: ns }, ctrlCtx);
-  assert(out.results[0].backend === 'do', JSON.stringify(out.results));
+  assert(out.results[0].scan.backend === 'do', JSON.stringify(out.results));
 
   const body = await (await handle(
     req('/__api/usage', { headers: { Authorization: basic } }), { ...shareEnv, USAGE_DO: ns }, ctrlCtx,
