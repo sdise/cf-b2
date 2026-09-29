@@ -3,5 +3,10 @@ node_modules/
 .dev.vars
 *.log
 
+# wrangler 的系统环境变量文件（内含 CLOUDFLARE_API_TOKEN / ACCOUNT_ID，绝不能提交）
+.env
+.env.*
+!.env.example
+
 # 若你的 wrangler.toml 内含真实桶信息，可取消下一行注释避免误提交
 # wrangler.toml
