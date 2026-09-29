@@ -1427,10 +1427,11 @@ async function refreshSnapshot(cfg, env, bucket) {
 /**
  * Cron（scheduled）统一入口：空间统计与计数归零共用这一个事件。
  * 按触发时刻的 UTC 小时分派（两者默认都在 23 点 → 一条 cron 即可）：
- *   USAGE_RESET_HOURS （默认 "23"）→ 先把 Class A/B/C/D 清零
- *   USAGE_SCAN_HOURS  （默认 "23"）→ 再刷新空间快照
- * 顺序刻意是「先归零、再扫描」：这样本次扫描消耗的 Class C 计入新周期，
- * 与"计数区间 = 昨天 23:00 → 今天 23:00"的定义一致。
+ *   USAGE_SCAN_HOURS  （默认 "23"）→ 先刷新空间快照
+ *   USAGE_RESET_HOURS （默认 "23"）→ 再把 Class A/B/C/D 清零
+ * 顺序是「先扫描、再归零」：即先给当前用量留下一份快照，再做归零结算；
+ * 本次扫描自己消耗的 Class C 也记在旧周期里，随后被归零一并清掉，
+ * 因此新周期（23:00 起算）从 0 开始。
  */
 async function runScheduled(event, env) {
   const cfg = loadConfig(env);
@@ -1453,18 +1454,7 @@ async function runScheduled(event, env) {
 
   const results = [];
   for (const bucket of buckets) {
-    const item = { bucket, reset: null, scan: null };
-
-    if (doReset) {
-      try {
-        const out = await resetCounters(cfg, env, bucket);
-        item.reset = { ok: true, backend: out.backend, resetAt: out.resetAt };
-        console.log('[cf-b2-worker] 当日计数已归零', bucket, 'via', out.backend);
-      } catch (error) {
-        item.reset = { ok: false, error: String((error && error.message) || error) };
-        console.error('[cf-b2-worker] 计数归零失败', bucket, error && error.message);
-      }
-    }
+    const item = { bucket, scan: null, reset: null };
 
     if (doScan) {
       try {
@@ -1478,11 +1468,22 @@ async function runScheduled(event, env) {
       }
     }
 
-    // 定时任务自己发起的 B2 请求（如本次扫描的 Class C）也要计数
+    // 定时任务自己发起的 B2 请求（如本次扫描的 Class C）先记账，再被下面的归零清掉
     if (Object.keys(cfg.usage.counts).length) {
       await flushCounters(cfg, env, bucket).catch((error) => {
         console.error('[cf-b2-worker] 定时任务的用量计数写入失败', error && error.message);
       });
+    }
+
+    if (doReset) {
+      try {
+        const out = await resetCounters(cfg, env, bucket);
+        item.reset = { ok: true, backend: out.backend, resetAt: out.resetAt };
+        console.log('[cf-b2-worker] 当日计数已归零', bucket, 'via', out.backend);
+      } catch (error) {
+        item.reset = { ok: false, error: String((error && error.message) || error) };
+        console.error('[cf-b2-worker] 计数归零失败', bucket, error && error.message);
+      }
     }
 
     results.push(item);

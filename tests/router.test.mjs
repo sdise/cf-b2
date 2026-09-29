@@ -469,17 +469,16 @@ await check('Cache 降级后端：固定键累加；23 点 cron 同时归零并�
   assert((await cacheStore.get(key).clone().json()).B === 2, '固定键应累加到 2');
 
   const run = await workerDefault.scheduled(cronEvent('0 23 * * *', 23), shareEnv, ctrlCtx);
-  assert(run.didReset === true && run.didScan === true, JSON.stringify(run));
+  assert(run.didScan === true && run.didReset === true, JSON.stringify(run));
   const after = await cacheStore.get(key).clone().json();
-  // 先归零、再扫描 → 剩下的 C 就是本次扫描自己消耗的 Class C（桩：1 页 = 1 次）
-  assert(after.A === 0 && after.B === 0 && after.D === 0, '归零未生效: ' + JSON.stringify(after));
-  assert(after.C === 1, '本次扫描的 Class C 应计入新周期，实际 ' + after.C);
+  // 先扫描、再归零 → 扫描自己消耗的 Class C 也记在旧周期里，随归零一起清掉
+  assert(after.A === 0 && after.B === 0 && after.C === 0 && after.D === 0, '归零未生效: ' + JSON.stringify(after));
   assert(after.resetAt, '缺少 resetAt');
 
   // 0 点那条 cron 在默认配置下不做任何事（默认小时是 23）
   const midnight = await workerDefault.scheduled(cronEvent('0 0 * * *', 0), shareEnv, ctrlCtx);
   assert(midnight.didScan === false && midnight.didReset === false, JSON.stringify(midnight));
-  return 'B=2 → 23 点触发：归零 + 扫描（C=1，resetAt 已写）→ 0 点无动作';
+  return 'B=2 → 23 点触发：先扫描后归零 → A/B/C/D 全 0（含扫描消耗），resetAt 已写';
 });
 
 await check('ENABLE_USAGE_PANEL=false 时端点明确报关闭', async () => {
@@ -843,7 +842,7 @@ await check('scheduled 按 UTC 小时分派：默认 23 点同时统计+归零',
   return '默认 23 点两者都做；7 点无动作；* 两者都做；- 都不做；可配成 23 扫/0 归零';
 });
 
-await check('DO 后端：23 点 cron 先归零再扫描，扫描消耗计入新周期', async () => {
+await check('DO 后端：23 点 cron 先扫描后归零，新周期从 0 开始', async () => {
   await settle();
   const ns = fakeDoNamespace();
   const doEnv = { ...shareEnv, USAGE_DO: ns };
@@ -854,14 +853,15 @@ await check('DO 后端：23 点 cron 先归零再扫描，扫描消耗计入新�
   assert(before.classB.used === 1, 'classB=' + before.classB.used);
 
   const run = await workerDefault.scheduled(cronEvent('0 23 * * *', 23), doEnv, ctrlCtx);
-  assert(run.didReset === true && run.results[0].reset.backend === 'do', JSON.stringify(run.results));
+  assert(run.didScan === true && run.didReset === true, JSON.stringify(run));
+  assert(run.results[0].scan.backend === 'do' && run.results[0].reset.backend === 'do', JSON.stringify(run.results));
 
   const after = await (await handle(req('/__api/usage', { headers: { Authorization: basic } }), doEnv, ctrlCtx)).json();
   assert(after.classB.used === 0, 'reset 后 B 应为 0，实际 ' + after.classB.used);
-  assert(after.classC.used === 1, '本次扫描的 Class C 应计入新周期，实际 ' + after.classC.used);
+  assert(after.classC.used === 0, '新周期应从 0 开始（扫描消耗计入旧周期），实际 ' + after.classC.used);
   assert(after.counterResetAt, '缺少 resetAt');
   assert(/23:00 UTC/.test(after.resetSchedule), 'resetSchedule=' + after.resetSchedule);
-  return 'B=1 → 23 点 cron → B=0 / C=1（via do），面板显示重置排期 ' + after.resetSchedule;
+  return 'B=1 → 23 点 cron（先扫描后归零）→ B=0 / C=0，重置排期 ' + after.resetSchedule;
 });
 
 await check('$path 模式未配置 USAGE_SCHEDULE_BUCKETS 时跳过并给出原因', async () => {
