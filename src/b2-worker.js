@@ -414,8 +414,10 @@ function loadConfig(env) {
       .split(',').map((s) => s.trim()).filter(Boolean),
     // scheduled() 里「刷新空间快照」的 UTC 小时（逗号分隔；* = 每次触发都做；- = 从不）
     usageScanHours: parseHourList(env.USAGE_SCAN_HOURS, '23'),
-    // scheduled() 里「重置 Class A/B/C/D 计数」的 UTC 小时（默认 0 点，与 B2 官方 00:00 GMT 对齐）
-    usageResetHours: parseHourList(env.USAGE_RESET_HOURS, '0'),
+    // scheduled() 里「重置 Class A/B/C/D 计数」的 UTC 小时。
+    // 默认与 USAGE_SCAN_HOURS 相同（23）→ 一条 cron 同时完成"统计 + 归零"；
+    // 计数区间 = 昨天 23:00 → 今天 23:00，与 B2 官方 00:00 GMT 有 1 小时偏移
+    usageResetHours: parseHourList(env.USAGE_RESET_HOURS, '23'),
     // Durable Object 计数：每累计多少次增量才落盘（1 = 每次请求都落盘，最精确）
     usageDoWriteEvery: Math.max(1, Math.min(100, readInt(env.USAGE_DO_WRITE_EVERY, 1))),
     // 每日额度（B2 免费账户的 Class B/C 各 2500 次/天，按你账户实际套餐调整）
@@ -1166,6 +1168,7 @@ export class UsageCounter {
 async function flushCounters(cfg, env, bucket) {
   const counts = cfg && cfg.usage && cfg.usage.counts;
   if (!counts || !Object.keys(counts).length) return;
+  cfg.usage.counts = {};   // 先清空，避免同一批增量被重复计入（scheduled 里会按桶循环调用）
 
   const stub = usageDoStub(env, bucket);
   if (stub) {
@@ -1181,7 +1184,11 @@ async function flushCounters(cfg, env, bucket) {
 
   const key = counterCacheKey(bucket);
   const prev = (await cacheGetJson(key)) || {};
-  const next = { A: prev.A || 0, B: prev.B || 0, C: prev.C || 0, D: prev.D || 0 };
+  // 保留 resetAt（由 scheduled 的归零写入），否则合并增量时会把它冲掉
+  const next = {
+    A: prev.A || 0, B: prev.B || 0, C: prev.C || 0, D: prev.D || 0,
+    resetAt: prev.resetAt || '',
+  };
   for (const [cls, n] of Object.entries(counts)) next[cls] = (next[cls] || 0) + n;
   next.at = new Date().toISOString();
   await cachePutJson(key, next, 2 * 86400);
@@ -1418,11 +1425,12 @@ async function refreshSnapshot(cfg, env, bucket) {
 }
 
 /**
- * Cron（scheduled）统一入口：既是空间统计的触发点，也是计数归零的触发点。
- * 按触发时刻的 UTC 小时分派：
- *   USAGE_SCAN_HOURS  （默认 "23"）→ 刷新空间快照（归零前拿到当日终值）
- *   USAGE_RESET_HOURS （默认 "0"） → 把 Class A/B/C/D 计数清零
- * 典型的 cron 配置：["0 23 * * *", "0 0 * * *"] —— 23 点统计、0 点归零。
+ * Cron（scheduled）统一入口：空间统计与计数归零共用这一个事件。
+ * 按触发时刻的 UTC 小时分派（两者默认都在 23 点 → 一条 cron 即可）：
+ *   USAGE_RESET_HOURS （默认 "23"）→ 先把 Class A/B/C/D 清零
+ *   USAGE_SCAN_HOURS  （默认 "23"）→ 再刷新空间快照
+ * 顺序刻意是「先归零、再扫描」：这样本次扫描消耗的 Class C 计入新周期，
+ * 与"计数区间 = 昨天 23:00 → 今天 23:00"的定义一致。
  */
 async function runScheduled(event, env) {
   const cfg = loadConfig(env);
@@ -1441,9 +1449,23 @@ async function runScheduled(event, env) {
     return { ok: false, skipped: '用量面板已关闭（ENABLE_USAGE_PANEL=false）', hour };
   }
 
+  if (cfg.enableUsage) cfg.usage = { counts: {} };   // 让定时任务里的 B2 调用也计入用量
+
   const results = [];
   for (const bucket of buckets) {
-    const item = { bucket, scan: null, reset: null };
+    const item = { bucket, reset: null, scan: null };
+
+    if (doReset) {
+      try {
+        const out = await resetCounters(cfg, env, bucket);
+        item.reset = { ok: true, backend: out.backend, resetAt: out.resetAt };
+        console.log('[cf-b2-worker] 当日计数已归零', bucket, 'via', out.backend);
+      } catch (error) {
+        item.reset = { ok: false, error: String((error && error.message) || error) };
+        console.error('[cf-b2-worker] 计数归零失败', bucket, error && error.message);
+      }
+    }
+
     if (doScan) {
       try {
         const record = await refreshSnapshot(cfg, env, bucket);
@@ -1455,16 +1477,14 @@ async function runScheduled(event, env) {
         console.error('[cf-b2-worker] 定时统计失败', bucket, error && error.message);
       }
     }
-    if (doReset) {
-      try {
-        const out = await resetCounters(cfg, env, bucket);
-        item.reset = { ok: true, backend: out.backend, resetAt: out.resetAt };
-        console.log('[cf-b2-worker] 当日计数已归零', bucket, 'via', out.backend);
-      } catch (error) {
-        item.reset = { ok: false, error: String((error && error.message) || error) };
-        console.error('[cf-b2-worker] 计数归零失败', bucket, error && error.message);
-      }
+
+    // 定时任务自己发起的 B2 请求（如本次扫描的 Class C）也要计数
+    if (Object.keys(cfg.usage.counts).length) {
+      await flushCounters(cfg, env, bucket).catch((error) => {
+        console.error('[cf-b2-worker] 定时任务的用量计数写入失败', error && error.message);
+      });
     }
+
     results.push(item);
   }
 
