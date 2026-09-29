@@ -441,6 +441,28 @@ await check('计数按 UTC 日切，key 里带当天日期', async () => {
   return String(keys[0]).replace('https://usage.internal', 'usage');
 });
 
+await check('Cache 降级后端：换日即换键，昨天/今天互不影响', async () => {
+  await settle();
+  cacheStore.clear();
+  const counterKey = (day) => 'https://usage.internal/counters/my-bucket/' + day;
+  const today = new Date().toISOString().slice(0, 10);
+  const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+
+  cacheStore.set(counterKey(yesterday), new Response(
+    JSON.stringify({ A: 9, B: 30, C: 7, D: 1, at: yesterday + 'T12:00:00.000Z' }),
+    { headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=172800' } },
+  ));
+
+  await handle(req('/share/reset-b.bin'), shareEnv, ctx);   // 一笔 Class B，落到"今天"的键
+  await settle();
+
+  const todayCounters = await cacheStore.get(counterKey(today)).clone().json();
+  const oldCounters = await cacheStore.get(counterKey(yesterday)).clone().json();
+  assert(todayCounters.B === 1, '今天的键应从 0 开始，实际 ' + JSON.stringify(todayCounters));
+  assert(oldCounters.B === 30, '昨天的记录不应被改写: ' + JSON.stringify(oldCounters));
+  return '今天 B=1；昨天仍是 B=30（键按 UTC 日期分桶）';
+});
+
 await check('ENABLE_USAGE_PANEL=false 时端点明确报关闭', async () => {
   const res = await handle(
     req('/__api/usage', { headers: { Authorization: basic } }),
@@ -531,6 +553,26 @@ await check('DO：累加计数并按 UTC 日切归零', async () => {
   assert(body.day !== res.day, '未跨日: ' + body.day);
   assert(body.counters.A === 0 && body.counters.B === 0 && body.counters.C === 1, JSON.stringify(body.counters));
   return '当天 A=2 B=4；次日归零后 A=0 B=0 C=1';
+});
+
+await check('DO：跨日期间没有任何调用，下次调用时也会正确归零', async () => {
+  const counter = new UsageCounter(fakeDoState(), {});
+  // 昨天 23:59 记两笔
+  await counter.onAdd(doReq('add', { B: 5, C: 2 }), doAt(23, 59, 0));
+  // 中间整段时间没有任何请求；隔天 00:30 才来第一笔
+  const next = await (await counter.onAdd(doReq('add', { B: 1 }), doAt(0, 30, 1))).json();
+  assert(next.counters.B === 1, '应只剩今天的 1 次，实际 ' + next.counters.B);
+  assert(next.counters.C === 0, '昨天的 C=2 不应带入今天，实际 ' + next.counters.C);
+  assert(next.day === new Date(doAt(0, 30, 1)).toISOString().slice(0, 10), 'day=' + next.day);
+  return '昨天 B=5,C=2 → 隔天首笔后 B=1,C=0';
+});
+
+await check('DO：跨日但只读（打开面板）也会先归零再返回', async () => {
+  const counter = new UsageCounter(fakeDoState(), {});
+  await counter.onAdd(doReq('add', { B: 7 }), doAt(23, 58, 0));
+  const read = await (await counter.onSync(doReq('sync', { ttl: 21600, windowHour: -1 }), doAt(0, 5, 1))).json();
+  assert(read.counters.B === 0, '隔天读取应显示 0，实际 ' + read.counters.B);
+  return '昨天 B=7 → 隔天打开面板读到 B=0';
 });
 
 await check('DO：首次读取要求扫描，之后不再重复要求', async () => {
