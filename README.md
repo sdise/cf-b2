@@ -19,7 +19,8 @@
 - 桶 `axyz-bucket` 保持 **Private**，所有请求由 Worker 实时签 SigV4，客户端无需任何凭据
 - 匿名只能在 `/share/` 前缀内读取，其余路径 403；管理员登录后全桶可读写删
 - 下载**强制经 Worker**（不签发 B2 直链），`/<key>?dl=1` 触发附件下载
-- 上传支持「预签名直传」与「Worker 代理」两种，>100MB 自动分片；两个域名均已加入 B2 的 CORS 允许来源
+- 上传支持「预签名直传」与「Worker 代理」两种，超过阈值自动并发分片（失败自动重试 3 次）；页头可直接调**分片大小**与**并发数**，输入框内即服务端默认值
+- 注意：**B2 单次 PUT 上限 100 MiB**（104857600 字节），超过必被中断，所以 >100MB 必须走分片；两个域名均已加入 B2 的 CORS 允许来源
 
 它是对下面两个项目的分析、对比与重写：
 
@@ -38,6 +39,7 @@ cf-b2-worker/
 ├─ package.json            # 可选：固化 wrangler 版本与 npm scripts
 ├─ tests/sigv4.test.mjs    # SigV4 与 AWS 官方示例的对拍测试
 ├─ tests/router.test.mjs   # 桩化 fetch/caches 的路由冒烟测试
+├─ tests/manage-ui.test.mjs# 假 DOM 里执行管理器前端脚本，验证调参默认值与钳制
 ├─ README.md               # 本文档：对比分析 + 快速开始
 └─ DEPLOY.md               # 部署步骤与参数详解
 ```
@@ -49,6 +51,8 @@ npm test      # 等价于 node tests/sigv4.test.mjs && node tests/router.test.mj
 ```
 
 - `sigv4.test.mjs`：用 AWS 官方文档的 IAM 示例（`20150830T123600Z`）验证签名结果与官方 Signature 完全一致。
+- `manage-ui.test.mjs`：把管理器页内联脚本放进极简假 DOM 中真实执行，验证「分片大小 / 并发数」输入框的
+  默认值来自服务端配置、上下限钳制、非法值回落、切换通道时收紧上限、以及 localStorage 记忆回填。
 - `router.test.mjs`：桩化 `fetch` / `caches`，覆盖鉴权、下载代理、Range 透传、目录列表 HTML/JSON、
   中文与空格 key 编码、路径穿越防护、`$path` 多桶模式、预签名、分片上传、管理页渲染。
 

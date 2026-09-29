@@ -695,6 +695,37 @@ await check('上传方式下拉框不带 title 说明', async () => {
   return '已移除说明';
 });
 
+await check('管理器提供分片大小/并发输入框，默认值取服务端配置', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(/id="partSize"[^>]*value="25"/.test(page), 'partSize 默认值不是 25');
+  assert(/id="conc"[^>]*value="3"/.test(page), 'conc 默认值不是 3');
+  assert(page.includes('function partSizeMB'), '缺少 partSizeMB');
+  assert(page.includes('function concurrency'), '缺少 concurrency');
+  assert(page.includes('function syncTuning') && page.includes('cfb2-tune'), '缺少调参持久化');
+  assert(page.includes('id="tuneHint"'), '缺少当前值提示');
+  return '分片 25 MiB / 并发 3';
+});
+
+await check('输入框默认值跟随 MULTIPART_PART_SIZE / UPLOAD_CONCURRENCY', async () => {
+  const page = await (await handle(
+    req('/__manage', { headers: { Authorization: basic } }),
+    { ...env, MULTIPART_PART_SIZE: '8388608', UPLOAD_CONCURRENCY: '5' }, ctx,
+  )).text();
+  assert(/id="partSize"[^>]*value="8"/.test(page), '分片默认值未跟随配置');
+  assert(/id="conc"[^>]*value="5"/.test(page), '并发默认值未跟随配置');
+  return '8 MiB / 5';
+});
+
+await check('分片大小按通道钳制：直传 ≤95MiB，Worker 按 MAX_UPLOAD_BYTES', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(page.includes('return 95;'), '直传上限应为 95MiB（B2 单次 PUT 100MiB 留余量）');
+  assert(/- 1048576\) \/ 1048576/.test(page), 'Worker 上限应按 MAX_UPLOAD_BYTES 推算');
+  assert(page.includes('clampField("partSize", 5, cap, defaultPartMB())'), '分片输入框应钳制在 5..cap，空值回落服务端默认');
+  assert(page.includes('clampField("conc", 1, 10, CFG.uploadConcurrency || 3)'), '并发应钳制在 1..10 并回落默认值');
+  assert(page.includes('function workerPartSize() { return partSizeMB(); }'), 'Worker 分片大小应走同一入口');
+  return '直传 5–95 MiB，并发 1–10';
+});
+
 await check('管理器内嵌前端 JS 可解析', async () => {
   const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
   const scripts = [...page.matchAll(/<script(?![^>]*type="application\/json")[^>]*>([\s\S]*?)<\/script>/g)];

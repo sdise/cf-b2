@@ -5,7 +5,7 @@
   "type": "module",
   "description": "单文件 Cloudflare Worker：连接 Backblaze B2 私有桶 + 网页文件管理器（内置 SigV4，零依赖）",
   "scripts": {
-    "test": "node tests/sigv4.test.mjs && node tests/router.test.mjs",
+    "test": "node tests/sigv4.test.mjs && node tests/router.test.mjs && node tests/manage-ui.test.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail"

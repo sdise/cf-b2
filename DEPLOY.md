@@ -227,12 +227,31 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 | --- | --- | --- |
 | `MAX_UPLOAD_BYTES` | `96000000`（96MB） | **「Worker 代理」**单请求上限。Workers 请求体硬上限是十进制 100MB，这里留 4MB 余量；超过该值自动改为**并发分片**经 Worker 转发 |
 | `MULTIPART_THRESHOLD` | `100000000` | **「直传」**超过该体积自动改为并发分片。**实测 B2 单次 PUT 上限 = 100 MiB（104857600 字节）**，达到即被上游中断（`500 InternalError`，浏览器显示 CORS Failed），故代码强制钳制该值 `< 104857600` |
-| `UPLOAD_CONCURRENCY` | `3` | 分片上传并发数（1–10），直传与 Worker 代理通用 |
+| `UPLOAD_CONCURRENCY` | `3` | 分片并发数的**默认值**（1–10），直传与 Worker 代理通用。可在管理器页面临时改（仅当前浏览器生效） |
 | `PRESIGN_EXPIRES` | `3600` | 预签名 URL 有效期（秒） |
-| `MULTIPART_PART_SIZE` | `26214400`（25MB） | 分片大小，**仅 Worker 代理路径使用**；B2 要求最后一片外其他片 ≥5MB，前端会自动取 `min(此值, MAX_UPLOAD_BYTES-1MB)` |
+| `MULTIPART_PART_SIZE` | `26214400`（25MB） | 分片大小的**默认值**，可在管理器页面临时改。直传上限 95 MiB、Worker 代理上限为 `MAX_UPLOAD_BYTES-1MB`，前端自动钳制；B2 要求除最后一片外每片 ≥5MB |
 | `RCLONE_DOWNLOAD` | `false` | 兼容 `rclone --b2-download-url`：剥掉 URL 中 `file/<bucket>/` 前缀 |
 
-> **直传恒为单次 PUT、永不分片**（`MULTIPART_THRESHOLD` 已移除）。代价：单次上传要受 B2 自身的单操作上限约束（约 5GB 量级），且中断需整体重传；超大文件请改用「Worker 代理」自动并发分片。
+> **两条上传通道都会按需分片**：直传超过 `MULTIPART_THRESHOLD`（默认 100MB）分片；Worker 代理超过 `MAX_UPLOAD_BYTES`（默认 96MB）分片。
+> 原因是 **B2 单次 PUT 上限 100 MiB**（详见 4.1 的实测数据）——单次 PUT 超过该值必被上游中断，所以超过 100MB 的文件**必须**分片。
+
+#### 3.4.1 在页面上临时调整分片大小 / 并发数
+
+管理器页头有两个输入框，**框内默认值即服务端配置**（`MULTIPART_PART_SIZE`、`UPLOAD_CONCURRENCY`）：
+
+```
+分片 [ 25 ] MiB   并发 [ 3 ]     ← 页面头部，改完立即生效（当前浏览器）
+分片 25 MiB × 并发 3（当前通道上限 95 MiB）   ← 面包屑下方实时提示
+```
+
+| 输入框 | 范围 | 说明 |
+| --- | --- | --- |
+| 分片 | 直传 `5–95` MiB；Worker 代理 `5–(MAX_UPLOAD_BYTES-1MB)` | 切换上传方式时自动收紧上限；超出/非法/留空则回落到服务端默认值 |
+| 并发 | `1–10` | 越大越快，但更吃带宽、更易触发上游限流；默认 3 是稳的 |
+
+- 改动**只影响当前浏览器**（存 `localStorage`，与「上传方式」选择一起记忆），不改服务端、不影响其他用户。
+- 需要改全局默认值 → 改 Workers 变量 `MULTIPART_PART_SIZE` / `UPLOAD_CONCURRENCY` 后重新部署。
+- Worker 代理模式下每片都要过 Worker，建议分片不要太大（25MiB 左右较稳）；直传模式下可酌情调大以减少请求数。
 
 ### 3.5 隐私收敛（防信息泄露）
 
