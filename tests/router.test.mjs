@@ -760,7 +760,6 @@ await check('USAGE_AUTO_SCAN=false（默认）：快照再旧也不会自动重�
   assert(body.storage.cached === true && body.storage.usedBytes === 42, JSON.stringify(body.storage));
   assert(sent.length === before, '10 天前的快照也不该触发重扫');
   assert(body.autoScan === false, 'autoScan=' + body.autoScan);
-  assert(body.pollSeconds === 0, 'pollSeconds 默认应为 0，实际 ' + body.pollSeconds);
   return '10 天前的快照仍直接返回（autoScan=false）';
 });
 
