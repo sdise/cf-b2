@@ -1118,6 +1118,7 @@ function humanSize(bytes) {
   return value.toFixed(unit === 0 ? 0 : 1) + ' ' + units[unit];
 }
 
+/** 公开目录页：服务端渲染首页 + 滚动到底部自动加载后续页（瀑布流） */
 function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
   const rows = [];
 
@@ -1142,10 +1143,70 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
       + '<td><a href="' + href + '">下载</a></td></tr>');
   }
 
-  const nextLink = data.truncated && data.nextToken
-    ? '<a href="' + base + escapeHtml(prefix) + '?format=html&cursor='
-      + encodeURIComponent(data.nextToken) + '">下一页</a>'
-    : '';
+  const initCount = data.folders.length + data.files.length;
+  const cfgJson = JSON.stringify({
+    prefix, base, next: data.truncated ? (data.nextToken || '') : '', loaded: initCount,
+  });
+
+  const script = [
+    '(function () {',
+    'var C = ' + cfgJson + ';',
+    'var NEXT = C.next, LOADING = false, LOADED = C.loaded;',
+    'function esc(s) {',
+    '  return String(s).split("&").join("&amp;").split("<").join("&lt;")',
+    '    .split(">").join("&gt;").split(String.fromCharCode(34)).join("&quot;");',
+    '}',
+    'function human(b) {',
+    '  if (!b) return "0 B";',
+    '  var u = ["B","KB","MB","GB","TB"], v = b, i = 0;',
+    '  while (v >= 1024 && i < u.length - 1) { v = v / 1024; i++; }',
+    '  return v.toFixed(i ? 1 : 0) + " " + u[i];',
+    '}',
+    'function rowsHtml(d) {',
+    '  var out = "";',
+    '  (d.folders || []).forEach(function (p) {',
+    '    var name = p.slice(C.prefix.length);',
+    '    if (name.charAt(name.length - 1) === "/") name = name.slice(0, -1);',
+    '    out += \'<tr class="dir"><td>[DIR] <a href="\' + C.base + esc(p) + \'">\' + esc(name) + \'/</a></td>\'',
+    '      + \'<td>-</td><td>-</td>\'',
+    '      + \'<td><a href="\' + C.base + esc(p) + \'?format=json">JSON</a></td></tr>\';',
+    '  });',
+    '  (d.files || []).forEach(function (f) {',
+    '    var href = C.base + esc(C.prefix + f.name);',
+    '    out += \'<tr><td>[FILE] <a href="\' + href + \'">\' + esc(f.name) + \'</a></td>\'',
+    '      + "<td>" + human(f.size) + "</td>"',
+    '      + \'<td class="muted">\' + esc(f.lastModified) + "</td>"',
+    '      + \'<td><a href="\' + href + \'">下载</a></td></tr>\';',
+    '  });',
+    '  return out;',
+    '}',
+    'function paint() {',
+    '  document.getElementById("status").innerHTML = LOADING',
+    '    ? \'<span class="spin"></span> 正在加载…\'',
+    '    : (NEXT ? "已加载 " + LOADED + " 项 · 继续往下滚动加载更多" : "已加载 " + LOADED + " 项 · 到底了");',
+    '}',
+    'function more() {',
+    '  if (LOADING || !NEXT) return;',
+    '  LOADING = true; paint();',
+    '  fetch(location.pathname + "?format=json&cursor=" + encodeURIComponent(NEXT), { credentials: "same-origin" })',
+    '    .then(function (r) { return r.json(); })',
+    '    .then(function (d) {',
+    '      LOADING = false;',
+    '      if (!d || d.ok === false) { paint(); return; }',
+    '      NEXT = d.truncated ? (d.nextToken || "") : "";',
+    '      document.getElementById("tb").insertAdjacentHTML("beforeend", rowsHtml(d));',
+    '      LOADED += (d.folders || []).length + (d.files || []).length;',
+    '      paint();',
+    '    })',
+    '    .catch(function () { LOADING = false; paint(); });',
+    '}',
+    'window.addEventListener("scroll", function () {',
+    '  if (LOADING || !NEXT) return;',
+    '  if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 300) more();',
+    '});',
+    'paint();',
+    '})();',
+  ].join('\n');
 
   return [
     '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
@@ -1158,6 +1219,9 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
     '.sub{color:var(--dim);font-size:13px;margin-bottom:20px}',
     '.top{display:flex;align-items:center;gap:10px;margin-bottom:18px}',
     '.top .grow{flex:1}',
+    '#status{margin-top:16px;font-size:12px;color:var(--dim);display:flex;gap:8px;align-items:center;justify-content:center}',
+    '.spin{width:12px;height:12px;border:2px solid var(--line);border-top-color:var(--acc);border-radius:50%;display:inline-block;animation:sp .8s linear infinite}',
+    '@keyframes sp{to{transform:rotate(360deg)}}',
     'button{font:inherit;color:var(--txt);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer}',
     'table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}',
     'td{padding:10px 14px;border-bottom:1px solid var(--line);font-size:14px}',
@@ -1165,7 +1229,7 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
     'tr.dir td{background:var(--folder)}tr.dir:hover td{background:var(--hover)}',
     'tr.dir td a{color:var(--folderTxt)}tr.dir td [data-act]{color:var(--folderTxt)}',
     'a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}',
-    '.empty{color:var(--dim);padding:24px;text-align:center}',
+    '.empty{color:var(--dim);padding:24px;text-align:center}.muted{color:var(--dim)}',
     '</style></head><body><div class="wrap">',
     '<div class="top"><button id="btnTheme">深色模式</button><span class="grow"></span></div>',
     '<h1>' + escapeHtml(bucketLabel) + ' ' + escapeHtml('/' + prefix) + '</h1>',
@@ -1173,9 +1237,13 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true) {
       + ' 个文件'
       + (showManage ? ' · <a href="' + base + MANAGE_PATH.slice(1) + '">打开管理器</a>' : '')
       + '</div>',
-    '<table>' + (rows.join('') || '<tr><td class="empty">（空）</td></tr>') + '</table>',
-    '<div style="margin-top:16px">' + nextLink + '</div>',
-    '</div><script>' + themeToggleScript() + '</script></body></html>',
+    '<table><thead><tr><th style="text-align:left">名称</th><th>大小</th><th>修改时间</th><th></th></tr></thead>',
+    '<tbody id="tb">' + (rows.join('') || '<tr><td class="empty" colspan="4">（空）</td></tr>') + '</tbody></table>',
+    '<div id="status"></div>',
+    '</div>',
+    '<script>' + themeToggleScript() + '</script>',
+    '<script>' + script + '</script>',
+    '</body></html>',
   ].join('\n');
 }
 
@@ -1303,7 +1371,7 @@ function managePage(cfg, url) {
     '<button class="ghost" id="btnLogout">退出</button>',
     '<button class="ghost" id="btnRefresh">刷新</button>',
     '<button class="ghost" id="btnMkdir">新建目录</button>',
-    '<select id="upMode" title="上传方式：直传＝浏览器经预签名 URL 直发 B2（不分片，需桶配 CORS）；Worker 代理＝经 Worker 转发，超过单请求上限时自动并发分片">',
+    '<select id="upMode">',
     '<option value="direct">直传（推荐）</option>',
     '<option value="worker">Worker 代理</option>',
     '</select>',
@@ -1582,7 +1650,8 @@ function managePage(cfg, url) {
     '    });',
     '  }).catch(function (e) { toast("上传失败: " + e.message, true); });',
     '}',
-    'function objUrl(key) { return CFG.basePath + key.split("/").map(encodeURIComponent).join("/"); }',
+    '/* 绝对地址（跟随当前访问域名，而不是写死某个域名） */',
+    'function objUrl(key) { return location.origin + CFG.basePath + key.split("/").map(encodeURIComponent).join("/"); }',
     '/* 复制链接：经 Worker 的可分享地址（与「下载」同一路径，加 ?dl=1 即强制另存） */',
     'function copyText(text) {',
     '  function fallback() { window.prompt("复制这条链接（经 Worker，可直接分享）", text); }',

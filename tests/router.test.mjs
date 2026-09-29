@@ -660,6 +660,32 @@ await check('列表改为瀑布流（无上下页按钮，滚动加载）', asyn
   return '无限滚动 + 追加渲染';
 });
 
+await check('公开目录页也走滚动加载（无「下一页」链接）', async () => {
+  const res = await handle(req('/share/'), shareEnv, ctx);
+  const body = await res.text();
+  assert(!body.includes('下一页</a>'), '仍存在下一页链接');
+  assert(body.includes('addEventListener("scroll"'), '缺少滚动监听');
+  assert(body.includes('insertAdjacentHTML'), '缺少追加渲染');
+  assert(body.includes('id="tb"'), '缺少 tbody 容器');
+  assert(body.includes('id="status"'), '缺少状态区');
+  assert(body.includes('?format=json&cursor='), '缺少游标请求');
+  return '无限滚动（服务端首屏 + 前端续接）';
+});
+
+await check('复制的链接跟随当前域名（绝对地址）', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(page.includes('location.origin + CFG.basePath'), '复制应使用 location.origin');
+  assert(!/function objUrl\(key\) \{ return CFG\.basePath/.test(page), '仍在使用相对路径');
+  return 'location.origin + basePath + key';
+});
+
+await check('上传方式下拉框不带 title 说明', async () => {
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(!page.includes('id="upMode" title'), '仍存在 title 说明');
+  assert(page.includes('<select id="upMode">'), '缺少下拉框');
+  return '已移除说明';
+});
+
 await check('管理器内嵌前端 JS 可解析', async () => {
   const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
   const scripts = [...page.matchAll(/<script(?![^>]*type="application\/json")[^>]*>([\s\S]*?)<\/script>/g)];
