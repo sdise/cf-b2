@@ -1123,15 +1123,35 @@ function humanSize(bytes) {
 }
 
 /** 公开目录页：服务端渲染首页 + 滚动到底部自动加载后续页（瀑布流） */
-function renderDirectory(data, prefix, base, bucketLabel, showManage = true, hideKeep = true) {
+function renderDirectory(data, prefix, opts = {}) {
+  const base = opts.base || '/';
+  const baseLabel = opts.label || '';
+  const showManage = opts.showManage !== false;
+  const hideKeep = opts.hideKeep !== false;
+  const publicPrefix = opts.publicPrefix || '';
+
   const rows = [];
   // 目录占位对象（<prefix>/.keep）不参与展示与计数
   const files = hideKeep ? data.files.filter((f) => f.name !== '.keep') : data.files;
 
+  /* 路径导航：每一级都可点击（匿名从公开根开始，不显示公开前缀本身；管理员从桶根开始） */
+  const segs = prefix.replace(/\/+$/, '').split('/').filter(Boolean);
+  const fromPublicRoot = !showManage && publicPrefix && segs[0] === publicPrefix;
+  const visibleSegs = fromPublicRoot ? segs.slice(1) : segs;
+  const rootHref = fromPublicRoot ? base + escapeHtml(publicPrefix) + '/' : base;
+  const crumbs = ['<a href="' + rootHref + '">' + escapeHtml(baseLabel) + '</a>'];
+  let acc = fromPublicRoot ? publicPrefix + '/' : '';
+  visibleSegs.forEach((seg, i) => {
+    acc += seg + '/';
+    crumbs.push(i === visibleSegs.length - 1
+      ? '<span class="cur">' + escapeHtml(seg) + '</span>'
+      : '<a href="' + base + escapeHtml(acc) + '">' + escapeHtml(seg) + '</a>');
+  });
+  const crumbsHtml = '<nav class="crumb">' + crumbs.join('<span class="sep">/</span>') + '</nav>';
+
   if (prefix) {
     // 注意 prefix 形如 "share/images/"，先去尾斜杠再取父级，否则会算成自己
-    const trimmed = prefix.replace(/\/+$/, '');
-    const parent = trimmed.split('/').slice(0, -1).join('/');
+    const parent = prefix.replace(/\/+$/, '').split('/').slice(0, -1).join('/');
     // 匿名在公开根（如 /share/）已无处可回，管理员仍可回到根
     if (parent !== '' || showManage) {
       rows.push('<tr><td colspan="4"><a href="' + base
@@ -1230,6 +1250,9 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true, hid
     themeCss(),
     'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0;padding:32px}',
     '.wrap{max-width:900px;margin:0 auto}h1{font-size:18px;margin:0 0 4px}',
+    '.crumb{font-size:18px;font-weight:600;margin:0 0 6px;display:flex;flex-wrap:wrap;align-items:center;gap:6px}',
+    '.crumb a{color:var(--acc)}.crumb a:hover{text-decoration:underline}',
+    '.crumb .sep{color:var(--dim);font-weight:400}.crumb .cur{color:var(--txt)}',
     '.sub{color:var(--dim);font-size:13px;margin-bottom:20px}',
     '.top{display:flex;align-items:center;gap:10px;margin-bottom:18px}',
     '.top .grow{flex:1}',
@@ -1246,7 +1269,7 @@ function renderDirectory(data, prefix, base, bucketLabel, showManage = true, hid
     '.empty{color:var(--dim);padding:24px;text-align:center}.muted{color:var(--dim)}',
     '</style></head><body><div class="wrap">',
     '<div class="top"><button id="btnTheme">深色模式</button><span class="grow"></span></div>',
-    '<h1>' + escapeHtml(bucketLabel) + ' ' + escapeHtml('/' + prefix) + '</h1>',
+    crumbsHtml,
     '<div class="sub">' + data.folders.length + ' 个目录 / ' + files.length
       + ' 个文件'
       + (showManage ? ' · <a href="' + base + MANAGE_PATH.slice(1) + '">打开管理器</a>' : '')
@@ -2004,7 +2027,13 @@ async function handle(request, env, ctx) {
         const base = cfg.bucketMode === 'path' ? '/' + bucket + '/' : '/';
         // 匿名视图不显示桶名，也不给出管理器入口
         const label = (auth.ok || !cfg.hideDetails) ? bucket : '公开目录';
-        return html(renderDirectory(result, prefix, base, label, auth.ok, cfg.hideKeep));
+        return html(renderDirectory(result, prefix, {
+          base,
+          label,
+          showManage: auth.ok,
+          hideKeep: cfg.hideKeep,
+          publicPrefix: cfg.publicPrefix,
+        }));
       }
 
       if (!resolved.key) return deny('缺少对象 key', request, cfg, 400);

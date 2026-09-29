@@ -159,7 +159,7 @@ cron(每周) → b2_authorize_account → b2_get_download_authorization(validDur
 | 边缘缓存 | `ENABLE_CACHE=true` 时使用 Cache API，命中返回头 `X-B2-Cache: HIT` |
 | 直链跳转 | `ALLOW_REDIRECT=true` 时 `GET /<key>?redirect=1` 返回 302 到预签名 URL |
 | 目录列表 | `GET /<prefix>/` 返回 HTML；`?format=json` 返回 JSON；`?cursor=` 翻页（服务器渲染首批 + 滚动续接） |
-| 目录层级 | 每个子目录都有「返回上一级」指向真正的父级；匿名在公开根不再显示该入口 |
+| 目录层级 | 目录页顶部是**可点击面包屑**（匿名：`公开目录 / images / icons`，管理员：`桶名 / share / …`），另有「返回上一级」；匿名在公开根不显示返回入口 |
 | 目录占位 | 新建目录会写 0 字节 `<prefix>/.keep` 作为占位（对象存储没有真目录）；列表默认隐藏它（`HIDE_KEEP_FILES`） |
 | Web 管理器 | `GET /__manage`（Basic/Bearer 鉴权） |
 | 管理 API | `/__api/list`、`/presign`、`/object`、`/copy`、`/mkdir`、`/multipart/*`、`/health` |

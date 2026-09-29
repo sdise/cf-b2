@@ -367,6 +367,54 @@ await check('三层目录的「返回上一级」逐级回退', async () => {
   return up[1];
 });
 
+await check('匿名：面包屑每一级都可点击（公开目录 / default）', async () => {
+  const page = await (await handle(req('/share/default/'), shareEnv, ctx)).text();
+  const crumb = page.match(/<nav class="crumb">([\s\S]*?)<\/nav>/);
+  assert(crumb, '页面缺少面包屑');
+  assert(crumb[1].includes('<a href="/share/">公开目录</a>'), '根级应为可点击的「公开目录 → /share/」: ' + crumb[1]);
+  assert(crumb[1].includes('<span class="cur">default</span>'), '当前级应为纯文本: ' + crumb[1]);
+  assert(!page.includes('<h1>'), '旧的静态标题应已移除');
+  return '公开目录 → /share/ ｜ default（当前）';
+});
+
+await check('匿名：三层目录面包屑逐级可点，且不暴露桶根', async () => {
+  const page = await (await handle(req('/share/images/icons/'), shareEnv, ctx)).text();
+  const crumb = page.match(/<nav class="crumb">([\s\S]*?)<\/nav>/)[1];
+  assert(crumb.includes('<a href="/share/">公开目录</a>'), '缺少公开根链接');
+  assert(crumb.includes('<a href="/share/images/">images</a>'), '缺少中间级链接: ' + crumb);
+  assert(crumb.includes('<span class="cur">icons</span>'), '当前级不对: ' + crumb);
+  assert(!crumb.includes('href="/"'), '匿名面包屑不应指向桶根 /');
+  assert(!crumb.includes('share</a>'), '匿名面包屑不应暴露公开前缀本身');
+  return '公开目录 → /share/images/ ｜ icons';
+});
+
+await check('匿名：公开根（/share/）面包屑只有「公开目录」且指向自身', async () => {
+  const page = await (await handle(req('/share/'), shareEnv, ctx)).text();
+  const crumb = page.match(/<nav class="crumb">([\s\S]*?)<\/nav>/)[1];
+  assert(crumb === '<a href="/share/">公开目录</a>', '面包屑不符: ' + crumb);
+  return crumb;
+});
+
+await check('管理员：面包屑从桶名指向根，逐级可点', async () => {
+  const page = await (await handle(
+    req('/share/images/', { headers: { Authorization: basic } }), shareEnv, ctx,
+  )).text();
+  const crumb = page.match(/<nav class="crumb">([\s\S]*?)<\/nav>/)[1];
+  assert(crumb.includes('<a href="/">my-bucket</a>'), '根级应为桶名 → /: ' + crumb);
+  assert(crumb.includes('<a href="/share/">share</a>'), '缺少 share 链接: ' + crumb);
+  assert(crumb.includes('<span class="cur">images</span>'), '当前级不对: ' + crumb);
+  return 'my-bucket → /share/ ｜ images';
+});
+
+await check('$path 模式：匿名面包屑根链接带桶名前缀', async () => {
+  const pathShareEnv = { ...env, BUCKET_NAME: '$path', ALLOW_LIST_BUCKET: 'false', PUBLIC_PREFIX: 'share' };
+  const page = await (await handle(req('/my-bucket/share/docs/'), pathShareEnv, ctx)).text();
+  const crumb = page.match(/<nav class="crumb">([\s\S]*?)<\/nav>/)[1];
+  assert(crumb.includes('<a href="/my-bucket/share/">公开目录</a>'), '根链接应为 /my-bucket/share/: ' + crumb);
+  assert(crumb.includes('<span class="cur">docs</span>'), '缺 docs 当前级: ' + crumb);
+  return crumb;
+});
+
 await check('公开根目录（/share/）匿名不再显示返回上一级，管理员仍可回根', async () => {
   const anon = await (await handle(req('/share/'), shareEnv, ctx)).text();
   assert(!anon.includes('返回上一级'), '匿名在公开根不该出现返回上一级');
