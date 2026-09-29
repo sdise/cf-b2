@@ -286,6 +286,19 @@ Backblaze **没有公开的用量 / 事务次数查询 API**：官方只在 Web 
 
 DO 侧的键：`usage`（`state.storage`，SQLite），内容 `{day, A, B, C, D, at, storage, windowDay, lastAttempt}`；跨日时 `day` 一变即归零。
 
+#### Class B/C 计数：存在哪 / 多久统计一次 / 何时清除
+
+| 问题 | Durable Object 后端（推荐） | Cache API 后端（降级） |
+| --- | --- | --- |
+| **存在哪里** | DO 实例的 `state.storage`，键 `usage`（SQLite 后端）；一个桶一个实例 `idFromName('usage:<bucket>')` | `caches.default`，键 `https://usage.internal/counters/<bucket>/<UTC 日期>` |
+| **多久统计一次** | **每个发往 B2 的请求结束时累加一次**（`ctx.waitUntil` 异步执行，不阻塞响应、不额外请求 B2）；不是定时统计 | 同左 |
+| **聚合粒度** | 按 B2 事务类别 A/B/C/D 累计"当日次数"，并记录 `at` 最后更新时间 | 同左 |
+| **何时清除（归零）** | 跨 UTC 日时**同一个键内的字段直接置 0**（`day` 一变即归零），旧值不留 | 键按 UTC 日期分桶，跨日自动读新键；旧键靠 `Cache-Control: max-age=172800` 在 **2 天后**过期 |
+| **占用** | 一条几十字节的 JSON；DO 免费额度含 5 GB 存储，无压力 | 单条 JSON，随 TTL 自动清理 |
+| **重置基准** | UTC 00:00（与 B2 官方计数器 00:00 GMT 对齐） | 同左 |
+
+> 注意：**计数本身不消耗 B2 事务**（不加任何 B2 请求），消耗的是 DO 请求/行写入（免费额度 10 万/天）或 Cache 读写。页面上的"剩余次数"= `CLASS_B_DAILY_QUOTA / CLASS_C_DAILY_QUOTA` 减去当日累计，纯粹是给你对照 B2 控制台用的提醒值。
+
 > **免费计划的 DO 额度**（官方口径，超额即报错，每日 00:00 UTC 重置）：**10 万请求/天**、13,000 GB-s/天、500 万行读/天、**10 万行写/天**、5 GB 存储；免费计划只能用 SQLite 后端，所以绑定用 `new_sqlite_classes`。每个"有 B2 调用的 Worker 请求"会带来 1 次 DO 请求 + 1 次行写入；量很大时可用 `USAGE_DO_WRITE_EVERY` 合并落盘来省写入额度。
 
 **怎么启用 DO**：
@@ -305,11 +318,24 @@ npx wrangler deploy
 | --- | --- | --- |
 | 事务计数 | 每个发往 B2 的请求 | 1 次 DO 调用（或 1 次 Cache 读+写），异步执行 `ctx.waitUntil`，**不额外请求 B2** |
 | 打开管理页 | 页面加载 | 只读已有快照；**只有 DO/缓存判定需要时才扫描** |
-| 空间扫描 | 快照缺失、或超过 `USAGE_CACHE_TTL`、或落入 23:00 窗口 | 默认 ≈ 每 6 小时一次，且**每天 23:00–24:00 之间必定补一次**（当日终值） |
+| 空间扫描 | **Cron Triggers → `scheduled()`** | 由你在 Worker 上配置的 Cron 决定（推荐每天 23:00 UTC 一次）；**不依赖有人访问页面** |
+| 首次引导 | 第一次打开用量面板且从无快照 | 只扫一次，之后一律只读快照 |
 | 点「重新统计」 | 手动 | 受 `USAGE_MIN_INTERVAL` 限流（默认 5 分钟），超频直接回快照并提示 |
 | 每日归零 | UTC 00:00 | 与 B2 官方计数器对齐；DO 全局一次、Cache 后端按 colo 各自切换 |
 
-**惰性窗口（`USAGE_REFRESH_AT_UTC_HOUR`，默认 23）**：UTC 进入 23 点后，当天**第一次**读取用量面板会强制重扫一次空间，这样在 B2 计数器 00:00 GMT 归零之前一定有一份"当日终值"快照；同一天内不会重复补扫（DO 侧用 `windowDay` 原子标记，多地区同时打开也只会有一个真正去扫）。设 `-1` 关闭该行为。
+**空间统计由 Cron 驱动（不是惰性统计）**：`USAGE_AUTO_SCAN` 默认 `false`，意味着**快照过期也不会自动重扫**——只在三种情况下扫描：① Cron 触发 `scheduled()`；② 从未有快照时的首次引导；③ 手动点「重新统计」。
+
+```toml
+# wrangler.toml
+[triggers]
+crons = ["0 23 * * *"]     # 每天 23:00 UTC（B2 计数器 00:00 GMT 归零前一小时）
+```
+
+- 选 23:00 UTC 的原因：B2 的用量计数器在 **00:00 GMT 归零**，这样归零前必定有一份"当日终值"快照。
+- 需要更密集的快照就多加几条，例如 `["0 23 * * *", "0 11 * * *"]`（每 12 小时）。
+- 用 wrangler 部署时，`[triggers]` 会与控制台里的 Cron 触发器保持同步；若只在控制台配置 Cron，则本文件这段可以留空。
+- 如果你更想要"有人访问就顺手刷新"的老行为，把 `USAGE_AUTO_SCAN` 设为 `true`，并可配合 `USAGE_REFRESH_AT_UTC_HOUR=23` 打开 23 点窗口逻辑。
+- `$path` / `$host` 多桶模式无法枚举桶，**必须在 `USAGE_SCHEDULE_BUCKETS` 里显式列出**要定时统计的桶，否则 `scheduled()` 会跳过并在日志里提示。
 
 **成本**：一次全量扫描 = ⌈对象数 ÷ 1000⌉ 次 Class C。1 万对象 = 10 次，约占每日免费额度（2,500 次）的 0.4%；默认单次扫描上限 20 页（2 万对象），超出会标注"扫描到上限，实际更多"。
 
@@ -317,10 +343,12 @@ npx wrangler deploy
 | --- | --- | --- |
 | `ENABLE_USAGE_PANEL` | `true` | 是否启用用量面板与 `/__api/usage` |
 | `STORAGE_QUOTA_BYTES` | `10000000000` | 「总空间」基准（十进制 10 GB）；设 `0` 不显示比例 |
-| `USAGE_CACHE_TTL` | `21600`（6h） | 空间快照有效期（DO 后端同样用这个 TTL） |
+| `USAGE_CACHE_TTL` | `21600`（6h） | 仅 `USAGE_AUTO_SCAN=true` 时用作"多久算过期"；Cron 模式不用它（快照默认留 2 天） |
 | `USAGE_MIN_INTERVAL` | `300`（5min） | 手动重新统计的最小间隔 |
 | `USAGE_SCAN_MAX_PAGES` | `20` | 单次扫描最多页数（每页 1000 对象） |
-| `USAGE_REFRESH_AT_UTC_HOUR` | `23` | 归零前窗口：UTC 进入该小时后当天第一次读取强制重扫；`-1` 关闭 |
+| `USAGE_AUTO_SCAN` | `false` | `false` = 只由 Cron 与手动触发（推荐）；`true` = 额外允许惰性自动扫描 |
+| `USAGE_REFRESH_AT_UTC_HOUR` | `-1` | 惰性窗口：UTC 进入该小时后当天首次读取强制重扫；默认关闭（已有 Cron） |
+| `USAGE_SCHEDULE_BUCKETS` | 空 | Cron 要统计的桶（逗号分隔）；固定桶模式留空即用 `BUCKET_NAME` |
 | `USAGE_DO_WRITE_EVERY` | `1` | DO 计数每累计多少批才落盘（1 = 每次都写，最精确） |
 | `CLASS_B_DAILY_QUOTA` | `2500` | Class B 每日额度（仅用于算"剩余"） |
 | `CLASS_C_DAILY_QUOTA` | `2500` | Class C 每日额度（仅用于算"剩余"） |

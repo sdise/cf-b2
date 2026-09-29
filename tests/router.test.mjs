@@ -6,7 +6,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const {
-  handle, loadConfig, UsageCounter, shouldWindowScan,
+  handle, loadConfig, UsageCounter, shouldWindowScan, default: workerDefault,
 } = await import(pathToFileURL(path.join(here, '..', 'src', 'b2-worker.js')).href);
 
 /* ---------- 桩：Cache API 与 fetch ---------- */
@@ -563,27 +563,30 @@ await check('DO：手动刷新受最小间隔限流，超时后可再扫', async
   return '60s 内 throttled=true；6 分钟后放行';
 });
 
-await check('DO：UTC 23 点窗口内补扫一次，全天只补一次', async () => {
+await check('DO：开启惰性窗口后，UTC 23 点内补扫一次、全天只补一次', async () => {
   const counter = new UsageCounter(fakeDoState(), {});
+  const auto = { ttl: 21600, minInterval: 300, windowHour: 23, autoScan: true };
   await counter.onSnapshot(doReq('snapshot', { usedBytes: 500 }), doAt(22, 59));
 
-  const inWindow = await (await counter.onSync(doReq('sync', {
-    ttl: 21600, minInterval: 300, windowHour: 23,
-  }), doAt(23, 5))).json();
+  const inWindow = await (await counter.onSync(doReq('sync', auto), doAt(23, 5))).json();
   assert(inWindow.shouldScan === true, '窗口内应补扫: ' + JSON.stringify(inWindow));
   assert(inWindow.windowed === true, 'windowed 标记缺失');
 
   await counter.onSnapshot(doReq('snapshot', { usedBytes: 900 }), doAt(23, 6));
-  const again = await (await counter.onSync(doReq('sync', {
-    ttl: 21600, minInterval: 300, windowHour: 23,
-  }), doAt(23, 30))).json();
+  const again = await (await counter.onSync(doReq('sync', auto), doAt(23, 30))).json();
   assert(again.shouldScan === false, '同一天窗口内不应重复扫: ' + JSON.stringify(again));
 
-  const tomorrow = await (await counter.onSync(doReq('sync', {
-    ttl: 21600, minInterval: 300, windowHour: 23,
-  }), doAt(23, 10, 1))).json();
+  const tomorrow = await (await counter.onSync(doReq('sync', auto), doAt(23, 10, 1))).json();
   assert(tomorrow.shouldScan === true, '新的一天应再次补扫');
-  return '22:59 不补 → 23:05 补 → 23:30 不补 → 次日 23:10 再补';
+
+  // 默认（autoScan 未开启）时窗口逻辑不生效
+  const offCounter = new UsageCounter(fakeDoState(), {});
+  await offCounter.onSnapshot(doReq('snapshot', { usedBytes: 500 }), doAt(22, 59));
+  const off = await (await offCounter.onSync(doReq('sync', {
+    ttl: 21600, minInterval: 300, windowHour: 23,
+  }), doAt(23, 5))).json();
+  assert(off.shouldScan === false, 'autoScan=false 时不该补扫: ' + JSON.stringify(off));
+  return '22:59 不补 → 23:05 补 → 23:30 不补 → 次日 23:10 再补；autoScan=false 时关闭';
 });
 
 await check('DO：writeEvery 合并落盘以减少 SQLite 行写入', async () => {
@@ -649,6 +652,130 @@ await check('DO 调用失败时自动降级到 Cache API，不影响面板可用
   assert(body.ok === true && body.counterBackend === 'cache', JSON.stringify(body).slice(0, 160));
   assert(body.storage.ok === true, '降级后仍应给出空间数据');
   return 'backend=cache，空间仍可用';
+});
+
+/* ---------- scheduled() 定时统计（Cron） ---------- */
+
+const seedSnapshot = (bucket, obj) => cacheStore.set(
+  'https://usage.internal/storage/' + encodeURIComponent(bucket),
+  new Response(JSON.stringify(obj), {
+    headers: { 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=172800' },
+  }),
+);
+const cronEvent = (cron = '0 23 * * *') => ({ cron, scheduledTime: Date.now() });
+
+await check('scheduled() 被导出，且会扫描并落快照', async () => {
+  await settle();
+  cacheStore.clear();
+  const before = sent.length;
+
+  const out = await workerDefault.scheduled(cronEvent(), shareEnv, ctrlCtx);
+  assert(out.ok === true, JSON.stringify(out));
+  assert(out.results[0].bucket === 'my-bucket' && out.results[0].backend === 'cache', JSON.stringify(out.results));
+  assert(sent.length > before, '定时统计应发起列举');
+
+  const snap = await cacheStore.get('https://usage.internal/storage/my-bucket').clone().json();
+  assert(snap.usedBytes === 1024 && snap.objects === 2, JSON.stringify(snap));
+  return '扫描 1 次 → 快照 1024B / 2 对象（backend=cache）';
+});
+
+await check('定时统计后：打开管理页只读快照，不再回源', async () => {
+  const before = sent.length;
+  const body = await (await handle(
+    req('/__api/usage', { headers: { Authorization: basic } }), shareEnv, ctx,
+  )).json();
+  assert(body.storage.cached === true, JSON.stringify(body.storage));
+  assert(body.storage.usedBytes === 1024, JSON.stringify(body.storage));
+  assert(sent.length === before, '不应回源 B2，实际多出 ' + (sent.length - before) + ' 次');
+  return 'cached=true，回源 0 次';
+});
+
+await check('USAGE_AUTO_SCAN=false（默认）：快照再旧也不会自动重扫', async () => {
+  await settle();
+  cacheStore.clear();
+  const stale = new Date(Date.now() - 10 * 86400 * 1000).toISOString();
+  seedSnapshot('my-bucket', { usedBytes: 42, objects: 1, pages: 1, complete: true, at: stale });
+
+  const before = sent.length;
+  const body = await (await handle(
+    req('/__api/usage', { headers: { Authorization: basic } }), shareEnv, ctx,
+  )).json();
+  assert(body.storage.cached === true && body.storage.usedBytes === 42, JSON.stringify(body.storage));
+  assert(sent.length === before, '10 天前的快照也不该触发重扫');
+  assert(body.autoScan === false, 'autoScan=' + body.autoScan);
+  return '10 天前的快照仍直接返回（autoScan=false）';
+});
+
+await check('手动「重新统计」仍可强制刷新（受最小间隔限制）', async () => {
+  const before = sent.length;
+  const body = await (await handle(
+    req('/__api/usage?refresh=1', { headers: { Authorization: basic } }), shareEnv, ctx,
+  )).json();
+  assert(sent.length > before, '手动刷新应回源');
+  assert(body.storage.cached === false && body.storage.usedBytes === 1024, JSON.stringify(body.storage));
+  return '手动刷新 → 重新扫描（1024B）';
+});
+
+await check('USAGE_AUTO_SCAN=true 时恢复惰性：过期快照触发重扫', async () => {
+  await settle();
+  cacheStore.clear();
+  const stale = new Date(Date.now() - 10 * 86400 * 1000).toISOString();
+  seedSnapshot('my-bucket', { usedBytes: 42, objects: 1, pages: 1, complete: true, at: stale });
+
+  const before = sent.length;
+  const body = await (await handle(
+    req('/__api/usage', { headers: { Authorization: basic } }),
+    { ...shareEnv, USAGE_AUTO_SCAN: 'true' }, ctx,
+  )).json();
+  assert(sent.length > before, '开启 autoScan 后过期快照应触发重扫');
+  assert(body.autoScan === true && body.storage.usedBytes === 1024, JSON.stringify(body.storage));
+  return 'autoScan=true → 自动重扫（1024B）';
+});
+
+await check('无快照时首次打开会引导性扫描一次（bootstrap）', async () => {
+  await settle();
+  cacheStore.clear();
+  const before = sent.length;
+  const body = await (await handle(
+    req('/__api/usage', { headers: { Authorization: basic } }), shareEnv, ctx,
+  )).json();
+  assert(sent.length > before, '首次应引导扫描');
+  assert(body.storage.ok === true && body.storage.usedBytes === 1024, JSON.stringify(body.storage));
+  return '首次引导扫描一次，之后只靠 Cron/手动';
+});
+
+await check('定时统计支持多桶（$path 模式需显式列出）', async () => {
+  await settle();
+  cacheStore.clear();
+  const out = await workerDefault.scheduled(cronEvent(), {
+    ...shareEnv, BUCKET_NAME: '$path', USAGE_SCHEDULE_BUCKETS: 'bucket-a, bucket-b',
+  }, ctrlCtx);
+  assert(out.ok === true, JSON.stringify(out));
+  assert(out.results.length === 2, JSON.stringify(out.results));
+  const urls = sent.slice(-2).map((r) => r.url);
+  assert(urls.some((u) => u.includes('/bucket-a/')), JSON.stringify(urls));
+  assert(urls.some((u) => u.includes('/bucket-b/')), JSON.stringify(urls));
+  return 'bucket-a / bucket-b 各扫一次';
+});
+
+await check('$path 模式未配置 USAGE_SCHEDULE_BUCKETS 时跳过并给出原因', async () => {
+  const out = await workerDefault.scheduled(cronEvent(), { ...shareEnv, BUCKET_NAME: '$path' }, ctrlCtx);
+  assert(out.ok === false && /USAGE_SCHEDULE_BUCKETS/.test(out.skipped), JSON.stringify(out));
+  return out.skipped;
+});
+
+await check('定时统计走 DO 后端时写入 DO 快照', async () => {
+  await settle();
+  const ns = fakeDoNamespace();
+  const out = await workerDefault.scheduled(cronEvent(), { ...shareEnv, USAGE_DO: ns }, ctrlCtx);
+  assert(out.results[0].backend === 'do', JSON.stringify(out.results));
+
+  const body = await (await handle(
+    req('/__api/usage', { headers: { Authorization: basic } }), { ...shareEnv, USAGE_DO: ns }, ctrlCtx,
+  )).json();
+  assert(body.counterBackend === 'do' && body.storage.cached === true, JSON.stringify(body.storage));
+  assert(body.storage.usedBytes === 1024, JSON.stringify(body.storage));
+  return 'backend=do，面板直接读到 DO 快照';
 });
 
 /* ---------- 目录页：返回上一级 / 占位对象 ---------- */

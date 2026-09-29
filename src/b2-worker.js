@@ -399,11 +399,19 @@ function loadConfig(env) {
     usageMinInterval: Math.max(0, readInt(env.USAGE_MIN_INTERVAL, 300)),
     // 单次扫描最多翻多少页（每页 1000 个对象 = 1 次 Class C）
     usageScanMaxPages: Math.max(1, Math.min(200, readInt(env.USAGE_SCAN_MAX_PAGES, 20))),
-    // 惰性窗口：UTC 进入该小时后，当天第一次读取会强制重扫一次（-1 关闭）
+    // 空间统计模式：
+    //   false（默认）= 只在 Cron 触发（scheduled）或手动「重新统计」时扫描
+    //   true         = 额外允许惰性自动扫描（TTL 过期或落入窗口）
+    usageAutoScan: readBool(env.USAGE_AUTO_SCAN, false),
+    // 惰性窗口（仅 usageAutoScan=true 时生效）：UTC 进入该小时后当天第一次读取强制重扫（-1 关闭）
     usageRefreshHour: (() => {
-      const hour = readInt(env.USAGE_REFRESH_AT_UTC_HOUR, 23);
+      const hour = readInt(env.USAGE_REFRESH_AT_UTC_HOUR, -1);
       return hour >= 0 && hour <= 23 ? hour : -1;
     })(),
+    // 定时统计的桶列表（逗号分隔）。固定桶模式留空即用 BUCKET_NAME；
+    // $path / $host 模式无法枚举桶，必须显式列出才会在 scheduled 里统计
+    usageScheduleBuckets: String(env.USAGE_SCHEDULE_BUCKETS || '')
+      .split(',').map((s) => s.trim()).filter(Boolean),
     // Durable Object 计数：每累计多少次增量才落盘（1 = 每次请求都落盘，最精确）
     usageDoWriteEvery: Math.max(1, Math.min(100, readInt(env.USAGE_DO_WRITE_EVERY, 1))),
     // 每日额度（B2 免费账户的 Class B/C 各 2500 次/天，按你账户实际套餐调整）
@@ -1043,19 +1051,22 @@ export class UsageCounter {
     const snapshot = this.data.storage;
     const snapshotAt = snapshot && snapshot.at ? Date.parse(snapshot.at) : 0;
     const ageMs = snapshotAt ? now.getTime() - snapshotAt : Infinity;
+    const autoScan = body.autoScan === true;
 
     let shouldScan = false;
     let throttled = false;
     let windowed = false;
+    let bootstrap = false;
 
     if (!snapshotAt) {
-      shouldScan = true;
+      shouldScan = true;              // 首次还没有任何快照 → 引导性扫一次
+      bootstrap = true;
     } else if (body.refresh === true) {
       if (ageMs < minIntervalMs) throttled = true;
       else shouldScan = true;
-    } else if (ttlMs > 0 && ageMs >= ttlMs) {
-      shouldScan = true;
-    } else if (shouldWindowScan(now, windowHour, this.data.windowDay)) {
+    } else if (autoScan && ttlMs > 0 && ageMs >= ttlMs) {
+      shouldScan = true;              // 仅在显式开启惰性自动扫描时才按 TTL 重扫
+    } else if (autoScan && shouldWindowScan(now, windowHour, this.data.windowDay)) {
       shouldScan = true;
     }
 
@@ -1076,6 +1087,7 @@ export class UsageCounter {
       shouldScan,
       throttled,
       windowed,
+      bootstrap,
       minInterval: Math.round(minIntervalMs / 1000),
       ageSeconds: Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : -1,
     }, 200);
@@ -1175,16 +1187,17 @@ async function usageStateViaCache(cfg, bucket, refresh) {
   const cached = await cacheGetJson(storageCacheKey(bucket));
   const cachedAt = cached && cached.at ? Date.parse(cached.at) : 0;
   const ageMs = cachedAt ? Date.now() - cachedAt : Infinity;
-  const inWindow = cfg.usageRefreshHour >= 0
+  const inWindow = cfg.usageAutoScan && cfg.usageRefreshHour >= 0
     && new Date().getUTCHours() >= cfg.usageRefreshHour;
-  const windowed = Boolean(cached) && shouldWindowScan(new Date(), cfg.usageRefreshHour, cached.windowDay);
+  const windowed = cfg.usageAutoScan && Boolean(cached)
+    && shouldWindowScan(new Date(), cfg.usageRefreshHour, cached.windowDay);
 
   let shouldScan = false;
   let throttled = false;
   if (!cachedAt) shouldScan = true;
   else if (refresh && ageMs < cfg.usageMinInterval * 1000) throttled = true;
   else if (refresh) shouldScan = true;
-  else if (ageMs >= cfg.usageCacheTtl * 1000) shouldScan = true;
+  else if (cfg.usageAutoScan && ageMs >= cfg.usageCacheTtl * 1000) shouldScan = true;
   else if (windowed) shouldScan = true;
 
   const counters = await readCountersViaCache(bucket);
@@ -1212,7 +1225,8 @@ async function usageStateViaCache(cfg, bucket, refresh) {
     complete: scan.complete, at: new Date().toISOString(),
     windowDay: inWindow ? utcDayStamp() : ((cached && cached.windowDay) || ''),
   };
-  await cachePutJson(storageCacheKey(bucket), stored, Math.max(60, cfg.usageCacheTtl));
+  // 快照可能一天才更新一次（Cron），缓存条目不能按 TTL 6h 就过期
+  await cachePutJson(storageCacheKey(bucket), stored, Math.max(cfg.usageCacheTtl, 2 * 86400));
   return {
     backend: 'cache',
     counters,
@@ -1236,6 +1250,7 @@ async function usageState(cfg, env, bucket, refresh) {
       minInterval: cfg.usageMinInterval,
       refresh,
       windowHour: cfg.usageRefreshHour,
+      autoScan: cfg.usageAutoScan,
     });
   } catch (error) {
     console.error('[cf-b2-worker] DO 读取失败，本次改用 Cache API 口径:', error && error.message);
@@ -1286,6 +1301,70 @@ async function usageState(cfg, env, bucket, refresh) {
     windowed: state.windowed,
     minInterval: state.minInterval,
   };
+}
+
+/** 定时统计要覆盖的桶列表：显式配置优先，固定桶模式回落到 BUCKET_NAME */
+function scheduledBuckets(cfg) {
+  if (cfg.usageScheduleBuckets.length) return cfg.usageScheduleBuckets;
+  if (cfg.bucketMode === 'fixed' && cfg.bucketFixed) return [cfg.bucketFixed];
+  return [];
+}
+
+/** 扫描一次空间并落成快照（DO 优先；未绑定 DO 时写 Cache API） */
+async function refreshSnapshot(cfg, env, bucket) {
+  const scan = await computeStorage(cfg, bucket);
+  if (!scan.ok) throw new Error(scan.error || ('扫描失败: HTTP ' + (scan.status || 0)));
+
+  const record = {
+    bucket,
+    usedBytes: scan.bytes,
+    objects: scan.objects,
+    pages: scan.pages,
+    complete: scan.complete,
+    at: new Date().toISOString(),
+  };
+
+  const stub = usageDoStub(env, bucket);
+  if (stub) {
+    try {
+      await doCall(stub, 'snapshot', record);
+      return { ...record, backend: 'do' };
+    } catch (error) {
+      console.error('[cf-b2-worker] 定时统计写 DO 失败，改写 Cache API:', error && error.message);
+    }
+  }
+  await cachePutJson(storageCacheKey(bucket), record, Math.max(cfg.usageCacheTtl, 2 * 86400));
+  return { ...record, backend: 'cache' };
+}
+
+/**
+ * Cron（scheduled）入口：为每个配置的桶刷新一次空间快照。
+ * 由 Cloudflare Cron Triggers 触发（例如每天 23:00 UTC），不依赖有人访问页面。
+ */
+async function runScheduled(event, env) {
+  const cfg = loadConfig(env);
+  if (!cfg.enableUsage) return { ok: false, skipped: '用量面板已关闭（ENABLE_USAGE_PANEL=false）' };
+
+  const buckets = scheduledBuckets(cfg);
+  if (!buckets.length) {
+    console.warn('[cf-b2-worker] 定时统计缺少桶名：$path / $host 模式请设置 USAGE_SCHEDULE_BUCKETS');
+    return { ok: false, skipped: '未确定桶名（请配置 USAGE_SCHEDULE_BUCKETS）' };
+  }
+
+  const results = [];
+  for (const bucket of buckets) {
+    try {
+      const record = await refreshSnapshot(cfg, env, bucket);
+      results.push({ bucket, ok: true, usedBytes: record.usedBytes, objects: record.objects, backend: record.backend });
+      console.log('[cf-b2-worker] 定时统计完成',
+        bucket, record.usedBytes + 'B', record.objects + ' objects', 'via', record.backend);
+    } catch (error) {
+      results.push({ bucket, ok: false, error: String((error && error.message) || error) });
+      console.error('[cf-b2-worker] 定时统计失败', bucket, error && error.message);
+    }
+  }
+
+  return { ok: results.every((r) => r.ok), cron: (event && event.cron) || '', results };
 }
 
 /* ============================ 6. 管理 API ============================ */
@@ -1407,6 +1486,8 @@ async function apiRouter(request, env, ctx, cfg, url) {
         windowed: state.windowed,
         windowHour: cfg.usageRefreshHour,
         minInterval: state.minInterval,
+        autoScan: cfg.usageAutoScan,
+        scheduledBuckets: scheduledBuckets(cfg),
         classA: used.A,
         classB: { used: used.B, quota: cfg.classBQuota, remaining: remaining(used.B, cfg.classBQuota) },
         classC: { used: used.C, quota: cfg.classCQuota, remaining: remaining(used.C, cfg.classCQuota) },
@@ -2504,6 +2585,7 @@ function managePage(cfg, url) {
     '  if (s.ok !== false && s.pages) foot.push("本次扫描 " + s.pages + " 次 Class C");',
     '  foot.push("次数按 UTC 每日 00:00 归零" + (d.resetAt ? "（下次 " + esc(d.resetAt) + "）" : ""));',
     '  if (d.counterBackendLabel) foot.push("计数后端：" + esc(d.counterBackendLabel));',
+    '  if (d.autoScan === false) foot.push("空间快照由 Cron 定时刷新（不会自动重扫）");',
     '  if (d.windowed) foot.push("本次是 UTC " + d.windowHour + ":00 窗口内的当日终值扫描");',
     '  if (d.scope) foot.push(esc(d.scope));',
     '  html += \'<div class="foot">\' + foot.map(function (t) { return "<span>" + t + "</span>"; }).join("")',
@@ -2702,6 +2784,16 @@ async function dispatch(request, env, ctx, cfg) {
 }
 
 export default {
+  /** Cron Triggers 入口：每天定时刷新空间快照（见 wrangler.toml 的 [triggers]） */
+  async scheduled(event, env, ctx) {
+    try {
+      return await runScheduled(event, env);
+    } catch (error) {
+      console.error('[cf-b2-worker] scheduled', error && error.stack ? error.stack : error);
+      return { ok: false, error: String((error && error.message) || error) };
+    }
+  },
+
   async fetch(request, env, ctx) {
     try {
       return await handle(request, env, ctx);

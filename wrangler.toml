@@ -130,9 +130,19 @@ USAGE_SCAN_MAX_PAGES = "20"
 CLASS_B_DAILY_QUOTA = "2500"
 CLASS_C_DAILY_QUOTA = "2500"
 
-# 惰性窗口：UTC 进入该小时后，当天第一次打开用量面板会强制重扫一次空间
-# 默认 23 = 在 B2 计数器 00:00 GMT 归零前一小时拿到「当日终值」；-1 关闭
-USAGE_REFRESH_AT_UTC_HOUR = "23"
+# 空间统计由 Cron（scheduled）驱动：每天刷新一次快照，管理页只读快照
+#   USAGE_AUTO_SCAN = "false"（默认）：只在 Cron 与手动「重新统计」时扫描
+#   USAGE_AUTO_SCAN = "true"         ：额外允许惰性自动扫描（TTL 过期 / 窗口触发）
+USAGE_AUTO_SCAN = "false"
+
+# 若允许惰性自动扫描，这里是「归零前窗口」：UTC 进入该小时后当天首次读取强制重扫
+# 默认 -1 = 关闭（因为已有 Cron 定时统计）
+USAGE_REFRESH_AT_UTC_HOUR = "-1"
+
+# 定时统计的桶列表（逗号分隔）。
+#   · 固定桶模式（BUCKET_NAME=xxx）留空即可，会自动用 BUCKET_NAME
+#   · $path / $host 模式无法枚举桶，必须在这里显式列出，例如 "bucket-a,bucket-b"
+USAGE_SCHEDULE_BUCKETS = ""
 
 # DO 计数每累计多少批才落盘（1 = 每批都写，最精确）
 # 免费计划 SQLite 行写入额度 10 万/天，提高该值可省额度（代价：DO 被驱逐时最多丢 N 批）
@@ -147,6 +157,17 @@ DEBUG = "false"
 #   npx wrangler secret put B2_APPLICATION_KEY     # applicationKey
 #   npx wrangler secret put ADMIN_PASS             # 管理口令（Basic）
 #   npx wrangler secret put ADMIN_TOKEN            # 管理令牌（Bearer，二选一）
+
+# ---------------------------------------------------------------------------
+# Cron Triggers：空间统计定时刷新
+#
+# 每天 23:00 UTC 触发 scheduled() → 扫描桶并写入空间快照（DO 优先）。
+# 选 23:00 是因为 B2 的用量计数器在 00:00 GMT 归零，这样归零前一定有一份当日终值。
+# 需要多个时间点可写多条，例如 ["0 23 * * *", "0 11 * * *"]。
+# 注意：用 wrangler 部署时，本节的 crons 会与控制台上的 Cron 触发器保持一致。
+# ---------------------------------------------------------------------------
+[triggers]
+crons = ["0 23 * * *"]
 
 # ---------------------------------------------------------------------------
 # Durable Objects：用量计数器（全局单实例 → 所有地区看到同一份数字；原子累加）
