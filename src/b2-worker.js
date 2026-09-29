@@ -376,7 +376,9 @@ function loadConfig(env) {
     useCache: readBool(env.ENABLE_CACHE, true),
     rcloneDownload: readBool(env.RCLONE_DOWNLOAD, false),
 
-    maxUploadBytes: readInt(env.MAX_UPLOAD_BYTES, 100 * 1024 * 1024),
+    // Workers 请求体上限是十进制 100MB（100,000,000 字节），不是 100 MiB；
+    // 默认再留 4MB 余量，避免上传到 99.9% 时被平台掐断（表现为连接中断 / HTTP 000）
+    maxUploadBytes: readInt(env.MAX_UPLOAD_BYTES, 96 * 1000 * 1000),
     presignExpires: readInt(env.PRESIGN_EXPIRES, 3600),
     multipartThreshold: readInt(env.MULTIPART_THRESHOLD, 100 * 1024 * 1024),
     multipartPartSize: readInt(env.MULTIPART_PART_SIZE, 25 * 1024 * 1024),
@@ -1415,7 +1417,7 @@ function managePage(cfg, url) {
     '  el("btnNext").disabled = !data.truncated;',
     '}',
     'function refresh() { load(PREFIX); }',
-    'var ERR_DIRECT = "直传失败：多半是桶未配置 CORS（需允许本站来源且放行 s3_put）。可改用「Worker 代理」上传，或在 B2 桶的 CORS 规则里加入本站。";',
+    'var ERR_DIRECT = "直传失败：浏览器只给笼统错误，请到 DevTools → Network 看真实状态码。常见原因：① 桶未配 CORS（需放行本站与 s3_put）；② 请求多带了未签名的自定义头（B2 会 400）。也可改用「Worker 代理」上传。";',
     'var ERR_WORKER = "经 Worker 上传失败：网络中断，或单请求超过 MAX_UPLOAD_BYTES（默认 100MB）。";',
     'function upMode() { return el("upMode") ? el("upMode").value : "direct"; }',
     'function saveMode() { try { localStorage.setItem("cfb2-upmode", upMode()); } catch (e) {} }',
@@ -1503,9 +1505,7 @@ function managePage(cfg, url) {
     '    var xhr = new XMLHttpRequest();',
     '    xhr.open("PUT", url, true);',
     '    xhr.setRequestHeader("Content-Type", ct);',
-    '    if (opts.direct) {',
-    '      xhr.setRequestHeader("x-amz-content-sha256", "UNSIGNED-PAYLOAD");',
-    '    } else {',
+    '    if (!opts.direct) {',
     '      var h = buildHeaders(false);',
     '      for (var key in h) { if (Object.prototype.hasOwnProperty.call(h, key)) xhr.setRequestHeader(key, h[key]); }',
     '    }',
