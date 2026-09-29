@@ -5,7 +5,7 @@ import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const { handle } = await import(pathToFileURL(path.join(here, '..', 'src', 'b2-worker.js')).href);
+const { handle, loadConfig } = await import(pathToFileURL(path.join(here, '..', 'src', 'b2-worker.js')).href);
 
 /* ---------- 桩：Cache API 与 fetch ---------- */
 const cacheStore = new Map();
@@ -622,15 +622,24 @@ await check('匿名目录页也带主题切换', async () => {
   return 'ok';
 });
 
-await check('直传不再分片；只有 Worker 代理超过上限才并发分片', async () => {
+await check('直传/Worker 都支持并发分片（含失败重试）', async () => {
   const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
-  assert(!page.includes('mpUpload'), '直传分片函数应已删除');
-  assert(!page.includes('multipartThreshold'), '不应再依赖 MULTIPART_THRESHOLD');
+  assert(page.includes('function mpUpload'), '缺少直传分片函数');
+  assert(page.includes('function directStep'), '缺少直传分片步骤');
+  assert(page.includes('function withRetry'), '缺少分片重试');
   assert(page.includes('runPool'), '缺少并发池');
   assert(page.includes('uploadConcurrency'), '缺少并发数配置');
-  assert(page.includes('CFG.maxUploadBytes'), 'Worker 代理应以上限作为分片阈值');
+  assert(/f\.size > \(CFG\.multipartThreshold \|\| 100000000\)/.test(page), '直传应以上限阈值决定是否分片');
   assert(/file\.size <= \(CFG\.maxUploadBytes/.test(page), 'Worker 代理应在上限内走单次转发');
-  return '直传=单次 PUT；Worker>上限=并发分片';
+  return '直传>100MB 分片；Worker>96MB 分片；均为并发+重试';
+});
+
+await check('MULTIPART_THRESHOLD 被钳制在 B2 单次 PUT 上限（100MiB）之内', async () => {
+  const cfg = loadConfig({ ...env, MULTIPART_THRESHOLD: '999999999' });
+  assert(cfg.multipartThreshold < 100 * 1024 * 1024, 'threshold=' + cfg.multipartThreshold);
+  const def = loadConfig({ ...env });
+  assert(def.multipartThreshold === 100000000, 'default=' + def.multipartThreshold);
+  return 'clamp < 104857600，默认 100000000';
 });
 
 await check('提供「复制」按钮（经 Worker 的分享链接）', async () => {

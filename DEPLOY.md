@@ -225,8 +225,9 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
-| `MAX_UPLOAD_BYTES` | `96000000`（96MB） | **「Worker 代理」**单请求上限。Workers 请求体硬上限是十进制 100MB，这里留 4MB 余量；超过该值自动改为**并发分片**经 Worker 转发。**直传路径不走 Worker，不受此值限制** |
-| `UPLOAD_CONCURRENCY` | `3` | Worker 代理分片上传的并发数（1–10） |
+| `MAX_UPLOAD_BYTES` | `96000000`（96MB） | **「Worker 代理」**单请求上限。Workers 请求体硬上限是十进制 100MB，这里留 4MB 余量；超过该值自动改为**并发分片**经 Worker 转发 |
+| `MULTIPART_THRESHOLD` | `100000000` | **「直传」**超过该体积自动改为并发分片。**实测 B2 单次 PUT 上限 = 100 MiB（104857600 字节）**，达到即被上游中断（`500 InternalError`，浏览器显示 CORS Failed），故代码强制钳制该值 `< 104857600` |
+| `UPLOAD_CONCURRENCY` | `3` | 分片上传并发数（1–10），直传与 Worker 代理通用 |
 | `PRESIGN_EXPIRES` | `3600` | 预签名 URL 有效期（秒） |
 | `MULTIPART_PART_SIZE` | `26214400`（25MB） | 分片大小，**仅 Worker 代理路径使用**；B2 要求最后一片外其他片 ≥5MB，前端会自动取 `min(此值, MAX_UPLOAD_BYTES-1MB)` |
 | `RCLONE_DOWNLOAD` | `false` | 兼容 `rclone --b2-download-url`：剥掉 URL 中 `file/<bucket>/` 前缀 |
@@ -420,11 +421,17 @@ curl -X PUT -T ./demo.bin \
 
 | 场景 | 行为 |
 | --- | --- |
-| 直传（任意体积） | 签一张预签名 PUT URL，浏览器**一次 PUT** 到 B2 |
+| 直传 + `≤MULTIPART_THRESHOLD` | 签一张预签名 PUT URL，浏览器**一次 PUT** 到 B2 |
+| 直传 + `>MULTIPART_THRESHOLD` | `create` → 逐片取预签名 URL → 按 `UPLOAD_CONCURRENCY` **并发**直发 B2 → `complete` |
 | Worker 代理 + `≤MAX_UPLOAD_BYTES` | 一次 PUT 到 `/__api/object` |
-| Worker 代理 + `>MAX_UPLOAD_BYTES` | `create` → 按 `UPLOAD_CONCURRENCY` **并发** PUT `/__api/multipart/part`（Worker 中继）→ `complete`，失败自动 `abort` |
+| Worker 代理 + `>MAX_UPLOAD_BYTES` | `create` → 按 `UPLOAD_CONCURRENCY` **并发** PUT `/__api/multipart/part`（Worker 中继）→ `complete` |
 
-> **直传 5GB 以上怎么办？** 单次 PUT 会撞 B2 的单操作上限，此时请切到「Worker 代理」——它会自动并发分片，不受单次上限影响。
+两条分片路径都带**失败自动重试（3 次，退避 0.8s/1.6s）**，最终失败会 `abort` 清理未完成碎片。
+
+> ⚠️ **实测数据（重要）**：B2 的 S3 兼容 API 对**单次 PUT** 的上限是 **100 MiB = 104857600 字节**，达到或超过会被上游中断——B2 回 `500 InternalError`（响应体只有空的 `<Message/>`），浏览器因该响应缺少 CORS 头而显示成 `CORS Failed`。
+> 实测：104,000,000 字节 ✅ 成功；104,857,600 / 105,000,000 / 130MB / 190MB ❌ 均在 103–104 MiB 处被切断。
+> 另经对照实验（30MB 限速 300KB/s、耗时 103 秒）确认**与耗时无关**，纯字节上限。
+> 因此超过 100MB 的文件**必须分片**，`MULTIPART_THRESHOLD` 会被强制钳制在 104857600 以下。
 
 ---
 
