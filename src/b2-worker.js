@@ -2100,14 +2100,17 @@ function renderDirectory(data, prefix, opts = {}) {
   }
 
   for (const folder of data.folders) {
+    // 相对挂载点（已去掉 share/ 这类别名偏移）：href 基于挂载根 base 拼接，且保留尾斜杠（目录链接）；
+    // 显示名 name 才需要去尾斜杠。不能再加完整列举前缀，否则别名下会出现 /share/<桶>/share/… 双前缀。
+    const rel = relPrefix + folder.slice(prefix.length);
     const name = folder.slice(prefix.length).replace(/\/$/, '');
-    rows.push('<tr class="dir"><td>[DIR] <a href="' + base + escapeHtml(folder) + '">' + escapeHtml(name) + '/</a></td>'
+    rows.push('<tr class="dir"><td>[DIR] <a href="' + base + escapeHtml(rel) + '">' + escapeHtml(name) + '/</a></td>'
       + '<td>-</td><td>-</td>'
-      + '<td><a href="' + base + escapeHtml(folder) + '?format=json">JSON</a></td></tr>');
+      + '<td><a href="' + base + escapeHtml(rel) + '?format=json">JSON</a></td></tr>');
   }
 
   for (const file of files) {
-    const href = base + escapeHtml(prefix + file.name);
+    const href = base + escapeHtml(relPrefix + file.name);
     rows.push('<tr><td>[FILE] <a href="' + href + '">' + escapeHtml(file.name) + '</a></td>'
       + '<td>' + humanSize(file.size) + '</td>'
       + '<td>' + escapeHtml(file.lastModified) + '</td>'
@@ -2116,7 +2119,7 @@ function renderDirectory(data, prefix, opts = {}) {
 
   const initCount = data.folders.length + files.length;
   const cfgJson = JSON.stringify({
-    prefix, base, next: data.truncated ? (data.nextToken || '') : '', loaded: initCount,
+    prefix, base, relPrefix, next: data.truncated ? (data.nextToken || '') : '', loaded: initCount,
     hideKeep: !!hideKeep,
   });
 
@@ -2138,14 +2141,15 @@ function renderDirectory(data, prefix, opts = {}) {
     '  var out = "";',
     '  (d.folders || []).forEach(function (p) {',
     '    var name = p.slice(C.prefix.length);',
+    '    var rel = C.relPrefix + p.slice(C.prefix.length);',
     '    if (name.charAt(name.length - 1) === "/") name = name.slice(0, -1);',
-    '    out += \'<tr class="dir"><td>[DIR] <a href="\' + C.base + esc(p) + \'">\' + esc(name) + \'/</a></td>\'',
+    '    out += \'<tr class="dir"><td>[DIR] <a href="\' + C.base + esc(rel) + \'">\' + esc(name) + \'/</a></td>\'',
     '      + \'<td>-</td><td>-</td>\'',
-    '      + \'<td><a href="\' + C.base + esc(p) + \'?format=json">JSON</a></td></tr>\';',
+    '      + \'<td><a href="\' + C.base + esc(rel) + \'?format=json">JSON</a></td></tr>\';',
     '  });',
     '  (d.files || []).filter(function (f) { return !(C.hideKeep && f.name === ".keep"); })',
     '    .forEach(function (f) {',
-    '    var href = C.base + esc(C.prefix + f.name);',
+    '    var href = C.base + esc(C.relPrefix + f.name);',
     '    out += \'<tr><td>[FILE] <a href="\' + href + \'">\' + esc(f.name) + \'</a></td>\'',
     '      + "<td>" + human(f.size) + "</td>"',
     '      + \'<td class="muted">\' + esc(f.lastModified) + "</td>"',
@@ -2189,7 +2193,7 @@ function renderDirectory(data, prefix, opts = {}) {
   return [
     '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    '<title>' + escapeHtml(prefix || '/') + ' - B2 Index</title>',
+    '<title>' + escapeHtml(relPrefix || '/') + ' - B2 Index</title>',
     // 空 favicon：避免浏览器自动请求 /favicon.ico（会被当对象下载，白记 1 次 Class B）
     '<link rel="icon" href="data:,">',
     '<style>',

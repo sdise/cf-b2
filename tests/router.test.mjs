@@ -378,6 +378,27 @@ await check('匿名可列举 /share/<桶>/ 目录', async () => {
   return 'HTML ok';
 });
 
+await check('share 目录链接基于挂载根（不含重复 share 前缀）', async () => {
+  const res = await handle(req('/share/my-bucket/'), shareEnv, ctx);
+  const html = await res.text();
+  // 正确：/share/my-bucket/a.txt 与 /share/my-bucket/sub/；错误（旧 bug）：/share/my-bucket/share/a.txt
+  assert(html.includes('href="/share/my-bucket/a.txt"'), '缺少正确文件链接');
+  assert(!html.includes('/share/my-bucket/share/a.txt'), '文件链接出现重复的 share 前缀');
+  assert(html.includes('href="/share/my-bucket/sub/"'), '缺少正确目录链接');
+  assert(!html.includes('/share/my-bucket/share/sub/'), '目录链接出现重复的 share 前缀');
+  assert(!html.includes('/share/my-bucket/share/.keep'), '.keep 应被过滤');
+  return '文件/目录链接均基于挂载根';
+});
+
+await check('share 子目录链接也不含重复 share 前缀', async () => {
+  const res = await handle(req('/share/my-bucket/sub/'), shareEnv, ctx);
+  const html = await res.text();
+  // 子目录内：base=/share/my-bucket/，relPrefix=sub/ → 文件 /share/my-bucket/sub/a.txt
+  assert(html.includes('href="/share/my-bucket/sub/a.txt"'), '缺少正确子目录文件链接');
+  assert(!html.includes('/share/my-bucket/share/sub/a.txt'), '子目录文件链接出现重复前缀');
+  return '子目录链接正确';
+});
+
 await check('匿名列举其它目录被重定向', async () => {
   const res = await handle(req('/my-bucket/private/'), shareEnv, ctx);
   assert(res.status === 308, 'status=' + res.status);
