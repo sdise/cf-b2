@@ -7,7 +7,7 @@ import vm from 'node:vm';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const { handle } = await import(pathToFileURL(path.join(here, '..', 'src', 'b2-worker.js')).href);
+const { handle } = await import(pathToFileURL(path.join(here, '..', 'dist', 'b2-worker.js')).href);
 
 let failed = 0;
 async function check(label, fn) {

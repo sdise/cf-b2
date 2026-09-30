@@ -29,7 +29,14 @@
  * 兼容性：Cloudflare Workers（ESM），compatibility_date >= 2023-09-04
  * ===================================================================================== */
 
-/* ============================ 1. 常量与基础工具 ============================ */
+/* eslint-disable */
+/* ============================================================================
+ * ⚠️ 自动生成，请勿直接编辑 —— 本文件由 tools/build.mjs 从 src/ 下的模块合并而来。
+ *    修改源码后执行：npm run build
+ * ============================================================================ */
+
+/* ---------- src/lib/constants.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L34-L56 */
 
 const SERVICE = 's3';
 const ALGORITHM = 'AWS4-HMAC-SHA256';
@@ -53,6 +60,9 @@ const FORWARD_READ_HEADERS = [
   'range', 'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since',
   'accept', 'accept-language',
 ];
+
+/* ---------- src/lib/crypto.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L57-L165 */
 
 const encoder = new TextEncoder();
 
@@ -162,6 +172,11 @@ function dirPrefix(value) {
 }
 
 /* ============================ 2. AWS Signature V4 ============================ */
+
+/* ---------- src/lib/sigv4.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L166-L277 */
+
+
 
 class SigV4 {
   constructor({ accessKeyId, secretAccessKey, region, service = SERVICE, keyCache = null }) {
@@ -275,25 +290,10 @@ class SigV4 {
 /* ============================ 3. 配置加载 ============================ */
 
 /** 前缀归一化：去掉首尾斜杠，中间保留；结果为空串表示"不限制" */
-function normalizePrefix(value) {
-  if (value === undefined || value === null) return '';
-  return String(value).trim().replace(/^\/+/, '').replace(/\/+$/, '');
-}
 
-/** key/prefix 是否位于指定前缀内（share 与 share/a.txt 均算命中） */
-function withinPrefix(key, prefix) {
-  if (!prefix) return true;
-  const target = String(key || '');
-  return target === prefix || target.startsWith(prefix + '/');
-}
+/* ---------- src/lib/http.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L297-L334、原 L564-L621 */
 
-/** 拼出带尾斜杠的前缀，用于生成链接 */
-function prefixWithSlash(prefix) {
-  return prefix ? prefix + '/' : '';
-}
-
-/** 公开目录的基础路径（$path 模式下需要带上桶名段） */
-/** 会暴露后端实现/对象内部信息的响应头，统一剥离 */
 const LEAKY_HEADERS = [
   'x-amz-request-id', 'x-amz-id-2', 'x-amz-version-id', 'x-amz-expiration',
   'x-amz-replication-status', 'x-amz-server-side-encryption',
@@ -332,234 +332,6 @@ function sanitizeUpstreamError(response, cfg, extraHeaders) {
 }
 
 // env 在同一 isolate 内是稳定对象：缓存 BUCKET_N 的 JSON 解析结果，避免每个请求都全量 parse 一遍
-const bucketVarsCache = new WeakMap();
-
-function loadConfig(env) {
-  let parsed = env && typeof env === 'object' ? bucketVarsCache.get(env) : null;
-  if (!parsed) {
-    parsed = parseBucketVars(env);
-    if (env && typeof env === 'object') bucketVarsCache.set(env, parsed);
-  }
-  const { buckets, problems } = parsed;
-
-  return {
-    // 挂载表：BUCKET_1..N，每个桶可属于不同的 B2 账号（各自 KEY_ID / APPLICATION_KEY / ENDPOINT）
-    buckets,
-    mountProblems: problems,
-    // 以下字段随请求按桶切换（applyBucket），这里仅是占位默认值
-    accessKeyId: '',
-    secretAccessKey: '',
-    endpointOrigin: '',
-    endpointHost: '',
-    region: '',
-    service: SERVICE,
-    urlStyle: String(env.URL_STYLE || 'path').toLowerCase() === 'virtual' ? 'virtual' : 'path',
-
-    bucketMode: 'fixed',
-    bucketFixed: '',
-
-    publicRead: readBool(env.PUBLIC_READ, true),
-    publicWrite: readBool(env.PUBLIC_WRITE, false),
-    // 匿名可读写的对象前缀；留空表示整个桶匿名可读（旧行为）
-    publicPrefix: normalizePrefix(env.PUBLIC_PREFIX === undefined ? 'share' : env.PUBLIC_PREFIX),
-    publicList: readBool(env.PUBLIC_LIST, true),
-    allowList: readBool(env.ALLOW_LIST_BUCKET, false),
-    enableWrite: readBool(env.ENABLE_WRITE, true),
-    enableDelete: readBool(env.ENABLE_DELETE, true),
-    enableManage: readBool(env.ENABLE_MANAGE, true),
-    // 匿名信息收敛：隐藏桶名 / 区域，并剥离 B2 内部响应头
-    hideDetails: readBool(env.HIDE_BUCKET_INFO, true),
-    // 隐藏目录占位对象（<prefix>/.keep），目录页与管理器列表都不显示
-    hideKeep: readBool(env.HIDE_KEEP_FILES, true),
-    stripUpstreamMeta: readBool(env.STRIP_UPSTREAM_META, true),
-    // 匿名访问目录时的行为：deny(返回403 JSON，默认) | redirect(302到管理器) | welcome(渲染引导页)
-    rootAction: ['deny', 'redirect', 'welcome'].includes(String(env.ROOT_ACTION || 'deny').toLowerCase())
-      ? String(env.ROOT_ACTION).toLowerCase() : 'deny',
-
-    cacheMaxAge: readInt(env.CACHE_MAX_AGE, 86400),
-    useCache: readBool(env.ENABLE_CACHE, true),
-    rcloneDownload: readBool(env.RCLONE_DOWNLOAD, false),
-
-    // Workers 请求体上限是十进制 100MB（100,000,000 字节），不是 100 MiB；
-    // 默认再留 4MB 余量，避免上传到 99.9% 时被平台掐断（表现为连接中断 / HTTP 000）
-    maxUploadBytes: readInt(env.MAX_UPLOAD_BYTES, 96 * 1000 * 1000),
-    // Worker 代理分片上传的并发数
-    uploadConcurrency: Math.max(1, Math.min(10, readInt(env.UPLOAD_CONCURRENCY, 3))),
-    presignExpires: readInt(env.PRESIGN_EXPIRES, 3600),
-    // 直传超过该体积 → 走并发分片。实测 B2 单次 PUT 上限为 100 MiB（104857600 字节），
-    // 超过会被上游中断（500 InternalError / 连接被切断），故默认 100000000 并强制钳制在 100MiB 以下
-    multipartThreshold: Math.min(readInt(env.MULTIPART_THRESHOLD, 100 * 1000 * 1000), 100 * 1024 * 1024 - 1),
-    multipartPartSize: readInt(env.MULTIPART_PART_SIZE, 25 * 1024 * 1024),
-
-    /* ---- B2 用量面板 ---- */
-    enableUsage: readBool(env.ENABLE_USAGE_PANEL, true),
-    // 「总空间」基准：默认按 B2 免费额度 10 GB（十进制）展示进度
-    storageQuotaBytes: Math.max(0, readInt(env.STORAGE_QUOTA_BYTES, 10 * 1000 * 1000 * 1000)),
-    // 空间扫描结果缓存时长（秒），默认 6 小时（仅 usageAutoScan=true 时用作过期判断）
-    usageCacheTtl: Math.max(60, readInt(env.USAGE_CACHE_TTL, 21600)),
-    // 单次扫描最多翻多少页（每页 1000 个对象 = 1 次 Class C）
-    usageScanMaxPages: Math.max(1, Math.min(200, readInt(env.USAGE_SCAN_MAX_PAGES, 20))),
-    // 空间统计模式：
-    //   false（默认）= 快照只由 Cron（scheduled）刷新；首次读取若还没有快照会引导性扫一次
-    //   true         = 额外允许惰性自动扫描（TTL 过期或落入窗口）
-    // 注：已移除"手动重新统计"，任何请求路径都不会强制重扫
-    usageAutoScan: readBool(env.USAGE_AUTO_SCAN, false),
-    // 惰性窗口（仅 usageAutoScan=true 时生效）：UTC 进入该小时后当天第一次读取强制重扫（-1 关闭）
-    usageRefreshHour: (() => {
-      const hour = readInt(env.USAGE_REFRESH_AT_UTC_HOUR, -1);
-      return hour >= 0 && hour <= 23 ? hour : -1;
-    })(),
-    // 定时统计的桶列表：直接来自挂载表（BUCKET_1..N）
-    usageScheduleBuckets: [],
-    // scheduled() 里「刷新空间快照」的 UTC 小时（逗号分隔；* = 每次触发都做；- = 从不）
-    usageScanHours: parseHourList(env.USAGE_SCAN_HOURS, '23'),
-    // scheduled() 里「重置 Class A/B/C/D 计数」的 UTC 小时。
-    // 默认与 USAGE_SCAN_HOURS 相同（23）→ 一条 cron 同时完成"统计 + 归零"；
-    // 计数区间 = 昨天 23:00 → 今天 23:00，与 B2 官方 00:00 GMT 有 1 小时偏移
-    usageResetHours: parseHourList(env.USAGE_RESET_HOURS, '23'),
-    // Durable Object 计数：每累计多少次增量才落盘（1 = 每次请求都落盘，最精确）
-    usageDoWriteEvery: Math.max(1, Math.min(100, readInt(env.USAGE_DO_WRITE_EVERY, 1))),
-    // 每日额度（B2 免费账户的 Class B/C 各 2500 次/天，按你账户实际套餐调整）
-    classBQuota: Math.max(0, readInt(env.CLASS_B_DAILY_QUOTA, 2500)),
-    classCQuota: Math.max(0, readInt(env.CLASS_C_DAILY_QUOTA, 2500)),
-
-    adminUser: String(env.ADMIN_USER || ''),
-    adminPass: String(env.ADMIN_PASS || ''),
-    adminToken: String(env.ADMIN_TOKEN || ''),
-    uploadCacheControl: String(env.UPLOAD_CACHE_CONTROL || ''),
-    allowedOrigins: String(env.ALLOWED_ORIGINS || '*').trim(),
-    debug: readBool(env.DEBUG, false),
-  };
-}
-
-/* ---- 多桶挂载表 ---- */
-
-/** 桶名不能占用这些路径段（大小写不敏感） */
-const RESERVED_MOUNTS = new Set(['share', '__api', '__manage']);
-
-/** 解析 BUCKET_1..N 环境变量（JSON：BUCKET_NAME / KEY_ID / APPLICATION_KEY / ENDPOINT）。
- *  单个变量有问题只跳过该桶并记录，不影响其它桶。 */
-function parseBucketVars(env) {
-  const buckets = [];
-  const problems = [];
-  for (const key of Object.keys(env)) {
-    if (!/^BUCKET_\d+$/.test(key)) continue;
-    const ordinal = parseInt(key.slice(7), 10);
-    const fail = (msg) => problems.push(key + '：' + msg);
-    let raw;
-    try {
-      raw = JSON.parse(String(env[key]));
-    } catch {
-      fail('值不是合法 JSON');
-      continue;
-    }
-    if (!raw || typeof raw !== 'object') { fail('值应为 JSON 对象'); continue; }
-    const name = String(raw.BUCKET_NAME || '').trim().toLowerCase();
-    const keyId = String(raw.KEY_ID || '').trim();
-    const appKey = String(raw.APPLICATION_KEY || '').trim();
-    const endpoint = String(raw.ENDPOINT || '').trim().replace(/\/+$/, '');
-    const label = String(raw.LABEL || '').trim();
-    if (!name) { fail('缺少 BUCKET_NAME'); continue; }
-    if (!/^[a-z0-9][a-z0-9.-]*$/.test(name)) { fail('桶名不合法：' + name); continue; }
-    if (RESERVED_MOUNTS.has(name)) { fail('桶名是保留字：' + name); continue; }
-    if (!keyId || !appKey) { fail('缺少 KEY_ID / APPLICATION_KEY'); continue; }
-    if (!endpoint || !/^https:\/\//.test(endpoint)) { fail('缺少或非法 ENDPOINT'); continue; }
-    if (buckets.some((b) => b.name === name)) { fail('桶名与其它变量重复：' + name); continue; }
-    buckets.push({ name, keyId, appKey, endpoint, ordinal, label: label || name });
-  }
-  buckets.sort((a, b) => a.ordinal - b.ordinal);
-  return { buckets, problems };
-}
-
-// endpoint 字符串到 {origin,host,region} 的解析结果可跨请求复用（同一 isolate 内 endpoint 数量极少）
-const endpointInfoCache = new Map();
-
-function endpointInfo(rawEndpoint) {
-  const cached = endpointInfoCache.get(rawEndpoint);
-  if (cached) return cached;
-  const endpoint = new URL(rawEndpoint);
-  const hostParts = endpoint.hostname.split('.');
-  const region = hostParts[0] === 's3' && hostParts.length > 2
-    ? hostParts.slice(1, -2).join('.')
-    : 'us-west-001';
-  const info = { origin: endpoint.origin, host: endpoint.hostname, region };
-  endpointInfoCache.set(rawEndpoint, info);
-  return info;
-}
-
-/** 把全局 cfg 原地切换成指定桶的视图（凭据 / endpoint / 桶名）。
- *  浅拷贝保留 cfg.usage 引用 → 同一请求内跨桶的调用都记进同一份计数。 */
-function applyBucket(cfg, name) {
-  const m = cfg.buckets.find((b) => b.name === name);
-  if (!m) return null;
-  const info = endpointInfo(m.endpoint);
-  cfg.accessKeyId = m.keyId;
-  cfg.secretAccessKey = m.appKey;
-  cfg.endpointOrigin = info.origin;
-  cfg.endpointHost = info.host;
-  cfg.region = info.region;
-  cfg.bucketFixed = m.name;
-  cfg.primaryBucket = m.name;
-  return cfg;
-}
-
-/** 独立的每桶视图（不改动请求级 cfg），给「遍历所有桶」的场景用 */
-function bucketView(cfg, m) {
-  const info = endpointInfo(m.endpoint);
-  return {
-    ...cfg,
-    accessKeyId: m.keyId,
-    secretAccessKey: m.appKey,
-    endpointOrigin: info.origin,
-    endpointHost: info.host,
-    region: info.region,
-    bucketFixed: m.name,
-    usage: { counts: {} },
-  };
-}
-
-/**
- * 把 URL 路径解析成挂载视图：
- *   /                → kind=root        （虚拟根：桶总览）
- *   /share           → kind=shareRoot   （虚拟公开根）
- *   /share/<b>/…     → kind=bucket      别名挂载：桶 b 的 share/… 前缀
- *   /<b>/…           → kind=bucket      正常挂载：桶 b 的 …
- *   其它             → kind=miss        （未挂载的首段）
- */
-function resolveMount(cfg, pathname) {
-  let segs;
-  try {
-    segs = pathname.split('/').filter(Boolean).map((s) => decodeURIComponent(s));
-  } catch {
-    return { kind: 'bad' };
-  }
-  if (segs.some((s) => s === '.' || s === '..' || s.includes('\0'))) return { kind: 'bad' };
-  if (!segs.length) return { kind: 'root' };
-  const trailingSlash = pathname.endsWith('/');
-  const join = (arr) => '/' + arr.join('/') + (trailingSlash || arr.length === 0 ? '/' : '');
-
-  if (segs[0].toLowerCase() === 'share') {
-    if (segs.length === 1) return { kind: 'shareRoot' };
-    const m = cfg.buckets.find((b) => b.name === segs[1].toLowerCase());
-    if (!m) return { kind: 'miss', name: segs[1] };
-    return { kind: 'bucket', m, alias: true, inner: join(['share', ...segs.slice(2)]) };
-  }
-  const m = cfg.buckets.find((b) => b.name === segs[0].toLowerCase());
-  if (!m) return { kind: 'miss', name: segs[0] };
-  return { kind: 'bucket', m, alias: false, inner: join(segs.slice(1)) };
-}
-
-/** 匿名访问 /share/** 以外路径时的智能重定向目标 */
-function smartPublicRedirect(mount) {
-  if (mount && mount.kind === 'bucket' && !mount.alias && mount.m) {
-    const rest = mount.inner.replace(/^\/+/, '');
-    if (rest === 'share' || rest.startsWith('share/')) {
-      const tail = rest === 'share' ? '' : rest.slice('share/'.length);
-      return '/share/' + mount.m.name + (tail ? '/' + tail : '/');
-    }
-  }
-  return '/share/';
-}
 
 function corsHeaders(request, cfg) {
   const origin = request.headers.get('origin');
@@ -619,6 +391,12 @@ function challenge(request, cfg) {
  * 校验管理权限：Bearer(ADMIN_TOKEN) > Basic(ADMIN_USER/ADMIN_PASS)
  * 未配置任何凭据时一律默认拒绝，避免误把私有桶变成公共网盘。
  */
+
+/* ---------- src/lib/auth.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L622-L674 */
+
+
+
 async function checkAuth(request, cfg) {
   if (cfg.publicWrite) return { ok: true, mode: 'public' };
   // Basic 模式要求用户名与密码同时配置：只配其一（例如漏配 ADMIN_USER）会退化成「空用户名 + 密码」，
@@ -672,6 +450,14 @@ function signerOf(cfg) {
 }
 
 /** 拼接对象 URL（默认 path-style，兼容性最好） */
+
+/* ---------- src/lib/b2.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L675-L1057 */
+
+
+
+
+
 function objectUrl(cfg, bucket, key) {
   const encodedKey = normalizeKey(key).split('/').map((seg) => uriEncode(seg, false)).join('/');
   if (cfg.urlStyle === 'virtual' && !bucket.includes('.')) {
@@ -1055,12 +841,31 @@ async function multipartAbort(cfg, bucket, key, uploadId) {
  * 打开管理页只读已有快照，不主动打 B2。
  */
 
-const USAGE_CACHE_ORIGIN = 'https://usage.internal';
+/* ---------- src/lib/prefix.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L278-L296 */
 
-/** UTC 日期戳（与 B2 计数器 00:00 GMT 重置对齐） */
-function utcDayStamp(date = new Date()) {
-  return date.toISOString().slice(0, 10);
+function normalizePrefix(value) {
+  if (value === undefined || value === null) return '';
+  return String(value).trim().replace(/^\/+/, '').replace(/\/+$/, '');
 }
+
+/** key/prefix 是否位于指定前缀内（share 与 share/a.txt 均算命中） */
+function withinPrefix(key, prefix) {
+  if (!prefix) return true;
+  const target = String(key || '');
+  return target === prefix || target.startsWith(prefix + '/');
+}
+
+/** 拼出带尾斜杠的前缀，用于生成链接 */
+function prefixWithSlash(prefix) {
+  return prefix ? prefix + '/' : '';
+}
+
+/** 公开目录的基础路径（$path 模式下需要带上桶名段） */
+/** 会暴露后端实现/对象内部信息的响应头，统一剥离 */
+
+/* ---------- src/lib/hours.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L1065-L1092 */
 
 /**
  * 解析 scheduled() 里的小时列表：
@@ -1090,6 +895,257 @@ function hourListLabel(spec) {
   if (spec.mode === 'always') return '每次触发';
   return spec.hours.slice().sort((a, b) => a - b).map((h) => h + ':00').join('、') + ' UTC';
 }
+
+/* ---------- src/lib/config.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L335-L563 */
+
+
+
+
+
+const bucketVarsCache = new WeakMap();
+
+function loadConfig(env) {
+  let parsed = env && typeof env === 'object' ? bucketVarsCache.get(env) : null;
+  if (!parsed) {
+    parsed = parseBucketVars(env);
+    if (env && typeof env === 'object') bucketVarsCache.set(env, parsed);
+  }
+  const { buckets, problems } = parsed;
+
+  return {
+    // 挂载表：BUCKET_1..N，每个桶可属于不同的 B2 账号（各自 KEY_ID / APPLICATION_KEY / ENDPOINT）
+    buckets,
+    mountProblems: problems,
+    // 以下字段随请求按桶切换（applyBucket），这里仅是占位默认值
+    accessKeyId: '',
+    secretAccessKey: '',
+    endpointOrigin: '',
+    endpointHost: '',
+    region: '',
+    service: SERVICE,
+    urlStyle: String(env.URL_STYLE || 'path').toLowerCase() === 'virtual' ? 'virtual' : 'path',
+
+    bucketMode: 'fixed',
+    bucketFixed: '',
+
+    publicRead: readBool(env.PUBLIC_READ, true),
+    publicWrite: readBool(env.PUBLIC_WRITE, false),
+    // 匿名可读写的对象前缀；留空表示整个桶匿名可读（旧行为）
+    publicPrefix: normalizePrefix(env.PUBLIC_PREFIX === undefined ? 'share' : env.PUBLIC_PREFIX),
+    publicList: readBool(env.PUBLIC_LIST, true),
+    allowList: readBool(env.ALLOW_LIST_BUCKET, false),
+    enableWrite: readBool(env.ENABLE_WRITE, true),
+    enableDelete: readBool(env.ENABLE_DELETE, true),
+    enableManage: readBool(env.ENABLE_MANAGE, true),
+    // 匿名信息收敛：隐藏桶名 / 区域，并剥离 B2 内部响应头
+    hideDetails: readBool(env.HIDE_BUCKET_INFO, true),
+    // 隐藏目录占位对象（<prefix>/.keep），目录页与管理器列表都不显示
+    hideKeep: readBool(env.HIDE_KEEP_FILES, true),
+    stripUpstreamMeta: readBool(env.STRIP_UPSTREAM_META, true),
+    // 匿名访问目录时的行为：deny(返回403 JSON，默认) | redirect(302到管理器) | welcome(渲染引导页)
+    rootAction: ['deny', 'redirect', 'welcome'].includes(String(env.ROOT_ACTION || 'deny').toLowerCase())
+      ? String(env.ROOT_ACTION).toLowerCase() : 'deny',
+
+    cacheMaxAge: readInt(env.CACHE_MAX_AGE, 86400),
+    useCache: readBool(env.ENABLE_CACHE, true),
+    rcloneDownload: readBool(env.RCLONE_DOWNLOAD, false),
+
+    // Workers 请求体上限是十进制 100MB（100,000,000 字节），不是 100 MiB；
+    // 默认再留 4MB 余量，避免上传到 99.9% 时被平台掐断（表现为连接中断 / HTTP 000）
+    maxUploadBytes: readInt(env.MAX_UPLOAD_BYTES, 96 * 1000 * 1000),
+    // Worker 代理分片上传的并发数
+    uploadConcurrency: Math.max(1, Math.min(10, readInt(env.UPLOAD_CONCURRENCY, 3))),
+    presignExpires: readInt(env.PRESIGN_EXPIRES, 3600),
+    // 直传超过该体积 → 走并发分片。实测 B2 单次 PUT 上限为 100 MiB（104857600 字节），
+    // 超过会被上游中断（500 InternalError / 连接被切断），故默认 100000000 并强制钳制在 100MiB 以下
+    multipartThreshold: Math.min(readInt(env.MULTIPART_THRESHOLD, 100 * 1000 * 1000), 100 * 1024 * 1024 - 1),
+    multipartPartSize: readInt(env.MULTIPART_PART_SIZE, 25 * 1024 * 1024),
+
+    /* ---- B2 用量面板 ---- */
+    enableUsage: readBool(env.ENABLE_USAGE_PANEL, true),
+    // 「总空间」基准：默认按 B2 免费额度 10 GB（十进制）展示进度
+    storageQuotaBytes: Math.max(0, readInt(env.STORAGE_QUOTA_BYTES, 10 * 1000 * 1000 * 1000)),
+    // 空间扫描结果缓存时长（秒），默认 6 小时（仅 usageAutoScan=true 时用作过期判断）
+    usageCacheTtl: Math.max(60, readInt(env.USAGE_CACHE_TTL, 21600)),
+    // 单次扫描最多翻多少页（每页 1000 个对象 = 1 次 Class C）
+    usageScanMaxPages: Math.max(1, Math.min(200, readInt(env.USAGE_SCAN_MAX_PAGES, 20))),
+    // 空间统计模式：
+    //   false（默认）= 快照只由 Cron（scheduled）刷新；首次读取若还没有快照会引导性扫一次
+    //   true         = 额外允许惰性自动扫描（TTL 过期或落入窗口）
+    // 注：已移除"手动重新统计"，任何请求路径都不会强制重扫
+    usageAutoScan: readBool(env.USAGE_AUTO_SCAN, false),
+    // 惰性窗口（仅 usageAutoScan=true 时生效）：UTC 进入该小时后当天第一次读取强制重扫（-1 关闭）
+    usageRefreshHour: (() => {
+      const hour = readInt(env.USAGE_REFRESH_AT_UTC_HOUR, -1);
+      return hour >= 0 && hour <= 23 ? hour : -1;
+    })(),
+    // 定时统计的桶列表：直接来自挂载表（BUCKET_1..N）
+    usageScheduleBuckets: [],
+    // scheduled() 里「刷新空间快照」的 UTC 小时（逗号分隔；* = 每次触发都做；- = 从不）
+    usageScanHours: parseHourList(env.USAGE_SCAN_HOURS, '23'),
+    // scheduled() 里「重置 Class A/B/C/D 计数」的 UTC 小时。
+    // 默认与 USAGE_SCAN_HOURS 相同（23）→ 一条 cron 同时完成"统计 + 归零"；
+    // 计数区间 = 昨天 23:00 → 今天 23:00，与 B2 官方 00:00 GMT 有 1 小时偏移
+    usageResetHours: parseHourList(env.USAGE_RESET_HOURS, '23'),
+    // Durable Object 计数：每累计多少次增量才落盘（1 = 每次请求都落盘，最精确）
+    usageDoWriteEvery: Math.max(1, Math.min(100, readInt(env.USAGE_DO_WRITE_EVERY, 1))),
+    // 每日额度（B2 免费账户的 Class B/C 各 2500 次/天，按你账户实际套餐调整）
+    classBQuota: Math.max(0, readInt(env.CLASS_B_DAILY_QUOTA, 2500)),
+    classCQuota: Math.max(0, readInt(env.CLASS_C_DAILY_QUOTA, 2500)),
+
+    adminUser: String(env.ADMIN_USER || ''),
+    adminPass: String(env.ADMIN_PASS || ''),
+    adminToken: String(env.ADMIN_TOKEN || ''),
+    uploadCacheControl: String(env.UPLOAD_CACHE_CONTROL || ''),
+    allowedOrigins: String(env.ALLOWED_ORIGINS || '*').trim(),
+    debug: readBool(env.DEBUG, false),
+  };
+}
+
+/* ---- 多桶挂载表 ---- */
+
+/** 桶名不能占用这些路径段（大小写不敏感） */
+const RESERVED_MOUNTS = new Set(['share', '__api', '__manage']);
+
+/** 解析 BUCKET_1..N 环境变量（JSON：BUCKET_NAME / KEY_ID / APPLICATION_KEY / ENDPOINT）。
+ *  单个变量有问题只跳过该桶并记录，不影响其它桶。 */
+function parseBucketVars(env) {
+  const buckets = [];
+  const problems = [];
+  for (const key of Object.keys(env)) {
+    if (!/^BUCKET_\d+$/.test(key)) continue;
+    const ordinal = parseInt(key.slice(7), 10);
+    const fail = (msg) => problems.push(key + '：' + msg);
+    let raw;
+    try {
+      raw = JSON.parse(String(env[key]));
+    } catch {
+      fail('值不是合法 JSON');
+      continue;
+    }
+    if (!raw || typeof raw !== 'object') { fail('值应为 JSON 对象'); continue; }
+    const name = String(raw.BUCKET_NAME || '').trim().toLowerCase();
+    const keyId = String(raw.KEY_ID || '').trim();
+    const appKey = String(raw.APPLICATION_KEY || '').trim();
+    const endpoint = String(raw.ENDPOINT || '').trim().replace(/\/+$/, '');
+    const label = String(raw.LABEL || '').trim();
+    if (!name) { fail('缺少 BUCKET_NAME'); continue; }
+    if (!/^[a-z0-9][a-z0-9.-]*$/.test(name)) { fail('桶名不合法：' + name); continue; }
+    if (RESERVED_MOUNTS.has(name)) { fail('桶名是保留字：' + name); continue; }
+    if (!keyId || !appKey) { fail('缺少 KEY_ID / APPLICATION_KEY'); continue; }
+    if (!endpoint || !/^https:\/\//.test(endpoint)) { fail('缺少或非法 ENDPOINT'); continue; }
+    if (buckets.some((b) => b.name === name)) { fail('桶名与其它变量重复：' + name); continue; }
+    buckets.push({ name, keyId, appKey, endpoint, ordinal, label: label || name });
+  }
+  buckets.sort((a, b) => a.ordinal - b.ordinal);
+  return { buckets, problems };
+}
+
+// endpoint 字符串到 {origin,host,region} 的解析结果可跨请求复用（同一 isolate 内 endpoint 数量极少）
+const endpointInfoCache = new Map();
+
+function endpointInfo(rawEndpoint) {
+  const cached = endpointInfoCache.get(rawEndpoint);
+  if (cached) return cached;
+  const endpoint = new URL(rawEndpoint);
+  const hostParts = endpoint.hostname.split('.');
+  const region = hostParts[0] === 's3' && hostParts.length > 2
+    ? hostParts.slice(1, -2).join('.')
+    : 'us-west-001';
+  const info = { origin: endpoint.origin, host: endpoint.hostname, region };
+  endpointInfoCache.set(rawEndpoint, info);
+  return info;
+}
+
+/** 把全局 cfg 原地切换成指定桶的视图（凭据 / endpoint / 桶名）。
+ *  浅拷贝保留 cfg.usage 引用 → 同一请求内跨桶的调用都记进同一份计数。 */
+function applyBucket(cfg, name) {
+  const m = cfg.buckets.find((b) => b.name === name);
+  if (!m) return null;
+  const info = endpointInfo(m.endpoint);
+  cfg.accessKeyId = m.keyId;
+  cfg.secretAccessKey = m.appKey;
+  cfg.endpointOrigin = info.origin;
+  cfg.endpointHost = info.host;
+  cfg.region = info.region;
+  cfg.bucketFixed = m.name;
+  cfg.primaryBucket = m.name;
+  return cfg;
+}
+
+/** 独立的每桶视图（不改动请求级 cfg），给「遍历所有桶」的场景用 */
+function bucketView(cfg, m) {
+  const info = endpointInfo(m.endpoint);
+  return {
+    ...cfg,
+    accessKeyId: m.keyId,
+    secretAccessKey: m.appKey,
+    endpointOrigin: info.origin,
+    endpointHost: info.host,
+    region: info.region,
+    bucketFixed: m.name,
+    usage: { counts: {} },
+  };
+}
+
+/**
+ * 把 URL 路径解析成挂载视图：
+ *   /                → kind=root        （虚拟根：桶总览）
+ *   /share           → kind=shareRoot   （虚拟公开根）
+ *   /share/<b>/…     → kind=bucket      别名挂载：桶 b 的 share/… 前缀
+ *   /<b>/…           → kind=bucket      正常挂载：桶 b 的 …
+ *   其它             → kind=miss        （未挂载的首段）
+ */
+function resolveMount(cfg, pathname) {
+  let segs;
+  try {
+    segs = pathname.split('/').filter(Boolean).map((s) => decodeURIComponent(s));
+  } catch {
+    return { kind: 'bad' };
+  }
+  if (segs.some((s) => s === '.' || s === '..' || s.includes('\0'))) return { kind: 'bad' };
+  if (!segs.length) return { kind: 'root' };
+  const trailingSlash = pathname.endsWith('/');
+  const join = (arr) => '/' + arr.join('/') + (trailingSlash || arr.length === 0 ? '/' : '');
+
+  if (segs[0].toLowerCase() === 'share') {
+    if (segs.length === 1) return { kind: 'shareRoot' };
+    const m = cfg.buckets.find((b) => b.name === segs[1].toLowerCase());
+    if (!m) return { kind: 'miss', name: segs[1] };
+    return { kind: 'bucket', m, alias: true, inner: join(['share', ...segs.slice(2)]) };
+  }
+  const m = cfg.buckets.find((b) => b.name === segs[0].toLowerCase());
+  if (!m) return { kind: 'miss', name: segs[0] };
+  return { kind: 'bucket', m, alias: false, inner: join(segs.slice(1)) };
+}
+
+/** 匿名访问 /share/** 以外路径时的智能重定向目标 */
+function smartPublicRedirect(mount) {
+  if (mount && mount.kind === 'bucket' && !mount.alias && mount.m) {
+    const rest = mount.inner.replace(/^\/+/, '');
+    if (rest === 'share' || rest.startsWith('share/')) {
+      const tail = rest === 'share' ? '' : rest.slice('share/'.length);
+      return '/share/' + mount.m.name + (tail ? '/' + tail : '/');
+    }
+  }
+  return '/share/';
+}
+
+/* ---------- src/lib/usage.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L1058-L1063、原 L1093-L1654 */
+
+
+
+
+
+const USAGE_CACHE_ORIGIN = 'https://usage.internal';
+
+/** UTC 日期戳（与 B2 计数器 00:00 GMT 重置对齐） */
+function utcDayStamp(date = new Date()) {
+  return date.toISOString().slice(0, 10);
+}
+
 
 /**
  * 是否该在「归零前窗口」补一次空间扫描：UTC 进入 windowHour 之后，
@@ -1167,7 +1223,7 @@ async function doCall(stub, action, payload) {
  * 不做「下次请求发现日期变了就归零」的惰性归零，也不用日期分键。
  * 含义：如果 Cron 没配/没跑，计数会持续累加不清零（要靠 Cron 保证）。
  */
-export class UsageCounter {
+class UsageCounter {
   constructor(state, env) {
     this.state = state;
     this.env = env;
@@ -1652,6 +1708,10 @@ async function runScheduled(event, env) {
 /* ---- B2 原生 API（控制面，免费、不计 Class A-D）：桶级 CORS 配置 ---- */
 
 /** b2_authorize_account：用桶自己的应用密钥换取控制面令牌 */
+
+/* ---------- src/lib/b2-native.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L1655-L1739 */
+
 async function b2Authorize(cfg) {
   const basic = 'Basic ' + btoa(cfg.accessKeyId + ':' + cfg.secretAccessKey);
   const res = await fetch('https://api.backblazeb2.com/b2api/v2/b2_authorize_account', {
@@ -1737,6 +1797,19 @@ async function readJsonBody(request) {
 }
 
 /** API 场景下的桶名解析：支持 /<bucket>/__api/...、/share/<bucket>/__api/... 与 ?bucket= 三种写法 */
+
+/* ---------- src/api.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L1740-L2087 */
+
+
+
+
+
+
+
+
+
+
 function resolveApiBucket(cfg, basePath, url) {
   const segs = basePath.split('/').filter(Boolean);
   let name = '';
@@ -2085,6 +2158,9 @@ async function apiRouter(request, env, ctx, cfg, url) {
 
 /* ============================ 7. 目录列表页 ============================ */
 
+/* ---------- src/ui/theme.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L2088-L2157 */
+
 function escapeHtml(str) {
   return String(str).split('&').join('&amp;').split('<').join('&lt;')
     .split('>').join('&gt;').split('"').join('&quot;');
@@ -2155,250 +2231,11 @@ function humanSize(bytes) {
 }
 
 /** 公开目录页：服务端渲染首页 + 滚动到底部自动加载后续页（瀑布流） */
-function renderDirectory(data, prefix, opts = {}) {
-  const base = opts.base || '/';
-  const baseLabel = opts.label || '';
-  const showManage = opts.showManage !== false;
-  const hideKeep = opts.hideKeep !== false;
-  const publicPrefix = opts.publicPrefix || '';
-  // 管理员删除目录用的 API 基址（挂载点感知：/<桶>/__api/ 或 /share/<桶>/__api/）
-  const apiBase = base.replace(/\/+$/, '') + API_PREFIX;
-  const bucketName = opts.bucket || '';
 
-  const rows = [];
-  // 目录占位对象（<prefix>/.keep）不参与展示与计数
-  const files = hideKeep ? data.files.filter((f) => f.name !== '.keep') : data.files;
+/* ---------- src/ui/manage.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L2403-L3213 */
 
-  /* 路径导航：挂载点段（crumbPre，由调用方按挂载方式给出）+ 相对段（relPrefix），每一级都可点击 */
-  const crumbPre = Array.isArray(opts.crumbPre) ? opts.crumbPre : [];
-  const relPrefix = opts.relPrefix !== undefined ? opts.relPrefix : prefix;
-  const crumbs = crumbPre.map((c) => '<a href="' + escapeHtml(c.href) + '">' + escapeHtml(c.label) + '</a>');
-  const segs = relPrefix.replace(/\/+$/, '').split('/').filter(Boolean);
-  let acc = '';
-  segs.forEach((seg, i) => {
-    acc += seg + '/';
-    crumbs.push(i === segs.length - 1
-      ? '<span class="cur">' + escapeHtml(seg) + '</span>'
-      : '<a href="' + base + escapeHtml(acc) + '">' + escapeHtml(seg) + '</a>');
-  });
-  if (!crumbs.length) crumbs.push('<span class="cur">/</span>');
-  const crumbsHtml = '<nav class="crumb">' + crumbs.join('<span class="sep">/</span>') + '</nav>';
 
-  if (relPrefix.replace(/\/+$/, '')) {
-    // 注意 relPrefix 形如 "images/"，先去尾斜杠再取父级，否则会算成自己
-    const parent = relPrefix.replace(/\/+$/, '').split('/').slice(0, -1).join('/');
-    rows.push('<tr><td colspan="4"><a href="' + base
-      + escapeHtml(parent ? parent + '/' : '') + '">返回上一级</a></td></tr>');
-  } else if (opts.upHref) {
-    // 已在挂载根：返回到虚拟根（/ 或 /share/）
-    rows.push('<tr><td colspan="4"><a href="' + escapeHtml(opts.upHref) + '">返回上一级</a></td></tr>');
-  }
-
-  for (const folder of data.folders) {
-    // 相对挂载点（已去掉 share/ 这类别名偏移）：href 基于挂载根 base 拼接，且保留尾斜杠（目录链接）；
-    // 显示名 name 才需要去尾斜杠。不能再加完整列举前缀，否则别名下会出现 /share/<桶>/share/… 双前缀。
-    const rel = relPrefix + folder.slice(prefix.length);
-    const name = folder.slice(prefix.length).replace(/\/$/, '');
-    // 匿名不给任何操作（连 JSON 也不暴露）；管理员给「删除」（删掉该目录的 .keep 占位）
-    const dirAct = showManage
-      ? '<td><button data-act="deldir" data-k="' + escapeHtml(folder + '.keep') + '">删除</button></td>'
-      : '<td></td>';
-    rows.push('<tr class="dir"><td><a href="' + base + escapeHtml(rel) + '">' + escapeHtml(name) + '/</a></td>'
-      + '<td>-</td><td>-</td>'
-      + dirAct + '</tr>');
-  }
-
-  for (const file of files) {
-    const href = base + escapeHtml(relPrefix + file.name);
-    rows.push('<tr><td>[FILE] <a href="' + href + '">' + escapeHtml(file.name) + '</a></td>'
-      + '<td>' + humanSize(file.size) + '</td>'
-      + '<td>' + escapeHtml(file.lastModified) + '</td>'
-      + '<td><a href="' + href + '">下载</a></td></tr>');
-  }
-
-  const initCount = data.folders.length + files.length;
-  const cfgJson = inlineJson({
-    prefix, base, relPrefix, apiBase, bucket: bucketName,
-    showManage: !!showManage,
-    next: data.truncated ? (data.nextToken || '') : '', loaded: initCount,
-    hideKeep: !!hideKeep,
-  });
-
-  const script = [
-    '(function () {',
-    'var C = ' + cfgJson + ';',
-    'var NEXT = C.next, LOADING = false, LOADED = C.loaded;',
-    'function esc(s) {',
-    '  return String(s).split("&").join("&amp;").split("<").join("&lt;")',
-    '    .split(">").join("&gt;").split(String.fromCharCode(34)).join("&quot;");',
-    '}',
-    'function human(b) {',
-    '  if (!b) return "0 B";',
-    '  var u = ["B","KB","MB","GB","TB"], v = b, i = 0;',
-    '  while (v >= 1024 && i < u.length - 1) { v = v / 1024; i++; }',
-    '  return v.toFixed(i ? 1 : 0) + " " + u[i];',
-    '}',
-    'function rowsHtml(d) {',
-    '  var out = "";',
-    '  (d.folders || []).forEach(function (p) {',
-    '    var name = p.slice(C.prefix.length);',
-    '    var rel = C.relPrefix + p.slice(C.prefix.length);',
-    '    if (name.charAt(name.length - 1) === "/") name = name.slice(0, -1);',
-    '    var act = C.showManage',
-    '      ? \'<td><button data-act="deldir" data-k="\' + esc(p + \'.keep\') + \'">删除</button></td>\'',
-    '      : \'<td></td>\';',
-    '    out += \'<tr class="dir"><td><a href="\' + C.base + esc(rel) + \'">\' + esc(name) + \'/</a></td>\'',
-    '      + \'<td>-</td><td>-</td>\'',
-    '      + act + \'</tr>\';',
-    '  });',
-    '  (d.files || []).filter(function (f) { return !(C.hideKeep && f.name === ".keep"); })',
-    '    .forEach(function (f) {',
-    '    var href = C.base + esc(C.relPrefix + f.name);',
-    '    out += \'<tr><td>[FILE] <a href="\' + href + \'">\' + esc(f.name) + \'</a></td>\'',
-    '      + "<td>" + human(f.size) + "</td>"',
-    '      + \'<td class="muted">\' + esc(f.lastModified) + "</td>"',
-    '      + \'<td><a href="\' + href + \'">下载</a></td></tr>\';',
-    '  });',
-    '  return out;',
-    '}',
-    'function paint() {',
-    '  document.getElementById("status").innerHTML = LOADING',
-    '    ? \'<span class="spin"></span> 正在加载…\'',
-    '    : (NEXT ? "已加载 " + LOADED + " 项 · 继续往下滚动加载更多" : "已加载 " + LOADED + " 项 · 到底了");',
-    '}',
-    '/* 请求一律用绝对 URL。若页面是通过 https://user:pass@host/… 打开的（书签里带了凭据），',
-    '   相对 URL 会让 fetch 直接抛 “Request cannot be constructed from a URL that includes credentials”，',
-    '   列表会一直卡在「正在加载…」。location.origin 不含凭据，同源请求浏览器会自动带上已缓存的 Basic 认证。 */',
-    'function absUrl(u) { return /^[a-z][a-z0-9+.-]*:\\/\\//i.test(u) ? u : location.origin + u; }',
-    'function more() {',
-    '  if (LOADING || !NEXT) return;',
-    '  LOADING = true; paint();',
-    '  fetch(absUrl(location.pathname + "?format=json&cursor=" + encodeURIComponent(NEXT)), { credentials: "same-origin" })',
-    '    .then(function (r) { return r.json(); })',
-    '    .then(function (d) {',
-    '      LOADING = false;',
-    '      if (!d || d.ok === false) { paint(); return; }',
-    '      NEXT = d.truncated ? (d.nextToken || "") : "";',
-    '      document.getElementById("tb").insertAdjacentHTML("beforeend", rowsHtml(d));',
-    '      LOADED += (d.folders || []).length + (d.files || []).filter(function (f) {',
-    '        return !(C.hideKeep && f.name === ".keep"); }).length;',
-    '      paint();',
-    '    })',
-    '    .catch(function () { LOADING = false; paint(); });',
-    '}',
-    'window.addEventListener("scroll", function () {',
-    '  if (LOADING || !NEXT) return;',
-    '  if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 300) more();',
-    '});',
-    '/* 管理员：删除目录（删掉该目录的 .keep 占位）。匿名页面不渲染这个按钮。 */',
-    'document.addEventListener("click", function (e) {',
-    '  var t = e.target;',
-    '  while (t && t !== document && t.tagName !== "BUTTON") t = t.parentNode;',
-    '  if (!t || t === document || t.getAttribute("data-act") !== "deldir") return;',
-    '  var k = t.getAttribute("data-k") || "";',
-    '  if (!k || !window.confirm("确认删除目录 " + k + " ？")) return;',
-    '  fetch(absUrl(C.apiBase + "object?key=" + encodeURIComponent(k) + "&bucket=" + encodeURIComponent(C.bucket || "")), {',
-    '    method: "DELETE", credentials: "same-origin",',
-    '  })',
-    '    .then(function (r) { return r.json(); })',
-    '    .then(function (j) {',
-    '      if (j && j.ok) location.reload();',
-    '      else window.alert("删除失败: " + ((j && j.error) || "未知错误"));',
-    '    })',
-    '    .catch(function () { window.alert("删除失败：网络错误"); });',
-    '});',
-    'paint();',
-    '})();',
-  ].join('\n');
-
-  return [
-    '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
-    '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    '<title>' + escapeHtml(relPrefix || '/') + ' - B2 Index</title>',
-    // 空 favicon：避免浏览器自动请求 /favicon.ico（会被当对象下载，白记 1 次 Class B）
-    '<link rel="icon" href="data:,">',
-    '<style>',
-    themeCss(),
-    'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0;padding:32px}',
-    '.wrap{max-width:900px;margin:0 auto}h1{font-size:18px;margin:0 0 4px}',
-    '.crumb{font-size:18px;font-weight:600;margin:0 0 6px;display:flex;flex-wrap:wrap;align-items:center;gap:6px}',
-    '.crumb a{color:var(--acc)}.crumb a:hover{text-decoration:underline}',
-    '.crumb .sep{color:var(--dim);font-weight:400}.crumb .cur{color:var(--txt)}',
-    '.sub{color:var(--dim);font-size:13px;margin-bottom:20px}',
-    '.top{display:flex;align-items:center;gap:10px;margin-bottom:18px}',
-    '.top .grow{flex:1}',
-    '#status{margin-top:16px;font-size:12px;color:var(--dim);display:flex;gap:8px;align-items:center;justify-content:center}',
-    '.spin{width:12px;height:12px;border:2px solid var(--line);border-top-color:var(--acc);border-radius:50%;display:inline-block;animation:sp .8s linear infinite}',
-    '@keyframes sp{to{transform:rotate(360deg)}}',
-    'button{font:inherit;color:var(--txt);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer}',
-    'table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}',
-    'td{padding:10px 14px;border-bottom:1px solid var(--line);font-size:14px}',
-    'tr:last-child td{border-bottom:0}tr:hover td{background:var(--hover)}',
-    'tr.dir td{background:var(--folder)}tr.dir:hover td{background:var(--hover)}',
-    'tr.dir td a{color:var(--folderTxt)}tr.dir td [data-act]{color:var(--folderTxt)}',
-    'a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}',
-    '.empty{color:var(--dim);padding:24px;text-align:center}.muted{color:var(--dim)}',
-    '</style></head><body><div class="wrap">',
-    '<div class="top"><button id="btnTheme">深色模式</button><span class="grow"></span></div>',
-    crumbsHtml,
-    '<div class="sub">' + data.folders.length + ' 个目录 / ' + files.length
-      + ' 个文件'
-      + (showManage ? ' · <a href="' + base + MANAGE_PATH.slice(1) + '">打开管理器</a>' : '')
-      + '</div>',
-    '<table><thead><tr><th style="text-align:left">名称</th><th>大小</th><th>修改时间</th><th></th></tr></thead>',
-    '<tbody id="tb">' + (rows.join('') || '<tr><td class="empty" colspan="4">（空）</td></tr>') + '</tbody></table>',
-    '<div id="status"></div>',
-    '</div>',
-    '<script>' + themeToggleScript() + '</script>',
-    '<script>' + script + '</script>',
-    '</body></html>',
-  ].join('\n');
-}
-
-/** 匿名访问未被授权目录时的引导页（ROOT_ACTION=welcome） */
-function welcomePage(cfg, bucketLabel, prefix, publicPath) {
-  const manageUrl = MANAGE_PATH;
-  const shareUrl = publicPath || '/';
-  return [
-    '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
-    '<meta name="viewport" content="width=device-width,initial-scale=1">',
-    '<title>B2 资源网关</title>',
-    // 空 favicon：避免浏览器自动请求 /favicon.ico（会被当对象下载，白记 1 次 Class B）
-    '<link rel="icon" href="data:,">',
-    '<style>',
-    themeCss(),
-    'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}',
-    '.card{max-width:560px;padding:32px 36px;background:var(--card);border:1px solid var(--line);border-radius:14px}',
-    '.thm{position:fixed;top:14px;right:14px}',
-    'button{font:inherit;color:var(--txt);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer}',
-    'h1{font-size:19px;margin:0 0 10px}p{color:var(--dim);line-height:1.7;font-size:14px;margin:6px 0}',
-    'code{background:var(--chip);padding:2px 6px;border-radius:5px;color:var(--acc)}',
-    'a{color:var(--acc)}',
-    '.btn{display:inline-block;margin-top:18px;padding:9px 16px;background:var(--acc);color:var(--btn);border-radius:8px;text-decoration:none;font-size:14px}',
-    'ul{color:var(--dim);font-size:13px;line-height:1.9;padding-left:18px}',
-    '</style></head><body>',
-    '<div class="thm"><button id="btnTheme">深色模式</button></div><div class="card">',
-    '<h1>📦 Backblaze B2 资源网关</h1>',
-    '<p>服务已就绪。请通过<strong>完整对象路径</strong>访问资源：</p>',
-    '<p>根路径 <code>/</code> 的目录浏览未对匿名开放。</p>',
-    '<ul>',
-    (cfg.publicPrefix
-      ? '<li>公开目录：<a href="' + shareUrl + '"><code>' + shareUrl + '</code></a>（匿名可直接下载）</li>'
-        + '<li>其他目录需登录后访问：<a href="' + manageUrl + '">打开 ' + manageUrl + '</a></li>'
-      : '<li>匿名下载：<code>/&lt;对象key&gt;</code>，例如 <code>/photos/a.jpg</code></li>'
-        + '<li>可视化管理：<a href="' + manageUrl + '">打开 ' + manageUrl + '</a></li>'),
-    '</ul>',
-    (cfg.hideDetails
-      ? '<p style="margin-top:14px">区域与桶信息已对用户隐藏。</p>'
-      : '<p style="margin-top:14px">当前桶：<code>' + escapeHtml(bucketLabel) + '</code>'
-        + (prefix ? ' · 前缀 <code>' + escapeHtml(prefix) + '</code>' : '')
-        + ' · 区域 <code>' + escapeHtml(cfg.region) + '</code></p>'),
-    '<a class="btn" href="' + manageUrl + '">进入文件管理器</a>',
-    '</div><script>' + themeToggleScript() + '</script></body></html>',
-  ].join('\n');
-}
-
-/* ============================ 8. 文件管理器页面 ============================ */
 
 function managePage(cfg, url) {
   // 管理器挂在挂载点下：/<bucket>/__manage 或别名 /share/<bucket>/__manage
@@ -3211,6 +3048,272 @@ function managePage(cfg, url) {
  * 请求入口：准备每请求独立的 cfg 与用量计数器，分发后异步把计数落盘。
  * 计数落盘放在 finally 里，因此出错路径产生的 B2 调用同样会被统计。
  */
+
+/* ---------- src/ui/directory.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L2158-L2402 */
+
+
+
+function renderDirectory(data, prefix, opts = {}) {
+  const base = opts.base || '/';
+  const baseLabel = opts.label || '';
+  const showManage = opts.showManage !== false;
+  const hideKeep = opts.hideKeep !== false;
+  const publicPrefix = opts.publicPrefix || '';
+  // 管理员删除目录用的 API 基址（挂载点感知：/<桶>/__api/ 或 /share/<桶>/__api/）
+  const apiBase = base.replace(/\/+$/, '') + API_PREFIX;
+  const bucketName = opts.bucket || '';
+
+  const rows = [];
+  // 目录占位对象（<prefix>/.keep）不参与展示与计数
+  const files = hideKeep ? data.files.filter((f) => f.name !== '.keep') : data.files;
+
+  /* 路径导航：挂载点段（crumbPre，由调用方按挂载方式给出）+ 相对段（relPrefix），每一级都可点击 */
+  const crumbPre = Array.isArray(opts.crumbPre) ? opts.crumbPre : [];
+  const relPrefix = opts.relPrefix !== undefined ? opts.relPrefix : prefix;
+  const crumbs = crumbPre.map((c) => '<a href="' + escapeHtml(c.href) + '">' + escapeHtml(c.label) + '</a>');
+  const segs = relPrefix.replace(/\/+$/, '').split('/').filter(Boolean);
+  let acc = '';
+  segs.forEach((seg, i) => {
+    acc += seg + '/';
+    crumbs.push(i === segs.length - 1
+      ? '<span class="cur">' + escapeHtml(seg) + '</span>'
+      : '<a href="' + base + escapeHtml(acc) + '">' + escapeHtml(seg) + '</a>');
+  });
+  if (!crumbs.length) crumbs.push('<span class="cur">/</span>');
+  const crumbsHtml = '<nav class="crumb">' + crumbs.join('<span class="sep">/</span>') + '</nav>';
+
+  if (relPrefix.replace(/\/+$/, '')) {
+    // 注意 relPrefix 形如 "images/"，先去尾斜杠再取父级，否则会算成自己
+    const parent = relPrefix.replace(/\/+$/, '').split('/').slice(0, -1).join('/');
+    rows.push('<tr><td colspan="4"><a href="' + base
+      + escapeHtml(parent ? parent + '/' : '') + '">返回上一级</a></td></tr>');
+  } else if (opts.upHref) {
+    // 已在挂载根：返回到虚拟根（/ 或 /share/）
+    rows.push('<tr><td colspan="4"><a href="' + escapeHtml(opts.upHref) + '">返回上一级</a></td></tr>');
+  }
+
+  for (const folder of data.folders) {
+    // 相对挂载点（已去掉 share/ 这类别名偏移）：href 基于挂载根 base 拼接，且保留尾斜杠（目录链接）；
+    // 显示名 name 才需要去尾斜杠。不能再加完整列举前缀，否则别名下会出现 /share/<桶>/share/… 双前缀。
+    const rel = relPrefix + folder.slice(prefix.length);
+    const name = folder.slice(prefix.length).replace(/\/$/, '');
+    // 匿名不给任何操作（连 JSON 也不暴露）；管理员给「删除」（删掉该目录的 .keep 占位）
+    const dirAct = showManage
+      ? '<td><button data-act="deldir" data-k="' + escapeHtml(folder + '.keep') + '">删除</button></td>'
+      : '<td></td>';
+    rows.push('<tr class="dir"><td><a href="' + base + escapeHtml(rel) + '">' + escapeHtml(name) + '/</a></td>'
+      + '<td>-</td><td>-</td>'
+      + dirAct + '</tr>');
+  }
+
+  for (const file of files) {
+    const href = base + escapeHtml(relPrefix + file.name);
+    rows.push('<tr><td>[FILE] <a href="' + href + '">' + escapeHtml(file.name) + '</a></td>'
+      + '<td>' + humanSize(file.size) + '</td>'
+      + '<td>' + escapeHtml(file.lastModified) + '</td>'
+      + '<td><a href="' + href + '">下载</a></td></tr>');
+  }
+
+  const initCount = data.folders.length + files.length;
+  const cfgJson = inlineJson({
+    prefix, base, relPrefix, apiBase, bucket: bucketName,
+    showManage: !!showManage,
+    next: data.truncated ? (data.nextToken || '') : '', loaded: initCount,
+    hideKeep: !!hideKeep,
+  });
+
+  const script = [
+    '(function () {',
+    'var C = ' + cfgJson + ';',
+    'var NEXT = C.next, LOADING = false, LOADED = C.loaded;',
+    'function esc(s) {',
+    '  return String(s).split("&").join("&amp;").split("<").join("&lt;")',
+    '    .split(">").join("&gt;").split(String.fromCharCode(34)).join("&quot;");',
+    '}',
+    'function human(b) {',
+    '  if (!b) return "0 B";',
+    '  var u = ["B","KB","MB","GB","TB"], v = b, i = 0;',
+    '  while (v >= 1024 && i < u.length - 1) { v = v / 1024; i++; }',
+    '  return v.toFixed(i ? 1 : 0) + " " + u[i];',
+    '}',
+    'function rowsHtml(d) {',
+    '  var out = "";',
+    '  (d.folders || []).forEach(function (p) {',
+    '    var name = p.slice(C.prefix.length);',
+    '    var rel = C.relPrefix + p.slice(C.prefix.length);',
+    '    if (name.charAt(name.length - 1) === "/") name = name.slice(0, -1);',
+    '    var act = C.showManage',
+    '      ? \'<td><button data-act="deldir" data-k="\' + esc(p + \'.keep\') + \'">删除</button></td>\'',
+    '      : \'<td></td>\';',
+    '    out += \'<tr class="dir"><td><a href="\' + C.base + esc(rel) + \'">\' + esc(name) + \'/</a></td>\'',
+    '      + \'<td>-</td><td>-</td>\'',
+    '      + act + \'</tr>\';',
+    '  });',
+    '  (d.files || []).filter(function (f) { return !(C.hideKeep && f.name === ".keep"); })',
+    '    .forEach(function (f) {',
+    '    var href = C.base + esc(C.relPrefix + f.name);',
+    '    out += \'<tr><td>[FILE] <a href="\' + href + \'">\' + esc(f.name) + \'</a></td>\'',
+    '      + "<td>" + human(f.size) + "</td>"',
+    '      + \'<td class="muted">\' + esc(f.lastModified) + "</td>"',
+    '      + \'<td><a href="\' + href + \'">下载</a></td></tr>\';',
+    '  });',
+    '  return out;',
+    '}',
+    'function paint() {',
+    '  document.getElementById("status").innerHTML = LOADING',
+    '    ? \'<span class="spin"></span> 正在加载…\'',
+    '    : (NEXT ? "已加载 " + LOADED + " 项 · 继续往下滚动加载更多" : "已加载 " + LOADED + " 项 · 到底了");',
+    '}',
+    '/* 请求一律用绝对 URL。若页面是通过 https://user:pass@host/… 打开的（书签里带了凭据），',
+    '   相对 URL 会让 fetch 直接抛 “Request cannot be constructed from a URL that includes credentials”，',
+    '   列表会一直卡在「正在加载…」。location.origin 不含凭据，同源请求浏览器会自动带上已缓存的 Basic 认证。 */',
+    'function absUrl(u) { return /^[a-z][a-z0-9+.-]*:\\/\\//i.test(u) ? u : location.origin + u; }',
+    'function more() {',
+    '  if (LOADING || !NEXT) return;',
+    '  LOADING = true; paint();',
+    '  fetch(absUrl(location.pathname + "?format=json&cursor=" + encodeURIComponent(NEXT)), { credentials: "same-origin" })',
+    '    .then(function (r) { return r.json(); })',
+    '    .then(function (d) {',
+    '      LOADING = false;',
+    '      if (!d || d.ok === false) { paint(); return; }',
+    '      NEXT = d.truncated ? (d.nextToken || "") : "";',
+    '      document.getElementById("tb").insertAdjacentHTML("beforeend", rowsHtml(d));',
+    '      LOADED += (d.folders || []).length + (d.files || []).filter(function (f) {',
+    '        return !(C.hideKeep && f.name === ".keep"); }).length;',
+    '      paint();',
+    '    })',
+    '    .catch(function () { LOADING = false; paint(); });',
+    '}',
+    'window.addEventListener("scroll", function () {',
+    '  if (LOADING || !NEXT) return;',
+    '  if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 300) more();',
+    '});',
+    '/* 管理员：删除目录（删掉该目录的 .keep 占位）。匿名页面不渲染这个按钮。 */',
+    'document.addEventListener("click", function (e) {',
+    '  var t = e.target;',
+    '  while (t && t !== document && t.tagName !== "BUTTON") t = t.parentNode;',
+    '  if (!t || t === document || t.getAttribute("data-act") !== "deldir") return;',
+    '  var k = t.getAttribute("data-k") || "";',
+    '  if (!k || !window.confirm("确认删除目录 " + k + " ？")) return;',
+    '  fetch(absUrl(C.apiBase + "object?key=" + encodeURIComponent(k) + "&bucket=" + encodeURIComponent(C.bucket || "")), {',
+    '    method: "DELETE", credentials: "same-origin",',
+    '  })',
+    '    .then(function (r) { return r.json(); })',
+    '    .then(function (j) {',
+    '      if (j && j.ok) location.reload();',
+    '      else window.alert("删除失败: " + ((j && j.error) || "未知错误"));',
+    '    })',
+    '    .catch(function () { window.alert("删除失败：网络错误"); });',
+    '});',
+    'paint();',
+    '})();',
+  ].join('\n');
+
+  return [
+    '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<title>' + escapeHtml(relPrefix || '/') + ' - B2 Index</title>',
+    // 空 favicon：避免浏览器自动请求 /favicon.ico（会被当对象下载，白记 1 次 Class B）
+    '<link rel="icon" href="data:,">',
+    '<style>',
+    themeCss(),
+    'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0;padding:32px}',
+    '.wrap{max-width:900px;margin:0 auto}h1{font-size:18px;margin:0 0 4px}',
+    '.crumb{font-size:18px;font-weight:600;margin:0 0 6px;display:flex;flex-wrap:wrap;align-items:center;gap:6px}',
+    '.crumb a{color:var(--acc)}.crumb a:hover{text-decoration:underline}',
+    '.crumb .sep{color:var(--dim);font-weight:400}.crumb .cur{color:var(--txt)}',
+    '.sub{color:var(--dim);font-size:13px;margin-bottom:20px}',
+    '.top{display:flex;align-items:center;gap:10px;margin-bottom:18px}',
+    '.top .grow{flex:1}',
+    '#status{margin-top:16px;font-size:12px;color:var(--dim);display:flex;gap:8px;align-items:center;justify-content:center}',
+    '.spin{width:12px;height:12px;border:2px solid var(--line);border-top-color:var(--acc);border-radius:50%;display:inline-block;animation:sp .8s linear infinite}',
+    '@keyframes sp{to{transform:rotate(360deg)}}',
+    'button{font:inherit;color:var(--txt);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer}',
+    'table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}',
+    'td{padding:10px 14px;border-bottom:1px solid var(--line);font-size:14px}',
+    'tr:last-child td{border-bottom:0}tr:hover td{background:var(--hover)}',
+    'tr.dir td{background:var(--folder)}tr.dir:hover td{background:var(--hover)}',
+    'tr.dir td a{color:var(--folderTxt)}tr.dir td [data-act]{color:var(--folderTxt)}',
+    'a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}',
+    '.empty{color:var(--dim);padding:24px;text-align:center}.muted{color:var(--dim)}',
+    '</style></head><body><div class="wrap">',
+    '<div class="top"><button id="btnTheme">深色模式</button><span class="grow"></span></div>',
+    crumbsHtml,
+    '<div class="sub">' + data.folders.length + ' 个目录 / ' + files.length
+      + ' 个文件'
+      + (showManage ? ' · <a href="' + base + MANAGE_PATH.slice(1) + '">打开管理器</a>' : '')
+      + '</div>',
+    '<table><thead><tr><th style="text-align:left">名称</th><th>大小</th><th>修改时间</th><th></th></tr></thead>',
+    '<tbody id="tb">' + (rows.join('') || '<tr><td class="empty" colspan="4">（空）</td></tr>') + '</tbody></table>',
+    '<div id="status"></div>',
+    '</div>',
+    '<script>' + themeToggleScript() + '</script>',
+    '<script>' + script + '</script>',
+    '</body></html>',
+  ].join('\n');
+}
+
+/** 匿名访问未被授权目录时的引导页（ROOT_ACTION=welcome） */
+function welcomePage(cfg, bucketLabel, prefix, publicPath) {
+  const manageUrl = MANAGE_PATH;
+  const shareUrl = publicPath || '/';
+  return [
+    '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<title>B2 资源网关</title>',
+    // 空 favicon：避免浏览器自动请求 /favicon.ico（会被当对象下载，白记 1 次 Class B）
+    '<link rel="icon" href="data:,">',
+    '<style>',
+    themeCss(),
+    'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}',
+    '.card{max-width:560px;padding:32px 36px;background:var(--card);border:1px solid var(--line);border-radius:14px}',
+    '.thm{position:fixed;top:14px;right:14px}',
+    'button{font:inherit;color:var(--txt);background:var(--card);border:1px solid var(--line);border-radius:8px;padding:5px 10px;cursor:pointer}',
+    'h1{font-size:19px;margin:0 0 10px}p{color:var(--dim);line-height:1.7;font-size:14px;margin:6px 0}',
+    'code{background:var(--chip);padding:2px 6px;border-radius:5px;color:var(--acc)}',
+    'a{color:var(--acc)}',
+    '.btn{display:inline-block;margin-top:18px;padding:9px 16px;background:var(--acc);color:var(--btn);border-radius:8px;text-decoration:none;font-size:14px}',
+    'ul{color:var(--dim);font-size:13px;line-height:1.9;padding-left:18px}',
+    '</style></head><body>',
+    '<div class="thm"><button id="btnTheme">深色模式</button></div><div class="card">',
+    '<h1>📦 Backblaze B2 资源网关</h1>',
+    '<p>服务已就绪。请通过<strong>完整对象路径</strong>访问资源：</p>',
+    '<p>根路径 <code>/</code> 的目录浏览未对匿名开放。</p>',
+    '<ul>',
+    (cfg.publicPrefix
+      ? '<li>公开目录：<a href="' + shareUrl + '"><code>' + shareUrl + '</code></a>（匿名可直接下载）</li>'
+        + '<li>其他目录需登录后访问：<a href="' + manageUrl + '">打开 ' + manageUrl + '</a></li>'
+      : '<li>匿名下载：<code>/&lt;对象key&gt;</code>，例如 <code>/photos/a.jpg</code></li>'
+        + '<li>可视化管理：<a href="' + manageUrl + '">打开 ' + manageUrl + '</a></li>'),
+    '</ul>',
+    (cfg.hideDetails
+      ? '<p style="margin-top:14px">区域与桶信息已对用户隐藏。</p>'
+      : '<p style="margin-top:14px">当前桶：<code>' + escapeHtml(bucketLabel) + '</code>'
+        + (prefix ? ' · 前缀 <code>' + escapeHtml(prefix) + '</code>' : '')
+        + ' · 区域 <code>' + escapeHtml(cfg.region) + '</code></p>'),
+    '<a class="btn" href="' + manageUrl + '">进入文件管理器</a>',
+    '</div><script>' + themeToggleScript() + '</script></body></html>',
+  ].join('\n');
+}
+
+/* ============================ 8. 文件管理器页面 ============================ */
+
+/* ---------- src/router.js ---------- */
+/* 由 src/b2-worker.js 拆分而来：原 L3214-L3482 */
+
+
+
+
+
+
+
+
+
+
+
+
+
 async function handle(request, env, ctx) {
   const cfg = loadConfig(env);
   if (cfg.enableUsage) cfg.usage = { counts: {} };
@@ -3480,6 +3583,8 @@ async function dispatch(request, env, ctx, cfg) {
   }
 }
 
+/* ---------- src/index.js（入口，保留导出） ---------- */
+
 export default {
   /** Cron Triggers 入口：每天定时刷新空间快照（见 wrangler.toml 的 [triggers]） */
   async scheduled(event, env, ctx) {
@@ -3508,5 +3613,6 @@ export default {
 export {
   SigV4, loadConfig, resolveBucketKey, objectUrl, bucketUrl, normalizeKey,
   uriEncode, canonicalPath, safeEqual, handle, managePage, listObjects,
-  shouldWindowScan, utcDayStamp, computeStorage, usageState,
+  shouldWindowScan, utcDayStamp, computeStorage, usageState, UsageCounter,
 };
+

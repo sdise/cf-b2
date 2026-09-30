@@ -1,6 +1,6 @@
 # cf-b2-worker
 
-**Cloudflare Workers ⇄ Backblaze B2 一体化网关**：单文件、零依赖，自带 AWS Signature V4 实现和网页文件管理器。
+**Cloudflare Workers ⇄ Backblaze B2 一体化网关**：源码按职责拆分为多个模块，构建出**单一部署物**；运行时零依赖，自带 AWS Signature V4 实现和网页文件管理器。
 
 ## 项目预览
 
@@ -33,10 +33,31 @@
 
 ```
 cf-b2-worker/
-├─ src/b2-worker.js        # 唯一需要的 Worker 文件（单文件、零依赖）
-├─ wrangler.toml           # 部署配置（含全部参数注释）
+├─ src/                    # 源码（按职责拆分，改动从这里开始）
+│  ├─ index.js             # 入口：export default { fetch, scheduled } + 具名导出
+│  ├─ router.js            # 顶层路由：鉴权 → 挂载解析 → 目录/对象/管理页分发
+│  ├─ api.js               # /__api/* 管理 API（list/presign/object/copy/mkdir/multipart/usage）
+│  ├─ lib/
+│  │  ├─ constants.js      # 共享常量（端点默认值、不可签名的头、转发白名单…）
+│  │  ├─ crypto.js         # SHA-256 / HMAC / 十六进制 / RFC3986 编码 / key 归一化
+│  │  ├─ sigv4.js          # 内置 AWS Signature V4 实现（含派生密钥缓存）
+│  │  ├─ auth.js           # Basic / Bearer 恒定时间比较鉴权
+│  │  ├─ http.js           # JSON/HTML 响应、安全响应头、CORS、上游错误清洗
+│  │  ├─ config.js         # BUCKET_N 解析、多桶挂载、端点推导、桶级视图
+│  │  ├─ prefix.js         # 公开前缀归一化与边界判断
+│  │  ├─ hours.js          # cron 小时表解析（"23" / "23,11" / "*" / "-"）
+│  │  ├─ b2.js             # 对象读写删、列举、缓存失效、S3 分片上传
+│  │  ├─ b2-native.js      # B2 原生 API：桶级 CORS 配置
+│  │  └─ usage.js          # 用量计数（Durable Object + Cache 降级）、Cron 快照
+│  └─ ui/
+│     ├─ theme.js          # 主题变量、切换脚本、HTML 转义、内联 JSON 转义
+│     ├─ directory.js      # 公开目录页 / 欢迎页
+│     └─ manage.js         # 网页文件管理器（单页应用）
+├─ dist/b2-worker.js       # 构建产物：单一部署物（已提交，可直接粘贴部署）
+├─ tools/build.mjs         # 零依赖打包器：src/ → dist/（30 行原生 Node）
+├─ wrangler.toml           # 部署配置（main 指向 dist/，含全部参数注释）
 ├─ .dev.vars.example       # 本地开发环境变量模板
-├─ package.json            # 可选：固化 wrangler 版本与 npm scripts
+├─ package.json            # npm scripts（build / test / deploy）
 ├─ tests/sigv4.test.mjs    # SigV4 与 AWS 官方示例的对拍测试
 ├─ tests/router.test.mjs   # 桩化 fetch/caches 的路由冒烟测试
 ├─ tests/manage-ui.test.mjs# 假 DOM 里执行管理器前端脚本，验证调参默认值与钳制
@@ -44,10 +65,17 @@ cf-b2-worker/
 └─ DEPLOY.md               # 部署步骤与参数详解
 ```
 
+> **为什么要拆分？** 单文件超过 3000 行后，定位一个函数要在同一份文件里来回翻；改动无法按模块 review，
+> 也容易误伤无关代码。现在按职责拆成 17 个模块，`tools/build.mjs` 再合并回**一个** `dist/b2-worker.js`——
+> 既拿到可维护性，又保留「零依赖、单文件、可直接粘贴到控制台」的部署体验。
+> 产物是自动生成的（文件头有告警），**请只改 `src/` 下的源码**。
+
 本地自检：
 
 ```bash
-npm test      # 等价于 node tests/sigv4.test.mjs && node tests/router.test.mjs
+npm run build   # src/ → dist/b2-worker.js（单文件产物）
+npm test        # 先自动构建，再跑三个测试（tests/*.test.mjs）
+npm run check   # 校验 dist/ 与 src/ 是否一致（CI 用）
 ```
 
 - `sigv4.test.mjs`：用 AWS 官方文档的 IAM 示例（`20150830T123600Z`）验证签名结果与官方 Signature 完全一致。
@@ -128,7 +156,7 @@ cron(每周) → b2_authorize_account → b2_get_download_authorization(validDur
 | 认证方式 | S3 SigV4（aws4fetch） | B2 原生 authorizationToken | S3 SigV4（**内置**，零依赖） |
 | 是否需要 CF API Token | 否 | **是（高危）** | 否 |
 | 是否需要第二个 Worker / cron | 否 | **是** | 否（密钥不过期，无需轮换） |
-| 依赖打包 | 需要 npm/pnpm + esbuild + `.html` loader | 需要 npm + TS 编译 | **不需要**，单文件直接部署 |
+| 依赖打包 | 需要 npm/pnpm + esbuild + `.html` loader | 需要 npm + TS 编译 | **运行时零依赖**；源码模块化 + 自研 30 行打包器产出单文件 |
 | 读取 | ✅ GET/HEAD | ✅ 图片为主 | ✅ GET/HEAD（Range、条件请求、304 全支持） |
 | 目录列举 | 可（HTML 欢迎页/桶列表） | ❌ | ✅ HTML + JSON + 分页游标 |
 | 上传 | ❌ | ❌ | ✅ 代理上传 / 预签名直传 / S3 分片上传 |
@@ -138,7 +166,7 @@ cron(每周) → b2_authorize_account → b2_get_download_authorization(validDur
 | 缓存 | 依赖桶元数据 | ❌ | ✅ Cache API + Cache-Control 覆写 + `X-B2-Cache` 标记 |
 | 鉴权 | ❌ | ❌ | ✅ Basic / Bearer 恒定时间比较，默认拒绝 |
 | 安全 | 路径未做穿越防护、无条件透传 key | 生成的 Worker 无白名单 | ✅ `../` 归一化、写删开关、CORS 白名单、敏感信息不入库 |
-| 体积 / 复杂度 | 中 | 中（双 Worker） | 单文件约 1000 行 |
+| 体积 / 复杂度 | 中 | 中（双 Worker） | 源码 17 个模块；产物单文件约 3500 行 |
 
 ### 关键优化结论
 
@@ -202,7 +230,7 @@ npx wrangler deploy --name <你的 Worker 名>   # 例：--name b2；名字写�
 
 方式二：控制台（无需本地环境）
 
-1. Workers 和 Pages → Create Worker → 粘贴 `src/b2-worker.js` 全部内容 → Deploy
+1. Workers 和 Pages → Create Worker → 粘贴 `dist/b2-worker.js` 全部内容 → Deploy
 2. Settings → Variables：添加 `B2_ENDPOINT`、`BUCKET_NAME` 等明文变量；加密变量（Secrets）填 `B2_KEY_ID`、`B2_APPLICATION_KEY`、`ADMIN_PASS`
 3. Settings → Domains & Routes 绑定自定义域名（可选，推荐）
 
@@ -237,5 +265,48 @@ curl -u admin:你的密码 "https://<你的域名>/?format=json"
 - **不要把 `wrangler.toml` / `.dev.vars` 提交到公开仓库**：密钥一律走 `wrangler secret put`。
 - Workers 免费套餐请求体上限 100MB、子请求数/CPU 也有限额，具体限制与应对见 `DEPLOY.md` 的"配额与限制"章节。
 - 未配置 `ADMIN_*` 时，所有写/删操作**默认拒绝**（fail-closed），避免出现"意外公开的公共网盘"。
+
+## 六、优化记录
+
+### 1）工程结构：源码拆分 + 构建单一部署物
+
+原先所有代码挤在一个 `src/b2-worker.js`（约 3500 行）。现按职责拆成 **17 个模块**（见上面的目录树），
+由 `tools/build.mjs` 合并回 `dist/b2-worker.js`。取舍如下：
+
+| 关注点 | 做法 |
+| --- | --- |
+| 可维护性 | 按职责分模块（crypto / sigv4 / config / b2 / usage / ui…），单文件从 3500 行降到 100~600 行 |
+| 依赖 | **不引入 esbuild**：模块都是自研纯 ESM、无外部依赖，30 行原生 Node 即可合并，保持「零依赖」 |
+| 部署体验 | 产物仍是**单文件纯 ESM**，可直接粘贴进 Cloudflare 控制台；`wrangler.toml` 的 `main` 指向 `dist/` |
+| 一致性 | `npm run build` 生成、`npm run check` 校验产物与源码是否同步；`npm test` 会先自动构建 |
+| 防误改 | 产物文件头有「自动生成，请勿直接编辑」告警；测试直接跑**构建产物**，打包器出问题会被测试拦住 |
+
+模块依赖是**无环**的（`config ⇄ usage` 的 `parseHourList` 已抽到独立的 `lib/hours.js` 打断）。
+
+### 2）安全
+
+| 项 | 说明 |
+| --- | --- |
+| 内联 JSON 转义 | 新增 `inlineJson()`，把 `<` `>` `&` 与 U+2028/2029 转义后再内联进 `<script>`，杜绝 `</script>` 提前闭合导致的脚本注入 |
+| 安全响应头 | 所有 HTML 响应统一带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 与严格 CSP（`default-src 'none'`） |
+| 鉴权强化 | Basic 模式要求 `ADMIN_USER` 与 `ADMIN_PASS` **成对配置**，避免只配其一时退化成「空用户名 + 密码」的弱配置 |
+
+### 3）正确性
+
+| 项 | 说明 |
+| --- | --- |
+| 缓存失效 | 新增 `purgeObjectCache()`：写、删、复制、重命名后按 key 失效 Cache API，避免「删了还能下载」的脏读 |
+| 跨桶复制 | 跨桶 `copy` 时按**目标桶**记账（`flushCounters(dstCfg, env, toBucket)`），不再把用量算到源桶头上 |
+
+### 4）性能
+
+| 项 | 说明 |
+| --- | --- |
+| 配置解析缓存 | `loadConfig()` 结果按 `env` 用 `WeakMap` 缓存，省掉每个请求都全量 `JSON.parse` 一遍 `BUCKET_N` |
+| 端点解析缓存 | `endpointInfo()` 记忆化，避免每次请求重复 `new URL()` |
+| 签名密钥缓存 | SigV4 的派生密钥（4 次 HMAC）按「凭据 + 日期」缓存到请求级 `_sigKeyCache`，分片上传时不再逐片重算 |
+| UNSIGNED-PAYLOAD | 代理上传（含每个分片）改用 `x-amz-content-sha256: UNSIGNED-PAYLOAD`，不再对最大 96MB 的请求体做 SHA-256，显著降低 CPU |
+
+---
 
 完整参数表、B2 控制台操作步骤、CORS 配置、故障排查表与 API 参考见 → **[DEPLOY.md](./DEPLOY.md)**

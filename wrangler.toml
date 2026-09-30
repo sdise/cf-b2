@@ -19,7 +19,7 @@
 #       ① keep_vars = true
 #       ② [vars] 整段注释掉 ⇒ 部署不上传任何明文变量
 #     结果：部署不会改动你控制台里的任何变量，全部沿用控制台的值。
-#     代码里每个变量都有默认值（见 src/b2-worker.js 的 loadConfig），
+#     代码里每个变量都有默认值（见 src/lib/config.js 的 loadConfig），
 #     控制台漏配哪一项就用默认值，不会因此崩溃。
 #
 #   想改成「以配置文件为准」：取消下面 [vars] 的注释并填真实值即可
@@ -34,7 +34,9 @@
 # =============================================================================
 
 name = "cf-b2-worker"
-main = "src/b2-worker.js"
+# main 指向**构建产物**（单一部署物）。源码已拆分为 src/ 下的多个模块，
+# 改动源码后先 `npm run build`（= node tools/build.mjs）再部署；deploy.mjs 已自动串上这一步。
+main = "dist/b2-worker.js"
 compatibility_date = "2024-11-01"
 
 # 保留控制台上已有的明文变量（不因部署被清空/覆盖）——本文件的「对控制台友好」开关

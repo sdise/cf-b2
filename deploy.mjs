@@ -102,7 +102,12 @@ if (!patch.ok || !patchRes.success) {
 }
 console.log(`✔ 变量已写入（共 ${patchRes.result.bindings.length} 个绑定）`);
 
-/* ② wrangler 只传代码（keep_vars=true ⇒ 不会动变量） */
+/* ② 先构建单一部署物（源码已拆分为 src/ 下多个模块，wrangler.toml 的 main 指向 dist/） */
+console.log('▶ node tools/build.mjs …');
+const b = spawnSync('node', ['tools/build.mjs'], { stdio: 'inherit' });
+if (b.status !== 0) die('构建失败，已中止部署。');
+
+/* ③ wrangler 只传代码（keep_vars=true ⇒ 不会动变量） */
 console.log(`▶ wrangler deploy --name ${NAME} …`);
 const r = spawnSync('npx', ['--yes', 'wrangler@3', 'deploy', '--name', NAME], {
   stdio: 'inherit',

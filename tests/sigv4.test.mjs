@@ -12,7 +12,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import os from 'node:os';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const source = fs.readFileSync(path.join(here, '..', 'src', 'b2-worker.js'), 'utf8');
+const source = fs.readFileSync(path.join(here, '..', 'dist', 'b2-worker.js'), 'utf8');
 
 const patched = source.replace("h.set('x-amz-content-sha256', payload);", '/* removed for test */');
 const tmpFile = path.join(os.tmpdir(), 'cf-b2-worker-test-' + Date.now() + '.mjs');

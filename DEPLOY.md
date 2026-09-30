@@ -1,6 +1,7 @@
 # 部署说明与参数详解
 
-适用对象：`src/b2-worker.js`（单文件 Worker，连接 Backblaze B2 私有/公有桶 + 文件管理）。
+适用对象：`dist/b2-worker.js`（构建产物：单文件 Worker，连接 Backblaze B2 私有/公有桶 + 文件管理）。
+源码在 `src/` 下拆分为多个模块，`npm run build` 会合并成这个单一部署物；只想部署的话，直接粘贴 `dist/b2-worker.js` 即可，无需构建环境。
 
 ---
 
@@ -84,10 +85,13 @@ npx wrangler secret put ADMIN_TOKEN   # 可选，与 Basic 二选一
 # 5. 本地预览（本地变量读 .dev.vars）
 npx wrangler dev --remote          # 用真实 B2 联调；不带 --remote 时签名仍会发出去
 
-# 6. 部署（⚠️ --name 决定更新哪个 Worker；写错会新建一个 Worker）
+# 6. 构建单一部署物（源码在 src/ 下拆成多个模块；改了源码必须重新构建）
+node tools/build.mjs
+
+# 7. 部署（⚠️ --name 决定更新哪个 Worker；写错会新建一个 Worker）
 npx wrangler deploy --name <你的 Worker 名>     # 例如 --name b2
 
-# 7. 看日志
+# 8. 看日志
 npx wrangler tail
 ```
 
@@ -108,7 +112,7 @@ npx wrangler tail
 ### 方式 B：Cloudflare 控制台（无需本地环境）
 
 1. **Workers & Pages → Create → Create Worker → 起个名字 → Deploy**
-2. **Edit Code**：把 `src/b2-worker.js` 的内容整段粘贴覆盖，再 **Deploy**
+2. **Edit Code**：把 `dist/b2-worker.js` 的内容整段粘贴覆盖，再 **Deploy**（该文件已提交入库，无需本地构建）
 3. **Settings → Variables and Secrets**：
    - **Secrets（加密）**：`B2_KEY_ID`、`B2_APPLICATION_KEY`、`ADMIN_PASS`
    - **Variables（明文）**：见第 3 节表格
@@ -123,7 +127,12 @@ npx wrangler tail
   "name": "cf-b2-worker",
   "private": true,
   "type": "module",
-  "scripts": { "dev": "wrangler dev", "deploy": "wrangler deploy", "tail": "wrangler tail" },
+  "scripts": {
+    "build": "node tools/build.mjs",
+    "dev": "npm run build && wrangler dev",
+    "deploy": "npm run build && wrangler deploy",
+    "tail": "wrangler tail"
+  },
   "devDependencies": { "wrangler": "^3.80.0" }
 }
 ```

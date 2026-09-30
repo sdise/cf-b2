@@ -7,7 +7,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const {
   handle, loadConfig, UsageCounter, shouldWindowScan, default: workerDefault,
-} = await import(pathToFileURL(path.join(here, '..', 'src', 'b2-worker.js')).href);
+} = await import(pathToFileURL(path.join(here, '..', 'dist', 'b2-worker.js')).href);
 
 /* ---------- 桩：Cache API 与 fetch ---------- */
 const cacheStore = new Map();
@@ -1133,7 +1133,7 @@ await check('各页面都带空 favicon（否则 /favicon.ico 被当对象下载
   }
   // 欢迎页模板同样要有（源码级校验，避免依赖具体路由条件）
   const src = await (await import('node:fs/promises')).readFile(
-    new URL('../src/b2-worker.js', import.meta.url), 'utf8',
+    new URL('../dist/b2-worker.js', import.meta.url), 'utf8',
   );
   const hits = src.split('<link rel="icon" href="data:,">').length - 1;
   assert(hits >= 3, '三处页面模板都应带空 favicon，实际 ' + hits + ' 处');
