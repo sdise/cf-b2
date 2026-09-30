@@ -164,18 +164,24 @@ function dirPrefix(value) {
 /* ============================ 2. AWS Signature V4 ============================ */
 
 class SigV4 {
-  constructor({ accessKeyId, secretAccessKey, region, service = SERVICE }) {
+  constructor({ accessKeyId, secretAccessKey, region, service = SERVICE, keyCache = null }) {
     this.accessKeyId = accessKeyId;
     this.secretAccessKey = secretAccessKey;
     this.region = region;
     this.service = service;
+    // 派生签名密钥（4 次 HMAC）对同一凭据/日期是常量；由 cfg 传入的请求级缓存可省去重复计算
+    this.keyCache = keyCache;
   }
 
   async signingKey(dateStamp) {
+    const cacheKey = this.accessKeyId + '|' + this.region + '|' + this.service + '|' + dateStamp;
+    if (this.keyCache && this.keyCache.has(cacheKey)) return this.keyCache.get(cacheKey);
     let k = await hmac(encoder.encode('AWS4' + this.secretAccessKey), dateStamp);
     k = await hmac(k, this.region);
     k = await hmac(k, this.service);
-    return await hmac(k, 'aws4_request');
+    const key = await hmac(k, 'aws4_request');
+    if (this.keyCache) this.keyCache.set(cacheKey, key);
+    return key;
   }
 
   /**
@@ -325,8 +331,16 @@ function sanitizeUpstreamError(response, cfg, extraHeaders) {
   });
 }
 
+// env 在同一 isolate 内是稳定对象：缓存 BUCKET_N 的 JSON 解析结果，避免每个请求都全量 parse 一遍
+const bucketVarsCache = new WeakMap();
+
 function loadConfig(env) {
-  const { buckets, problems } = parseBucketVars(env);
+  let parsed = env && typeof env === 'object' ? bucketVarsCache.get(env) : null;
+  if (!parsed) {
+    parsed = parseBucketVars(env);
+    if (env && typeof env === 'object') bucketVarsCache.set(env, parsed);
+  }
+  const { buckets, problems } = parsed;
 
   return {
     // 挂载表：BUCKET_1..N，每个桶可属于不同的 B2 账号（各自 KEY_ID / APPLICATION_KEY / ENDPOINT）
@@ -457,13 +471,20 @@ function parseBucketVars(env) {
   return { buckets, problems };
 }
 
+// endpoint 字符串到 {origin,host,region} 的解析结果可跨请求复用（同一 isolate 内 endpoint 数量极少）
+const endpointInfoCache = new Map();
+
 function endpointInfo(rawEndpoint) {
+  const cached = endpointInfoCache.get(rawEndpoint);
+  if (cached) return cached;
   const endpoint = new URL(rawEndpoint);
   const hostParts = endpoint.hostname.split('.');
   const region = hostParts[0] === 's3' && hostParts.length > 2
     ? hostParts.slice(1, -2).join('.')
     : 'us-west-001';
-  return { origin: endpoint.origin, host: endpoint.hostname, region };
+  const info = { origin: endpoint.origin, host: endpoint.hostname, region };
+  endpointInfoCache.set(rawEndpoint, info);
+  return info;
 }
 
 /** 把全局 cfg 原地切换成指定桶的视图（凭据 / endpoint / 桶名）。
@@ -566,7 +587,16 @@ function json(data, status = 200, request = null, cfg = null) {
 function html(body, status = 200, extraHeaders = {}) {
   return new Response(body, {
     status,
-    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store', ...extraHeaders },
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8',
+      'Cache-Control': 'no-store',
+      'X-Content-Type-Options': 'nosniff',
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'no-referrer',
+      // 页面脚本/样式全部内联，因此放行 unsafe-inline，但仍禁止加载外部资源与嵌套框架
+      'Content-Security-Policy': "default-src 'none'; img-src 'self' data:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+      ...extraHeaders,
+    },
   });
 }
 
@@ -591,8 +621,11 @@ function challenge(request, cfg) {
  */
 async function checkAuth(request, cfg) {
   if (cfg.publicWrite) return { ok: true, mode: 'public' };
-  if (!cfg.adminToken && !cfg.adminUser && !cfg.adminPass) {
-    return { ok: false, reason: '未配置 ADMIN_TOKEN 或 ADMIN_USER/ADMIN_PASS，操作已被默认拒绝' };
+  // Basic 模式要求用户名与密码同时配置：只配其一（例如漏配 ADMIN_USER）会退化成「空用户名 + 密码」，
+  // 因此这里按「成对存在」判断，避免弱配置被绕过。
+  const basicReady = Boolean(cfg.adminUser && cfg.adminPass);
+  if (!cfg.adminToken && !basicReady) {
+    return { ok: false, reason: '未配置 ADMIN_TOKEN 或完整的 ADMIN_USER/ADMIN_PASS（两者都需设置），操作已被默认拒绝' };
   }
 
   const authorization = request.headers.get('authorization') || '';
@@ -604,6 +637,7 @@ async function checkAuth(request, cfg) {
   }
 
   if (authorization.toLowerCase().startsWith('basic ')) {
+    if (!basicReady) return { ok: false, reason: '未配置 Basic 凭据' };
     let decoded = '';
     try {
       decoded = atob(authorization.slice(6).trim());
@@ -611,6 +645,7 @@ async function checkAuth(request, cfg) {
       return { ok: false, reason: 'Basic 凭据格式错误' };
     }
     const idx = decoded.indexOf(':');
+    if (idx < 0) return { ok: false, reason: 'Basic 凭据格式错误' };
     const user = decoded.slice(0, idx);
     const pass = decoded.slice(idx + 1);
     if (await safeEqual(user, cfg.adminUser) && await safeEqual(pass, cfg.adminPass)) {
@@ -625,11 +660,14 @@ async function checkAuth(request, cfg) {
 /* ============================ 5. B2(S3) 数据面操作 ============================ */
 
 function signerOf(cfg) {
+  // 请求级缓存：同一 cfg（含 bucketView 浅拷贝）共享一份派生密钥，避免分片上传时逐片重算
+  if (!cfg._sigKeyCache) cfg._sigKeyCache = new Map();
   return new SigV4({
     accessKeyId: cfg.accessKeyId,
     secretAccessKey: cfg.secretAccessKey,
     region: cfg.region,
     service: cfg.service,
+    keyCache: cfg._sigKeyCache,
   });
 }
 
@@ -818,7 +856,8 @@ async function putObject(request, cfg, bucket, key) {
   const headers = { 'content-type': request.headers.get('content-type') || 'application/octet-stream' };
   if (cfg.uploadCacheControl) headers['cache-control'] = cfg.uploadCacheControl;
 
-  const response = await b2Fetch(cfg, 'PUT', objectUrl(cfg, bucket, key), { headers, body });
+  // 走 UNSIGNED-PAYLOAD：避免对最大 96MB 的请求体做 SHA-256（下载/复制早已如此），显著降低 CPU
+  const response = await b2Fetch(cfg, 'PUT', objectUrl(cfg, bucket, key), { headers, body, unsignedPayload: true });
   const text = await response.text();
   return response.ok
     ? json({ ok: true, key, size: body.byteLength }, 200, request, cfg)
@@ -845,6 +884,36 @@ async function deleteObject(cfg, bucket, key) {
     return { ok: false, status: response.status, error: extractError(text) };
   }
   return { ok: true };
+}
+
+/**
+ * 写/删对象后清理边缘缓存（Cache API 键是「公开对象 URL」，见 readObject）。
+ * 覆盖两种挂载形态下的公开路径：/<桶>/<key> 与 /share/<桶>/<去公开前缀的 key>，并含 ?dl=1 变体。
+ * 浏览器直传 B2（预签名）不经 Worker，无法在此清理，只能靠缓存 TTL 自然过期。
+ */
+function purgeObjectCache(ctx, cfg, bucket, key, origin) {
+  if (!cfg.useCache || !origin) return;
+  const enc = normalizeKey(key).split('/').map((s) => encodeURIComponent(s)).join('/');
+  const paths = ['/' + bucket + '/' + enc];
+  const prefix = (cfg.publicPrefix || '').replace(/\/+$/, '');
+  if (prefix && enc.toLowerCase().startsWith(prefix.toLowerCase() + '/')) {
+    paths.push('/share/' + bucket + '/' + enc.slice(prefix.length + 1));
+  }
+  const targets = [];
+  for (const path of paths) targets.push(origin + path, origin + path + '?dl=1');
+  for (const target of targets) {
+    try {
+      const del = caches && caches.default && caches.default.delete;
+      if (typeof del !== 'function') continue;
+      const pending = del.call(caches.default, target);
+      if (pending && typeof pending.then === 'function') {
+        const settled = pending.catch(() => {});
+        if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(settled);
+      }
+    } catch {
+      /* 缓存不可用时忽略 */
+    }
+  }
 }
 
 /* ---------- 极简 XML 工具（Workers 无 DOMParser） ---------- */
@@ -1819,11 +1888,14 @@ async function apiRouter(request, env, ctx, cfg, url) {
       if (request.method === 'DELETE') {
         if (!cfg.enableDelete) return deny('已禁用删除（ENABLE_DELETE=false）', request, cfg, 403);
         const res = await deleteObject(cfg, targetBucket, key);
+        if (res.ok) purgeObjectCache(ctx, cfg, targetBucket, key, url.origin);
         return json(res, res.ok ? 200 : (res.status || 500), request, cfg);
       }
       if (request.method === 'PUT') {
         if (!cfg.enableWrite) return deny('已禁用写入（ENABLE_WRITE=false）', request, cfg, 403);
-        return putObject(request, cfg, targetBucket, key);
+        const res = await putObject(request, cfg, targetBucket, key);
+        if (res.ok) purgeObjectCache(ctx, cfg, targetBucket, key, url.origin);
+        return res;
       }
       if (request.method === 'GET' || request.method === 'HEAD') {
         return readObject(request, env, ctx, cfg, targetBucket, key);
@@ -1844,30 +1916,40 @@ async function apiRouter(request, env, ctx, cfg, url) {
         if (!res.ok) return deny(res.error, request, cfg, res.status || 500);
         const moved = body.move === true || url.searchParams.get('move') === '1';
         if (moved) await deleteObject(cfg, targetBucket, from);
+        purgeObjectCache(ctx, cfg, targetBucket, to, url.origin);
+        if (moved) purgeObjectCache(ctx, cfg, targetBucket, from, url.origin);
         return json({ ok: true, from, to, moved, crossBucket: false }, 200, request, cfg);
       }
       // 跨桶（可能跨 B2 账号）：GET 源 → 流式 PUT 目标；调用方决定是否删除源
       const dst = cfg.buckets.find((b) => b.name === toBucket);
       if (!dst) return deny('目标桶未挂载：' + toBucket, request, cfg, 400);
       const dstCfg = bucketView(cfg, dst);
-      const upstream = await b2Fetch(cfg, 'GET', objectUrl(cfg, targetBucket, from));
-      if (!upstream.ok) {
-        return deny('读取源对象失败: HTTP ' + upstream.status, request, cfg, upstream.status === 404 ? 404 : 502);
+      try {
+        const upstream = await b2Fetch(cfg, 'GET', objectUrl(cfg, targetBucket, from));
+        if (!upstream.ok) {
+          return deny('读取源对象失败: HTTP ' + upstream.status, request, cfg, upstream.status === 404 ? 404 : 502);
+        }
+        const headers = { 'Content-Type': upstream.headers.get('content-type') || 'application/octet-stream' };
+        const cc = upstream.headers.get('cache-control');
+        if (cc) headers['Cache-Control'] = cc;
+        const put = await b2Fetch(dstCfg, 'PUT', objectUrl(dstCfg, toBucket, to), {
+          headers,
+          body: upstream.body,
+          unsignedPayload: true,
+        });
+        if (!put.ok) {
+          return deny('写入目标桶失败: HTTP ' + put.status + '（源对象未删除，可重试）', request, cfg, 502);
+        }
+        const moved = body.move === true || url.searchParams.get('move') === '1';
+        if (moved) await deleteObject(cfg, targetBucket, from);
+        purgeObjectCache(ctx, dstCfg, toBucket, to, url.origin);
+        if (moved) purgeObjectCache(ctx, cfg, targetBucket, from, url.origin);
+        return json({ ok: true, from, to, toBucket, moved, crossBucket: true }, 200, request, cfg);
+      } finally {
+        // 目标桶计数挂在 dstCfg 上，而请求级 finally 只会 flush 源桶，这里补一次避免漏计
+        const pending = flushCounters(dstCfg, env, toBucket).catch(() => {});
+        if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(pending);
       }
-      const headers = { 'Content-Type': upstream.headers.get('content-type') || 'application/octet-stream' };
-      const cc = upstream.headers.get('cache-control');
-      if (cc) headers['Cache-Control'] = cc;
-      const put = await b2Fetch(dstCfg, 'PUT', objectUrl(dstCfg, toBucket, to), {
-        headers,
-        body: upstream.body,
-        unsignedPayload: true,
-      });
-      if (!put.ok) {
-        return deny('写入目标桶失败: HTTP ' + put.status + '（源对象未删除，可重试）', request, cfg, 502);
-      }
-      const moved = body.move === true || url.searchParams.get('move') === '1';
-      if (moved) await deleteObject(cfg, targetBucket, from);
-      return json({ ok: true, from, to, toBucket, moved, crossBucket: true }, 200, request, cfg);
     }
 
     /* ---- 创建目录（0 字节 .keep 占位对象） ---- */
@@ -1952,10 +2034,12 @@ async function apiRouter(request, env, ctx, cfg, url) {
           if (body.byteLength > cfg.maxUploadBytes) {
             return json({ ok: false, error: '分片超过 MAX_UPLOAD_BYTES' }, 413, request, cfg);
           }
+          // 分片同样用 UNSIGNED-PAYLOAD，避免每片都重算 body 哈希
           const response = await b2Fetch(cfg, 'PUT', objectUrl(cfg, targetBucket, key), {
             query: { partNumber: String(partNumber), uploadId },
             headers: { 'content-type': 'application/octet-stream' },
             body,
+            unsignedPayload: true,
           });
           const text = await response.text();
           if (!response.ok) {
@@ -1981,6 +2065,7 @@ async function apiRouter(request, env, ctx, cfg, url) {
         const uploadId = String(body.uploadId || '');
         if (!key || !uploadId) return deny('需要 key / uploadId', request, cfg, 400);
         const res = await multipartComplete(cfg, targetBucket, key, uploadId);
+        if (res.ok) purgeObjectCache(ctx, cfg, targetBucket, key, url.origin);
         return json(res, res.ok ? 200 : (res.status || 500), request, cfg);
       }
 
@@ -2003,6 +2088,13 @@ async function apiRouter(request, env, ctx, cfg, url) {
 function escapeHtml(str) {
   return String(str).split('&').join('&amp;').split('<').join('&lt;')
     .split('>').join('&gt;').split('"').join('&quot;');
+}
+
+/** 内联进 <script> 的 JSON：转义 < > & 与行分隔符，防止 </script> 提前闭合标签造成注入 */
+function inlineJson(value) {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c').replace(/>/g, '\\u003e').replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
 }
 
 /* ---------- 主题：暖色（默认） / 深色 ---------- */
@@ -2125,7 +2217,7 @@ function renderDirectory(data, prefix, opts = {}) {
   }
 
   const initCount = data.folders.length + files.length;
-  const cfgJson = JSON.stringify({
+  const cfgJson = inlineJson({
     prefix, base, relPrefix, apiBase, bucket: bucketName,
     showManage: !!showManage,
     next: data.truncated ? (data.nextToken || '') : '', loaded: initCount,
@@ -2317,7 +2409,7 @@ function managePage(cfg, url) {
   // 对象访问根路径（挂载点前缀），下载一律走这里，不再用预签名直链
   const objectBase = basePath.endsWith('/') ? basePath : basePath + '/';
 
-  const configJson = JSON.stringify({
+  const configJson = inlineJson({
     apiBase,
     basePath: objectBase,
     defaultBucket,
@@ -3361,7 +3453,9 @@ async function dispatch(request, env, ctx, cfg) {
       const auth = await checkAuth(request, cfg);
       if (!auth.ok) return deny(auth.reason, request, cfg, 401);
       if (!cfg.enableWrite) return deny('已禁用写入（ENABLE_WRITE=false）', request, cfg, 405);
-      return putObject(request, cfg, bucket, resolved.key);
+      const res = await putObject(request, cfg, bucket, resolved.key);
+      if (res.ok) purgeObjectCache(ctx, cfg, bucket, resolved.key, url.origin);
+      return res;
     }
 
     case 'DELETE': {
@@ -3370,6 +3464,7 @@ async function dispatch(request, env, ctx, cfg) {
       if (!auth.ok) return deny(auth.reason, request, cfg, 401);
       if (!cfg.enableDelete) return deny('已禁用删除（ENABLE_DELETE=false）', request, cfg, 405);
       const res = await deleteObject(cfg, bucket, resolved.key);
+      if (res.ok) purgeObjectCache(ctx, cfg, bucket, resolved.key, url.origin);
       return json(res, res.ok ? 200 : (res.status || 500), request, cfg);
     }
 
