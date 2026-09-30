@@ -2069,6 +2069,9 @@ function renderDirectory(data, prefix, opts = {}) {
   const showManage = opts.showManage !== false;
   const hideKeep = opts.hideKeep !== false;
   const publicPrefix = opts.publicPrefix || '';
+  // 管理员删除目录用的 API 基址（挂载点感知：/<桶>/__api/ 或 /share/<桶>/__api/）
+  const apiBase = base.replace(/\/+$/, '') + API_PREFIX;
+  const bucketName = opts.bucket || '';
 
   const rows = [];
   // 目录占位对象（<prefix>/.keep）不参与展示与计数
@@ -2104,9 +2107,13 @@ function renderDirectory(data, prefix, opts = {}) {
     // 显示名 name 才需要去尾斜杠。不能再加完整列举前缀，否则别名下会出现 /share/<桶>/share/… 双前缀。
     const rel = relPrefix + folder.slice(prefix.length);
     const name = folder.slice(prefix.length).replace(/\/$/, '');
-    rows.push('<tr class="dir"><td>[DIR] <a href="' + base + escapeHtml(rel) + '">' + escapeHtml(name) + '/</a></td>'
+    // 匿名不给任何操作（连 JSON 也不暴露）；管理员给「删除」（删掉该目录的 .keep 占位）
+    const dirAct = showManage
+      ? '<td><button data-act="deldir" data-k="' + escapeHtml(folder + '.keep') + '">删除</button></td>'
+      : '<td></td>';
+    rows.push('<tr class="dir"><td><a href="' + base + escapeHtml(rel) + '">' + escapeHtml(name) + '/</a></td>'
       + '<td>-</td><td>-</td>'
-      + '<td><a href="' + base + escapeHtml(rel) + '?format=json">JSON</a></td></tr>');
+      + dirAct + '</tr>');
   }
 
   for (const file of files) {
@@ -2119,7 +2126,9 @@ function renderDirectory(data, prefix, opts = {}) {
 
   const initCount = data.folders.length + files.length;
   const cfgJson = JSON.stringify({
-    prefix, base, relPrefix, next: data.truncated ? (data.nextToken || '') : '', loaded: initCount,
+    prefix, base, relPrefix, apiBase, bucket: bucketName,
+    showManage: !!showManage,
+    next: data.truncated ? (data.nextToken || '') : '', loaded: initCount,
     hideKeep: !!hideKeep,
   });
 
@@ -2143,9 +2152,12 @@ function renderDirectory(data, prefix, opts = {}) {
     '    var name = p.slice(C.prefix.length);',
     '    var rel = C.relPrefix + p.slice(C.prefix.length);',
     '    if (name.charAt(name.length - 1) === "/") name = name.slice(0, -1);',
-    '    out += \'<tr class="dir"><td>[DIR] <a href="\' + C.base + esc(rel) + \'">\' + esc(name) + \'/</a></td>\'',
+    '    var act = C.showManage',
+    '      ? \'<td><button data-act="deldir" data-k="\' + esc(p + \'.keep\') + \'">删除</button></td>\'',
+    '      : \'<td></td>\';',
+    '    out += \'<tr class="dir"><td><a href="\' + C.base + esc(rel) + \'">\' + esc(name) + \'/</a></td>\'',
     '      + \'<td>-</td><td>-</td>\'',
-    '      + \'<td><a href="\' + C.base + esc(rel) + \'?format=json">JSON</a></td></tr>\';',
+    '      + act + \'</tr>\';',
     '  });',
     '  (d.files || []).filter(function (f) { return !(C.hideKeep && f.name === ".keep"); })',
     '    .forEach(function (f) {',
@@ -2185,6 +2197,23 @@ function renderDirectory(data, prefix, opts = {}) {
     'window.addEventListener("scroll", function () {',
     '  if (LOADING || !NEXT) return;',
     '  if (window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 300) more();',
+    '});',
+    '/* 管理员：删除目录（删掉该目录的 .keep 占位）。匿名页面不渲染这个按钮。 */',
+    'document.addEventListener("click", function (e) {',
+    '  var t = e.target;',
+    '  while (t && t !== document && t.tagName !== "BUTTON") t = t.parentNode;',
+    '  if (!t || t === document || t.getAttribute("data-act") !== "deldir") return;',
+    '  var k = t.getAttribute("data-k") || "";',
+    '  if (!k || !window.confirm("确认删除目录 " + k + " ？")) return;',
+    '  fetch(absUrl(C.apiBase + "object?key=" + encodeURIComponent(k) + "&bucket=" + encodeURIComponent(C.bucket || "")), {',
+    '    method: "DELETE", credentials: "same-origin",',
+    '  })',
+    '    .then(function (r) { return r.json(); })',
+    '    .then(function (j) {',
+    '      if (j && j.ok) location.reload();',
+    '      else window.alert("删除失败: " + ((j && j.error) || "未知错误"));',
+    '    })',
+    '    .catch(function () { window.alert("删除失败：网络错误"); });',
     '});',
     'paint();',
     '})();',
@@ -2524,7 +2553,7 @@ function managePage(cfg, url) {
     '  (data.folders || []).forEach(function (p) {',
     '    var name = p.slice(PREFIX.length);',
     '    if (name.charAt(name.length - 1) === "/") name = name.slice(0, -1);',
-    '    rows += "<tr class=\\"dir\\"><td>[DIR] <a data-act=\\"dir\\" data-p=\\"" + esc(p) + "\\">" + esc(name) + "</a></td>"',
+    '    rows += "<tr class=\\"dir\\"><td><a data-act=\\"dir\\" data-p=\\"" + esc(p) + "\\">" + esc(name) + "</a></td>"',
     '      + "<td class=\\"muted\\">目录</td><td></td>"',
     '      + "<td class=\\"act\\"><button class=\\"mini\\" data-act=\\"deldir\\" data-k=\\"" + esc(p + ".keep") + "\\">删除</button></td></tr>";',
     '  });',
@@ -3303,6 +3332,7 @@ async function dispatch(request, env, ctx, cfg) {
         const relPrefix = mount.alias ? prefix.slice(cfg.publicPrefix.length + 1) : prefix;
         return html(renderDirectory(result, prefix, {
           base,
+          bucket,
           label,
           showManage: auth.ok,
           hideKeep: cfg.hideKeep,

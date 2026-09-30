@@ -399,6 +399,23 @@ await check('share 子目录链接也不含重复 share 前缀', async () => {
   return '子目录链接正确';
 });
 
+await check('公开目录：匿名无操作列（不暴露 JSON/删除），管理员给「删除」', async () => {
+  const anon = await (await handle(req('/share/my-bucket/'), shareEnv, ctx)).text();
+  assert(!anon.includes('>JSON<'), '匿名不应显示 JSON 链接');
+  assert(!anon.includes('[DIR]'), '目录名不应带 [DIR] 前缀');
+  const row = (anon.match(/<tr class="dir">[\s\S]*?<\/tr>/) || [''])[0];
+  assert(row.includes('<td></td>'), '匿名目录行操作列应为空: ' + row);
+
+  const admin = await (await handle(
+    req('/share/my-bucket/', { headers: { Authorization: basic } }), shareEnv, ctx,
+  )).text();
+  const arow = (admin.match(/<tr class="dir">[\s\S]*?<\/tr>/) || [''])[0];
+  assert(arow.includes('data-act="deldir"'), '管理员目录行应有删除按钮: ' + arow);
+  assert(!admin.includes('>JSON<'), '管理员同样不应有 JSON 链接');
+  assert(!admin.includes('[DIR]'), '管理员视图目录名也不应带 [DIR]');
+  return '匿名留空 / 管理员删除 / 均无 [DIR] 与 JSON';
+});
+
 await check('匿名列举其它目录被重定向', async () => {
   const res = await handle(req('/my-bucket/private/'), shareEnv, ctx);
   assert(res.status === 308, 'status=' + res.status);

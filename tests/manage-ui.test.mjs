@@ -330,6 +330,14 @@ await check('管理器带「配置CORS」按钮并已绑定处理器', async () 
   return '按钮 + 处理器就位';
 });
 
+await check('管理页目录行不再显示 [DIR]（靠 dir 配色 + 「目录」标签区分）', async () => {
+  const page = await render(env);
+  assert(!page.includes('[DIR]'), '管理页仍出现 [DIR] 前缀');
+  assert(/class=\\?"dir\\?"/.test(page), '目录行应保留 dir 类（配色区分）');
+  assert(page.includes('>目录<'), '目录行应保留「目录」标签');
+  return '已去掉 [DIR]；保留 dir 配色与「目录」标签';
+});
+
 await check('objUrl：公开前缀内生成 /share/<桶>/… 可分享链接，其余 /<桶>/…（复制/下载不再报「未挂载的桶」）', async () => {
   const page = await render(env);
   const m = page.match(/function objUrl\(key\) \{[\s\S]*?\n\}/);
