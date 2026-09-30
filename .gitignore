@@ -10,3 +10,7 @@ node_modules/
 
 # 若你的 wrangler.toml 内含真实桶信息，可取消下一行注释避免误提交
 # wrangler.toml
+
+# GitHub Wiki 内容：它自己是一个独立 git 仓库（remote = cf-b2.wiki.git），
+# 只在「推送 wiki」时单独发布（见 _wiki-cfb2 内 git push wiki），不参与本仓库的代码提交。
+_wiki-cfb2/
