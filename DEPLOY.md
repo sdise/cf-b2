@@ -272,7 +272,21 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 - 需要改全局默认值 → 改 Workers 变量 `MULTIPART_PART_SIZE` / `UPLOAD_CONCURRENCY` 后重新部署。
 - Worker 代理模式下每片都要过 Worker，建议分片不要太大（25MiB 左右较稳）；直传模式下可酌情调大以减少请求数。
 
-### 3.5 B2 用量面板
+### 3.5 多桶挂载（BUCKET_1..N）
+
+自 2026-10 起改为**多桶挂载**：每个 B2 桶一个环境变量 BUCKET_N（N 为序号），值为 JSON：
+
+\json
+{ "BUCKET_NAME": "b1", "KEY_ID": "005..", "APPLICATION_KEY": "K005..", "ENDPOINT": "https://s3.us-west-004.backblazeb2.com" }
+\\n
+- 桶可分属**不同 B2 账号**（各自密钥/区域）；桶名不得为保留字 share/__api/__manage\n- URL 映射：/b1/… → 桶 b1；/share/b1/… → 桶 b1 的 share/ 前缀（匿名唯一入口）
+- 匿名只有 /share/** 的 GET，其余路径 308 重定向；虚拟根（/ 与 /share/）纯配置推导，0 次 Class C
+- 部署后首个请求自动为每个桶补建 share/.keep（幂等盲写，Class A 免费）
+- 跨桶改名/移动 = Worker 中转流式复制（源 GET + 目标 PUT + 源 DELETE）
+- 每个桶都要单独配 **CORS**（桶级），否则直传失败
+- /__manage 为全局入口（头部可切换桶），/b1/__manage 为该桶深链
+
+### 3.6 B2 用量面板
 
 管理页的用量卡片**只展示这 6 项，其余一概不显示**：桶名、已用空间（百分比为主值、数值行为第二行）、对象数、Class B、Class C、计数后端。
 

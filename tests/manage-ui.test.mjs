@@ -105,24 +105,18 @@ function buildSandbox(html) {
     if (target.includes('/usage')) {
       return okJson({
         ok: true,
-        bucket: 'demo-bucket',
-        quotaBytes: 10000000000,
-        storage: {
-          ok: true, usedBytes: 2147483648, objects: 12, pages: 3,
-          complete: true, cached: true, at: '2026-09-30T02:00:00.000Z',
-        },
-        classA: 7,
-        classB: { used: 128, quota: 2500, remaining: 2372 },
-        classC: { used: 12, quota: 2500, remaining: 2488 },
-        classD: 0,
-        counterBackend: 'do',
         counterBackendLabel: 'Durable Object',
-        windowed: true,
-        windowHour: 23,
         scanSchedule: '23:00 UTC',
-        resetSchedule: '0:00 UTC',
-        counterResetAt: '2026-09-30T00:00:12.000Z',
-        scope: '仅统计本 Worker 发往 B2 的请求；控制台、rclone 等其他客户端不计入',
+        resetSchedule: '23:00 UTC',
+        buckets: [{
+          name: 'demo-bucket', label: 'demo-bucket', ordinal: 1, quotaBytes: 10000000000,
+          storage: {
+            ok: true, usedBytes: 2147483648, objects: 12, pages: 3,
+            complete: true, cached: true, at: '2026-09-30T02:00:00.000Z',
+          },
+          classB: { used: 128, quota: 2500, remaining: 2372 },
+          classC: { used: 12, quota: 2500, remaining: 2488 },
+        }],
       });
     }
     return okJson({ ok: true, files: [], folders: [], truncated: false, nextToken: '' });
@@ -198,7 +192,10 @@ async function render(pageEnv) {
 }
 
 const env = {
-  B2_KEY_ID: 'k', B2_APPLICATION_KEY: 's', BUCKET_NAME: 'b',
+  BUCKET_1: JSON.stringify({
+    BUCKET_NAME: 'b', KEY_ID: 'k', APPLICATION_KEY: 's',
+    ENDPOINT: 'https://s3.us-west-001.backblazeb2.com',
+  }),
   ADMIN_USER: 'b2', ADMIN_PASS: 'b2',
   MAX_UPLOAD_BYTES: '96000000', MULTIPART_PART_SIZE: '26214400', UPLOAD_CONCURRENCY: '3',
 };

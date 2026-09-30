@@ -287,10 +287,6 @@ function prefixWithSlash(prefix) {
 }
 
 /** 公开目录的基础路径（$path 模式下需要带上桶名段） */
-function publicBase(cfg, bucket) {
-  return cfg.bucketMode === 'path' ? '/' + bucket + '/' : '/';
-}
-
 /** 会暴露后端实现/对象内部信息的响应头，统一剥离 */
 const LEAKY_HEADERS = [
   'x-amz-request-id', 'x-amz-id-2', 'x-amz-version-id', 'x-amz-expiration',
@@ -330,31 +326,23 @@ function sanitizeUpstreamError(response, cfg, extraHeaders) {
 }
 
 function loadConfig(env) {
-  const rawEndpoint = String(env.B2_ENDPOINT || DEFAULT_ENDPOINT).trim().replace(/\/+$/, '');
-  const endpoint = new URL(rawEndpoint);
-  const hostParts = endpoint.hostname.split('.');
-
-  let region = String(env.B2_REGION || '').trim();
-  if (!region) {
-    region = hostParts[0] === 's3' && hostParts.length > 2
-      ? hostParts.slice(1, -2).join('.')
-      : 'us-west-001';
-  }
-
-  const bucketName = String(env.BUCKET_NAME || '').trim();
-  const bucketMode = bucketName === '$path' ? 'path' : bucketName === '$host' ? 'host' : 'fixed';
+  const { buckets, problems } = parseBucketVars(env);
 
   return {
-    accessKeyId: String(env.B2_KEY_ID || env.B2_APPLICATION_KEY_ID || ''),
-    secretAccessKey: String(env.B2_APPLICATION_KEY || env.B2_SECRET_ACCESS_KEY || ''),
-    endpointOrigin: endpoint.origin,
-    endpointHost: endpoint.hostname,
-    region,
+    // 挂载表：BUCKET_1..N，每个桶可属于不同的 B2 账号（各自 KEY_ID / APPLICATION_KEY / ENDPOINT）
+    buckets,
+    mountProblems: problems,
+    // 以下字段随请求按桶切换（applyBucket），这里仅是占位默认值
+    accessKeyId: '',
+    secretAccessKey: '',
+    endpointOrigin: '',
+    endpointHost: '',
+    region: '',
     service: SERVICE,
     urlStyle: String(env.URL_STYLE || 'path').toLowerCase() === 'virtual' ? 'virtual' : 'path',
 
-    bucketMode,
-    bucketFixed: bucketName,
+    bucketMode: 'fixed',
+    bucketFixed: '',
 
     publicRead: readBool(env.PUBLIC_READ, true),
     publicWrite: readBool(env.PUBLIC_WRITE, false),
@@ -407,10 +395,8 @@ function loadConfig(env) {
       const hour = readInt(env.USAGE_REFRESH_AT_UTC_HOUR, -1);
       return hour >= 0 && hour <= 23 ? hour : -1;
     })(),
-    // 定时统计的桶列表（逗号分隔）。固定桶模式留空即用 BUCKET_NAME；
-    // $path / $host 模式无法枚举桶，必须显式列出才会在 scheduled 里统计
-    usageScheduleBuckets: String(env.USAGE_SCHEDULE_BUCKETS || '')
-      .split(',').map((s) => s.trim()).filter(Boolean),
+    // 定时统计的桶列表：直接来自挂载表（BUCKET_1..N）
+    usageScheduleBuckets: [],
     // scheduled() 里「刷新空间快照」的 UTC 小时（逗号分隔；* = 每次触发都做；- = 从不）
     usageScanHours: parseHourList(env.USAGE_SCAN_HOURS, '23'),
     // scheduled() 里「重置 Class A/B/C/D 计数」的 UTC 小时。
@@ -432,7 +418,127 @@ function loadConfig(env) {
   };
 }
 
-/* ============================ 4. 响应与鉴权 ============================ */
+/* ---- 多桶挂载表 ---- */
+
+/** 桶名不能占用这些路径段（大小写不敏感） */
+const RESERVED_MOUNTS = new Set(['share', '__api', '__manage']);
+
+/** 解析 BUCKET_1..N 环境变量（JSON：BUCKET_NAME / KEY_ID / APPLICATION_KEY / ENDPOINT）。
+ *  单个变量有问题只跳过该桶并记录，不影响其它桶。 */
+function parseBucketVars(env) {
+  const buckets = [];
+  const problems = [];
+  for (const key of Object.keys(env)) {
+    if (!/^BUCKET_\d+$/.test(key)) continue;
+    const ordinal = parseInt(key.slice(7), 10);
+    const fail = (msg) => problems.push(key + '：' + msg);
+    let raw;
+    try {
+      raw = JSON.parse(String(env[key]));
+    } catch {
+      fail('值不是合法 JSON');
+      continue;
+    }
+    if (!raw || typeof raw !== 'object') { fail('值应为 JSON 对象'); continue; }
+    const name = String(raw.BUCKET_NAME || '').trim().toLowerCase();
+    const keyId = String(raw.KEY_ID || '').trim();
+    const appKey = String(raw.APPLICATION_KEY || '').trim();
+    const endpoint = String(raw.ENDPOINT || '').trim().replace(/\/+$/, '');
+    const label = String(raw.LABEL || '').trim();
+    if (!name) { fail('缺少 BUCKET_NAME'); continue; }
+    if (!/^[a-z0-9][a-z0-9.-]*$/.test(name)) { fail('桶名不合法：' + name); continue; }
+    if (RESERVED_MOUNTS.has(name)) { fail('桶名是保留字：' + name); continue; }
+    if (!keyId || !appKey) { fail('缺少 KEY_ID / APPLICATION_KEY'); continue; }
+    if (!endpoint || !/^https:\/\//.test(endpoint)) { fail('缺少或非法 ENDPOINT'); continue; }
+    if (buckets.some((b) => b.name === name)) { fail('桶名与其它变量重复：' + name); continue; }
+    buckets.push({ name, keyId, appKey, endpoint, ordinal, label: label || name });
+  }
+  buckets.sort((a, b) => a.ordinal - b.ordinal);
+  return { buckets, problems };
+}
+
+function endpointInfo(rawEndpoint) {
+  const endpoint = new URL(rawEndpoint);
+  const hostParts = endpoint.hostname.split('.');
+  const region = hostParts[0] === 's3' && hostParts.length > 2
+    ? hostParts.slice(1, -2).join('.')
+    : 'us-west-001';
+  return { origin: endpoint.origin, host: endpoint.hostname, region };
+}
+
+/** 把全局 cfg 原地切换成指定桶的视图（凭据 / endpoint / 桶名）。
+ *  浅拷贝保留 cfg.usage 引用 → 同一请求内跨桶的调用都记进同一份计数。 */
+function applyBucket(cfg, name) {
+  const m = cfg.buckets.find((b) => b.name === name);
+  if (!m) return null;
+  const info = endpointInfo(m.endpoint);
+  cfg.accessKeyId = m.keyId;
+  cfg.secretAccessKey = m.appKey;
+  cfg.endpointOrigin = info.origin;
+  cfg.endpointHost = info.host;
+  cfg.region = info.region;
+  cfg.bucketFixed = m.name;
+  cfg.primaryBucket = m.name;
+  return cfg;
+}
+
+/** 独立的每桶视图（不改动请求级 cfg），给「遍历所有桶」的场景用 */
+function bucketView(cfg, m) {
+  const info = endpointInfo(m.endpoint);
+  return {
+    ...cfg,
+    accessKeyId: m.keyId,
+    secretAccessKey: m.appKey,
+    endpointOrigin: info.origin,
+    endpointHost: info.host,
+    region: info.region,
+    bucketFixed: m.name,
+    usage: { counts: {} },
+  };
+}
+
+/**
+ * 把 URL 路径解析成挂载视图：
+ *   /                → kind=root        （虚拟根：桶总览）
+ *   /share           → kind=shareRoot   （虚拟公开根）
+ *   /share/<b>/…     → kind=bucket      别名挂载：桶 b 的 share/… 前缀
+ *   /<b>/…           → kind=bucket      正常挂载：桶 b 的 …
+ *   其它             → kind=miss        （未挂载的首段）
+ */
+function resolveMount(cfg, pathname) {
+  let segs;
+  try {
+    segs = pathname.split('/').filter(Boolean).map((s) => decodeURIComponent(s));
+  } catch {
+    return { kind: 'bad' };
+  }
+  if (segs.some((s) => s === '.' || s === '..' || s.includes('\0'))) return { kind: 'bad' };
+  if (!segs.length) return { kind: 'root' };
+  const trailingSlash = pathname.endsWith('/');
+  const join = (arr) => '/' + arr.join('/') + (trailingSlash || arr.length === 0 ? '/' : '');
+
+  if (segs[0].toLowerCase() === 'share') {
+    if (segs.length === 1) return { kind: 'shareRoot' };
+    const m = cfg.buckets.find((b) => b.name === segs[1].toLowerCase());
+    if (!m) return { kind: 'miss', name: segs[1] };
+    return { kind: 'bucket', m, alias: true, inner: join(['share', ...segs.slice(2)]) };
+  }
+  const m = cfg.buckets.find((b) => b.name === segs[0].toLowerCase());
+  if (!m) return { kind: 'miss', name: segs[0] };
+  return { kind: 'bucket', m, alias: false, inner: join(segs.slice(1)) };
+}
+
+/** 匿名访问 /share/** 以外路径时的智能重定向目标 */
+function smartPublicRedirect(mount) {
+  if (mount && mount.kind === 'bucket' && !mount.alias && mount.m) {
+    const rest = mount.inner.replace(/^\/+/, '');
+    if (rest === 'share' || rest.startsWith('share/')) {
+      const tail = rest === 'share' ? '' : rest.slice('share/'.length);
+      return '/share/' + mount.m.name + (tail ? '/' + tail : '/');
+    }
+  }
+  return '/share/';
+}
 
 function corsHeaders(request, cfg) {
   const origin = request.headers.get('origin');
@@ -544,20 +650,11 @@ function bucketUrl(cfg, bucket) {
   return cfg.endpointOrigin + '/' + bucket + '/';
 }
 
-/** 依据请求解析 { bucket, key, isDir }：以 / 结尾视为目录列举 */
+/** 依据请求解析 { bucket, key, isDir }：以 / 结尾视为目录列举（多桶模式由 resolveMount 完成） */
 function resolveBucketKey(cfg, url) {
   const rawPath = url.pathname.replace(/^\/+/, '');
   const isDir = rawPath === '' || rawPath.endsWith('/');
   const pathKey = safeDecode(rawPath.replace(/\/+$/, ''));
-
-  if (cfg.bucketMode === 'path') {
-    const segments = pathKey.split('/').filter(Boolean);
-    if (segments.length === 0) return { bucket: '', key: '', isDir: true };
-    return { bucket: segments[0], key: normalizeKey(segments.slice(1).join('/')), isDir };
-  }
-  if (cfg.bucketMode === 'host') {
-    return { bucket: url.hostname.split('.')[0], key: normalizeKey(pathKey), isDir };
-  }
   return { bucket: cfg.bucketFixed, key: normalizeKey(pathKey), isDir };
 }
 
@@ -586,8 +683,8 @@ function recordUsage(cfg, cls) {
 }
 
 async function b2Fetch(cfg, method, url, options = {}) {
-  const { headers = {}, body = null, query = {} } = options;
-  const request = await signerOf(cfg).sign(method, url, { headers, body, query });
+  const { headers = {}, body = null, query = {}, unsignedPayload = false } = options;
+  const request = await signerOf(cfg).sign(method, url, { headers, body, query, unsignedPayload });
   recordUsage(cfg, classifyB2(method, new URL(request.url || url)));
   return fetch(request);
 }
@@ -1370,11 +1467,9 @@ async function usageState(cfg, env, bucket) {
   };
 }
 
-/** 定时统计要覆盖的桶列表：显式配置优先，固定桶模式回落到 BUCKET_NAME */
+/** 定时统计要覆盖的桶列表：直接来自挂载表（BUCKET_1..N） */
 function scheduledBuckets(cfg) {
-  if (cfg.usageScheduleBuckets.length) return cfg.usageScheduleBuckets;
-  if (cfg.bucketMode === 'fixed' && cfg.bucketFixed) return [cfg.bucketFixed];
-  return [];
+  return cfg.buckets.map((b) => b.name);
 }
 
 /** 扫描一次空间并落成快照（DO 优先；未绑定 DO 时写 Cache API） */
@@ -1433,12 +1528,15 @@ async function runScheduled(event, env) {
   if (cfg.enableUsage) cfg.usage = { counts: {} };   // 让定时任务里的 B2 调用也计入用量
 
   const results = [];
-  for (const bucket of buckets) {
+  for (const m of cfg.buckets) {
+    // 每桶独立视图（各自的凭据 / endpoint / 计数器）
+    const view = bucketView(cfg, m);
+    const bucket = m.name;
     const item = { bucket, scan: null, reset: null };
 
     if (doScan) {
       try {
-        const record = await refreshSnapshot(cfg, env, bucket);
+        const record = await refreshSnapshot(view, env, bucket);
         item.scan = { ok: true, usedBytes: record.usedBytes, objects: record.objects, backend: record.backend };
         console.log('[cf-b2-worker] 定时统计完成',
           bucket, record.usedBytes + 'B', record.objects + ' objects', 'via', record.backend);
@@ -1449,15 +1547,15 @@ async function runScheduled(event, env) {
     }
 
     // 定时任务自己发起的 B2 请求（如本次扫描的 Class C）先记账，再被下面的归零清掉
-    if (Object.keys(cfg.usage.counts).length) {
-      await flushCounters(cfg, env, bucket).catch((error) => {
+    if (Object.keys(view.usage.counts).length) {
+      await flushCounters(view, env, bucket).catch((error) => {
         console.error('[cf-b2-worker] 定时任务的用量计数写入失败', error && error.message);
       });
     }
 
     if (doReset) {
       try {
-        const out = await resetCounters(cfg, env, bucket);
+        const out = await resetCounters(view, env, bucket);
         item.reset = { ok: true, backend: out.backend, resetAt: out.resetAt };
         console.log('[cf-b2-worker] 当日计数已归零', bucket, 'via', out.backend);
       } catch (error) {
@@ -1501,12 +1599,16 @@ async function readJsonBody(request) {
   }
 }
 
-/** API 场景下的桶名解析：支持 <bucket>/__api/... 与 ?bucket= 两种写法 */
+/** API 场景下的桶名解析：支持 /<bucket>/__api/...、/share/<bucket>/__api/... 与 ?bucket= 三种写法 */
 function resolveApiBucket(cfg, basePath, url) {
-  if (cfg.bucketMode === 'fixed') return cfg.bucketFixed;
-  if (cfg.bucketMode === 'host') return url.hostname.split('.')[0];
-  const fromPath = basePath.split('/').filter(Boolean)[0];
-  return fromPath || url.searchParams.get('bucket') || '';
+  const segs = basePath.split('/').filter(Boolean);
+  let name = '';
+  if (segs[0] && segs[0].toLowerCase() === 'share' && segs.length >= 2) name = segs[1];
+  else if (segs.length) name = segs[0];
+  if (!name) name = url.searchParams.get('bucket') || '';
+  name = String(name).trim().toLowerCase();
+  if (!name && cfg.buckets.length) name = cfg.buckets[0].name;   // 缺省 = 第一个挂载桶
+  return cfg.buckets.some((b) => b.name === name) ? name : '';
 }
 
 async function apiRouter(request, env, ctx, cfg, url) {
@@ -1547,7 +1649,9 @@ async function apiRouter(request, env, ctx, cfg, url) {
       publicRead: cfg.publicRead,
       ...(details ? {
         bucketMode: cfg.bucketMode,
-        region: cfg.region,
+        region: cfg.buckets[0] ? endpointInfo(cfg.buckets[0].endpoint).region : cfg.region,
+        buckets: cfg.buckets.map((b) => b.name),
+        mountProblems: cfg.mountProblems,
         publicPrefix: cfg.publicPrefix || '',
         hideDetails: cfg.hideDetails,
       } : {}),
@@ -1561,51 +1665,47 @@ async function apiRouter(request, env, ctx, cfg, url) {
   if (!targetBucket) {
     return deny('无法确定桶名（请写成 /<bucket>' + API_PREFIX + '... 或携带 ?bucket=）', request, cfg, 400);
   }
+  // 按桶切换凭据 / endpoint；未挂载的桶一律拒绝
+  if (!applyBucket(cfg, targetBucket)) {
+    return deny('未挂载的桶：' + targetBucket, request, cfg, 404);
+  }
 
   switch (action) {
-    /* ---- B2 用量（空间 + 事务计数） ---- */
+    /* ---- B2 用量（全部挂载桶，按 BUCKET_N 序号排序） ---- */
     case 'usage': {
-      const state = cfg.enableUsage
-        ? await usageState(cfg, env, targetBucket)
-        : {
-          backend: 'off',
-          counters: { A: 0, B: 0, C: 0, D: 0, at: '' },
-          storage: { ok: false, error: '用量面板已关闭（ENABLE_USAGE_PANEL=false）' },
-          windowed: false,
-        };
-
-      // 本请求刚发生的 B2 调用（例如本次扫描本身）也一并计入展示
-      const live = (cfg.usage && cfg.usage.counts) || {};
-      const used = {
-        A: (state.counters.A || 0) + (live.A || 0),
-        B: (state.counters.B || 0) + (live.B || 0),
-        C: (state.counters.C || 0) + (live.C || 0),
-        D: (state.counters.D || 0) + (live.D || 0),
-      };
-      const remaining = (total, quota) => Math.max(0, quota - total);
-
+      if (!cfg.enableUsage) {
+        return json({ ok: false, error: '用量面板已关闭（ENABLE_USAGE_PANEL=false）' }, 200, request, cfg);
+      }
+      const list = [];
+      let backendLabel = '已关闭';
+      for (const m of cfg.buckets) {
+        // 每桶独立视图：扫描产生的调用按桶落账
+        const bc = bucketView(cfg, m);
+        const state = await usageState(bc, env, m.name);
+        if (!backendLabel || backendLabel === '已关闭') {
+          backendLabel = state.backend === 'do' ? 'Durable Object'
+            : (state.backend === 'cache' ? 'Cache API' : '已关闭');
+        }
+        const live = (bc.usage && bc.usage.counts) || {};
+        const usedB = (state.counters.B || 0) + (live.B || 0);
+        const usedC = (state.counters.C || 0) + (live.C || 0);
+        list.push({
+          name: m.name,
+          ordinal: m.ordinal,
+          label: m.label,
+          quotaBytes: cfg.storageQuotaBytes,
+          storage: state.storage,
+          classB: { used: usedB, quota: cfg.classBQuota, remaining: Math.max(0, cfg.classBQuota - usedB) },
+          classC: { used: usedC, quota: cfg.classCQuota, remaining: Math.max(0, cfg.classCQuota - usedC) },
+        });
+        await flushCounters(bc, env, m.name).catch(() => {});
+      }
       return json({
         ok: true,
-        bucket: targetBucket,
-        quotaBytes: cfg.storageQuotaBytes,
-        storage: state.storage,
-        counterBackend: state.backend,
-        counterBackendLabel: state.backend === 'do'
-          ? 'Durable Object'
-          : (state.backend === 'cache' ? 'Cache API' : '已关闭'),
-        windowed: state.windowed,
-        windowHour: cfg.usageRefreshHour,
-        autoScan: cfg.usageAutoScan,
-        scheduledBuckets: scheduledBuckets(cfg),
-        classA: used.A,
-        classB: { used: used.B, quota: cfg.classBQuota, remaining: remaining(used.B, cfg.classBQuota) },
-        classC: { used: used.C, quota: cfg.classCQuota, remaining: remaining(used.C, cfg.classCQuota) },
-        classD: used.D,
+        buckets: list,
+        counterBackendLabel: backendLabel,
         scanSchedule: hourListLabel(cfg.usageScanHours),
         resetSchedule: hourListLabel(cfg.usageResetHours),
-        counterResetAt: state.resetAt || state.counters.resetAt || '',
-        counterUpdatedAt: state.counters.at || '',
-        scope: '仅统计本 Worker 发往 B2 的请求；控制台、rclone 等其他客户端不计入',
         updatedAt: new Date().toISOString(),
       }, 200, request, cfg);
     }
@@ -1663,18 +1763,43 @@ async function apiRouter(request, env, ctx, cfg, url) {
       return deny('不支持的请求方法', request, cfg, 405);
     }
 
-    /* ---- 复制 / 移动 ---- */
+    /* ---- 复制 / 移动（支持跨桶：Worker 中转流式复制） ---- */
     case 'copy': {
       if (!cfg.enableWrite) return deny('已禁用写入（ENABLE_WRITE=false）', request, cfg, 403);
       const body = await readJsonBody(request);
       const from = normalizeKey(body.from || '');
       const to = normalizeKey(body.to || '');
+      const toBucket = String(body.toBucket || targetBucket).toLowerCase();
       if (!from || !to) return deny('需要 from 与 to', request, cfg, 400);
-      const res = await copyObject(cfg, targetBucket, from, to);
-      if (!res.ok) return deny(res.error, request, cfg, res.status || 500);
+      if (toBucket === targetBucket) {
+        const res = await copyObject(cfg, targetBucket, from, to);
+        if (!res.ok) return deny(res.error, request, cfg, res.status || 500);
+        const moved = body.move === true || url.searchParams.get('move') === '1';
+        if (moved) await deleteObject(cfg, targetBucket, from);
+        return json({ ok: true, from, to, moved, crossBucket: false }, 200, request, cfg);
+      }
+      // 跨桶（可能跨 B2 账号）：GET 源 → 流式 PUT 目标；调用方决定是否删除源
+      const dst = cfg.buckets.find((b) => b.name === toBucket);
+      if (!dst) return deny('目标桶未挂载：' + toBucket, request, cfg, 400);
+      const dstCfg = bucketView(cfg, dst);
+      const upstream = await b2Fetch(cfg, 'GET', objectUrl(cfg, targetBucket, from));
+      if (!upstream.ok) {
+        return deny('读取源对象失败: HTTP ' + upstream.status, request, cfg, upstream.status === 404 ? 404 : 502);
+      }
+      const headers = { 'Content-Type': upstream.headers.get('content-type') || 'application/octet-stream' };
+      const cc = upstream.headers.get('cache-control');
+      if (cc) headers['Cache-Control'] = cc;
+      const put = await b2Fetch(dstCfg, 'PUT', objectUrl(dstCfg, toBucket, to), {
+        headers,
+        body: upstream.body,
+        unsignedPayload: true,
+      });
+      if (!put.ok) {
+        return deny('写入目标桶失败: HTTP ' + put.status + '（源对象未删除，可重试）', request, cfg, 502);
+      }
       const moved = body.move === true || url.searchParams.get('move') === '1';
       if (moved) await deleteObject(cfg, targetBucket, from);
-      return json({ ok: true, from, to, moved }, 200, request, cfg);
+      return json({ ok: true, from, to, toBucket, moved, crossBucket: true }, 200, request, cfg);
     }
 
     /* ---- 创建目录（0 字节 .keep 占位对象） ---- */
@@ -1846,29 +1971,29 @@ function renderDirectory(data, prefix, opts = {}) {
   // 目录占位对象（<prefix>/.keep）不参与展示与计数
   const files = hideKeep ? data.files.filter((f) => f.name !== '.keep') : data.files;
 
-  /* 路径导航：每一级都可点击（匿名从公开根开始，不显示公开前缀本身；管理员从桶根开始） */
-  const segs = prefix.replace(/\/+$/, '').split('/').filter(Boolean);
-  const fromPublicRoot = !showManage && publicPrefix && segs[0] === publicPrefix;
-  const visibleSegs = fromPublicRoot ? segs.slice(1) : segs;
-  const rootHref = fromPublicRoot ? base + escapeHtml(publicPrefix) + '/' : base;
-  const crumbs = ['<a href="' + rootHref + '">' + escapeHtml(baseLabel) + '</a>'];
-  let acc = fromPublicRoot ? publicPrefix + '/' : '';
-  visibleSegs.forEach((seg, i) => {
+  /* 路径导航：挂载点段（crumbPre，由调用方按挂载方式给出）+ 相对段（relPrefix），每一级都可点击 */
+  const crumbPre = Array.isArray(opts.crumbPre) ? opts.crumbPre : [];
+  const relPrefix = opts.relPrefix !== undefined ? opts.relPrefix : prefix;
+  const crumbs = crumbPre.map((c) => '<a href="' + escapeHtml(c.href) + '">' + escapeHtml(c.label) + '</a>');
+  const segs = relPrefix.replace(/\/+$/, '').split('/').filter(Boolean);
+  let acc = '';
+  segs.forEach((seg, i) => {
     acc += seg + '/';
-    crumbs.push(i === visibleSegs.length - 1
+    crumbs.push(i === segs.length - 1
       ? '<span class="cur">' + escapeHtml(seg) + '</span>'
       : '<a href="' + base + escapeHtml(acc) + '">' + escapeHtml(seg) + '</a>');
   });
+  if (!crumbs.length) crumbs.push('<span class="cur">/</span>');
   const crumbsHtml = '<nav class="crumb">' + crumbs.join('<span class="sep">/</span>') + '</nav>';
 
-  if (prefix) {
-    // 注意 prefix 形如 "share/images/"，先去尾斜杠再取父级，否则会算成自己
-    const parent = prefix.replace(/\/+$/, '').split('/').slice(0, -1).join('/');
-    // 匿名在公开根（如 /share/）已无处可回，管理员仍可回到根
-    if (parent !== '' || showManage) {
-      rows.push('<tr><td colspan="4"><a href="' + base
-        + escapeHtml(parent ? parent + '/' : '') + '">返回上一级</a></td></tr>');
-    }
+  if (relPrefix.replace(/\/+$/, '')) {
+    // 注意 relPrefix 形如 "images/"，先去尾斜杠再取父级，否则会算成自己
+    const parent = relPrefix.replace(/\/+$/, '').split('/').slice(0, -1).join('/');
+    rows.push('<tr><td colspan="4"><a href="' + base
+      + escapeHtml(parent ? parent + '/' : '') + '">返回上一级</a></td></tr>');
+  } else if (opts.upHref) {
+    // 已在挂载根：返回到虚拟根（/ 或 /share/）
+    rows.push('<tr><td colspan="4"><a href="' + escapeHtml(opts.upHref) + '">返回上一级</a></td></tr>');
   }
 
   for (const folder of data.folders) {
@@ -2048,25 +2173,20 @@ function welcomePage(cfg, bucketLabel, prefix, publicPath) {
 /* ============================ 8. 文件管理器页面 ============================ */
 
 function managePage(cfg, url) {
-  // $path 模式下，管理器可以挂在 /<bucket>/__manage，此时 API 也走同名前缀
-  let apiBase = API_PREFIX;
-  let defaultBucket = '';
-  if (cfg.bucketMode === 'fixed') {
-    defaultBucket = cfg.bucketFixed;
-  } else if (cfg.bucketMode === 'path') {
-    const basePath = url.pathname.slice(0, url.pathname.lastIndexOf(MANAGE_PATH));
-    const bucketFromPath = basePath.split('/').filter(Boolean)[0];
-    if (bucketFromPath) apiBase = '/' + bucketFromPath + API_PREFIX;
-    else defaultBucket = url.searchParams.get('bucket') || '';
-  }
+  // 管理器挂在挂载点下：/<bucket>/__manage 或别名 /share/<bucket>/__manage
+  const basePath = url.pathname.slice(0, -MANAGE_PATH.length) || '/';
+  const apiBase = basePath.replace(/\/+$/, '') + API_PREFIX;
+  const defaultBucket = cfg.bucketFixed;
 
-  // 对象访问根路径（$path 模式会带桶名段），下载一律走这里，不再用预签名直链
-  const basePath = apiBase.slice(0, apiBase.lastIndexOf(API_PREFIX)) + '/';
+  // 对象访问根路径（挂载点前缀），下载一律走这里，不再用预签名直链
+  const objectBase = basePath.endsWith('/') ? basePath : basePath + '/';
 
   const configJson = JSON.stringify({
     apiBase,
-    basePath,
+    basePath: objectBase,
     defaultBucket,
+    bucket: cfg.bucketFixed,
+    buckets: cfg.buckets.map((b) => ({ name: b.name, label: b.label })),
     publicPrefix: cfg.publicPrefix,
     bucketMode: cfg.bucketMode,
     bucketFixed: cfg.bucketFixed,
@@ -2106,19 +2226,20 @@ function managePage(cfg, url) {
     'button.ghost{background:var(--chip);color:var(--txt);border-color:var(--line)}',
     'button.mini{padding:3px 7px;font-size:12px;background:var(--chip);border-color:var(--line);color:var(--txt)}',
     'button:disabled{opacity:.45;cursor:not-allowed}',
-    // 桌面端：左侧用量卡片（250px 窄栏），右侧文件列表
-    'main{max-width:1280px;margin:0 auto;padding:20px;display:grid;grid-template-columns:250px minmax(0,1fr);gap:20px;align-items:start}',
+    // 桌面端：左侧用量卡片（360px，容纳多桶两列），右侧文件列表
+    'main{max-width:1400px;margin:0 auto;padding:20px;display:grid;grid-template-columns:360px minmax(0,1fr);gap:20px;align-items:start}',
     '.content{min-width:0}',
     // 表格列宽用 class 而不用内联样式，移动端断点才能覆盖
     '.c-size{width:110px}.c-time{width:180px}.c-act{width:300px;text-align:right}.act{text-align:right}',
     // 移动端「更多」折叠区：桌面用 display:contents，子项直接参与 header 的 flex 布局
-    // order 的取值刻意让桌面视觉顺序与改造前完全一致
+    // order 的取值刻意让桌面视觉顺序稳定（桶切换器在新建目录之前）
     '.more{display:contents}',
     '.more-toggle{display:none}',
     '.more>*{order:1}',
-    '#btnMkdir{order:2}#upMode{order:3}',
-    '.more .set,.more #btnTheme{order:4}',
-    '#btnUpload{order:5}',
+    '#bucketSel{order:2}',
+    '#btnMkdir{order:3}#upMode{order:4}',
+    '.more .set,.more #btnTheme{order:5}',
+    '#btnUpload{order:6}',
     // 移动端：① 不显示 B2 桶信息 ② 顶部只常显「新建目录 / 上传方式 / 上传」，其余折叠
     // ③ 隐藏「修改时间」并拉宽「操作」，让「复制/下载/重命名/删除」放得下、好点
     '@media (max-width:860px){',
@@ -2132,6 +2253,8 @@ function managePage(cfg, url) {
     '.more h1{font-size:14px}',
     '.more-toggle{display:inline-block;order:4}',
     '#btnMkdir{order:1}#upMode{order:2}#btnUpload{order:3}',
+    // 桶切换器在移动端收进折叠区
+    '#bucketSel{order:0;max-width:150px}',
     // 文件列表：文件行为「两行」（第一行 名称+大小，第二行 四个操作按钮整行铺开；
     // 390px 下按钮挤在名称右侧会让名称只剩 ~58px，长文件名折成 10 行）。
     // 目录行保持「一行」：名称占满、删除按钮尾部右对齐（目录只有一个按钮，放得下）。
@@ -2178,6 +2301,14 @@ function managePage(cfg, url) {
     '.usage .bar>i{display:block;height:100%;background:var(--acc)}',
     '.usage .over{color:#c2410c}',
     '.usage .foot{margin-top:10px;padding-top:8px;border-top:1px solid var(--line);color:var(--dim);font-size:12px}',
+    // 多桶用量：每桶一块，两列并排
+    '.bgrid{display:grid;grid-template-columns:1fr 1fr;gap:10px}',
+    '.bcell{min-width:0;border:1px solid var(--line);border-radius:10px;padding:10px;background:var(--bg)}',
+    '.bcell .bname{font-weight:600;margin-bottom:6px;font-size:13px;overflow-wrap:anywhere}',
+    '.bcell .row{display:flex;flex-direction:column;gap:4px}',
+    '.bcell .kv{gap:4px}',
+    '.bcell .v{font-size:13px}',
+    '.bcell .muted{font-size:12px;overflow-wrap:anywhere}',
     '</style></head><body>',
     '<header>',
     // 折叠区（桌面 display:contents → 顺序与改造前完全一致）
@@ -2190,6 +2321,7 @@ function managePage(cfg, url) {
     '<button class="ghost" id="btnLogin">鉴权</button>',
     '<button class="ghost" id="btnLogout">退出</button>',
     '<button class="ghost" id="btnRefresh">刷新</button>',
+    '<select id="bucketSel" title="切换到其它桶的管理器"></select>',
     '<label class="set" title="分片大小（MiB）。直传单次 PUT 上限为 5–95，Worker 代理受 MAX_UPLOAD_BYTES 约束；B2 硬上限 100MiB。">分片',
     '<input id="partSize" type="number" min="5" max="95" step="1" value="' + defaultPartMiB + '">MiB</label>',
     '<label class="set" title="分片并发上传数，1–10。越大越快，但更吃带宽/上游限流。">并发',
@@ -2633,10 +2765,16 @@ function managePage(cfg, url) {
     '      copyText(objUrl(k));',
     '      break;',
     '    case "ren":',
-    '      var target = window.prompt("重命名为：", k.split("/").pop());',
+    '      var target = window.prompt("重命名为（输入 其它桶名/路径 可跨桶移动）：", k.split("/").pop());',
     '      if (!target) return;',
-    '      call("copy", { method: "POST", body: JSON.stringify({ from: k, to: PREFIX + target, move: true }) })',
-    '        .then(function (r) { toast(r.ok ? "已重命名" : "失败: " + (r.data.error || r.status), !r.ok); refresh(); });',
+    '      var toBucket = CFG.bucketFixed, toKey = PREFIX + target;',
+    '      var head = target.split("/")[0].toLowerCase();',
+    '      if ((CFG.buckets || []).some(function (b) { return b.name === head; }) && head !== CFG.bucketFixed) {',
+    '        toBucket = head;',
+    '        toKey = target.slice(head.length + 1);',
+    '      }',
+    '      call("copy", { method: "POST", body: JSON.stringify({ from: k, to: toKey, toBucket: toBucket, move: true }) })',
+    '        .then(function (r) { toast(r.ok ? (r.data.crossBucket ? "已移动到 " + toBucket : "已重命名") : "失败: " + (r.data.error || r.status), !r.ok); refresh(); });',
     '      break;',
     '    case "del":',
     '    case "deldir":',
@@ -2739,30 +2877,39 @@ function managePage(cfg, url) {
     '    + "<span class=\\"v" + (over ? " over" : "") + "\\">" + used + "</span>"',
     '    + "<span class=\\"muted\\">/ " + (quota || "-") + "</span></span>";',
     '}',
-    '/* 用量卡片：只展示「桶 / 已用空间 / 对象数 / Class B / Class C / 计数后端」，其余一律不展示 */',
+    '/* 用量卡片：全部挂载桶两列并排（按 BUCKET_N 序号排序），每桶只展示',
+    '   「桶名 / 已用空间 / 对象数 / Class B / Class C」，计数后端放卡片底部 */',
     'function renderUsage(d) {',
-    '  var s = (d && d.storage) || {};',
-    '  var quota = d.quotaBytes || 0;',
+    '  var list = (d && d.buckets) || [];',
     '  var html = "";',
-    '  if (s.ok === false) {',
-    '    html += "<div class=\\"row\\"><span>空间统计失败：" + esc(s.error || "未知错误") + "</span></div>";',
+    '  if (!list.length) {',
+    '    html += "<div class=\\"row\\"><span>没有已挂载的桶</span></div>";',
     '  } else {',
-    '    var used = s.usedBytes || 0;',
-    '    html += "<div class=\\"row\\">"',
-    '      + "<span class=\\"kv\\"><span class=\\"muted\\">桶</span><span class=\\"v\\">" + esc(d.bucket || "") + "</span></span>"',
-    '      + (quota',
-    '        ? "<span class=\\"kv\\"><span class=\\"muted\\">已用空间:</span><span class=\\"v\\">" + pct(used, quota) + "</span></span>"',
-    '          + "<span class=\\"muted\\" style=\\"padding-left:2px\\">" + sizeD(used) + " / " + sizeD(quota) + "</span>"',
-    '        : "<span class=\\"kv\\"><span class=\\"muted\\">已用空间</span><span class=\\"v\\">" + sizeD(used) + "</span></span>")',
-    '      + "<span class=\\"kv\\"><span class=\\"muted\\">对象数</span><span class=\\"v\\">" + (s.objects || 0) + "</span>"',
-    '      + (s.complete === false ? "<span class=\\"over\\">（扫描到上限，实际更多）</span>" : "") + "</span>"',
-    '      + "</div>";',
-    '    if (quota) html += \'<div class="bar"><i style="width:\' + Math.min(100, used / quota * 100) + \'%"></i></div>\';',
+    '    html += \'<div class="bgrid">\';',
+    '    list.forEach(function (b) {',
+    '      var s = b.storage || {};',
+    '      var quota = b.quotaBytes || 0;',
+    '      var cell = "<div class=\\"bcell\\"><div class=\\"bname\\">" + esc(b.label || b.name) + "</div>";',
+    '      if (s.ok === false) {',
+    '        cell += "<div class=\\"muted\\">空间统计失败：" + esc(s.error || "未知错误") + "</div>";',
+    '      } else {',
+    '        var used = s.usedBytes || 0;',
+    '        cell += "<div class=\\"row\\">"',
+    '          + "<span class=\\"kv\\"><span class=\\"muted\\">已用空间:</span><span class=\\"v\\">" + pct(used, quota) + "</span></span>"',
+    '          + (quota ? "<span class=\\"muted\\">" + sizeD(used) + " / " + sizeD(quota) + "</span>" : "<span class=\\"muted\\">" + sizeD(used) + "</span>")',
+    '          + "<span class=\\"kv\\"><span class=\\"muted\\">对象数</span><span class=\\"v\\">" + (s.objects || 0) + "</span>"',
+    '          + (s.complete === false ? "<span class=\\"over\\">（扫描到上限，实际更多）</span>" : "") + "</span>"',
+    '          + "</div>";',
+    '        if (quota) cell += \'<div class="bar"><i style="width:\' + Math.min(100, used / quota * 100) + \'%"></i></div>\';',
+    '      }',
+    '      cell += "<div class=\\"row\\" style=\\"margin-top:8px\\">"',
+    '        + quotaCell("Class B:", (b.classB || {}).used || 0, (b.classB || {}).quota || 0)',
+    '        + quotaCell("Class C:", (b.classC || {}).used || 0, (b.classC || {}).quota || 0)',
+    '        + "</div></div>";',
+    '      html += cell;',
+    '    });',
+    '    html += "</div>";',
     '  }',
-    '  html += "<div class=\\"row\\" style=\\"margin-top:10px\\">"',
-    '    + quotaCell("Class B:", (d.classB || {}).used || 0, (d.classB || {}).quota || 0)',
-    '    + quotaCell("Class C:", (d.classC || {}).used || 0, (d.classC || {}).quota || 0)',
-    '    + "</div>";',
     '  html += \'<div class="foot"><span>计数后端：\' + esc(d.counterBackendLabel || "-") + "</span></div>";',
     '  el("usage").innerHTML = html;',
     '}',
@@ -2780,9 +2927,18 @@ function managePage(cfg, url) {
     '  });',
     '}',
     'loadUsage();',
-    'el("bucketLabel").textContent = CFG.bucketMode === "fixed"',
-    '  ? ("桶: " + CFG.bucketFixed)',
-    '  : (CFG.bucketMode === "path" ? "桶: 按 URL 首段动态解析" : "桶: 按主机名首段动态解析");',
+    'el("bucketLabel").textContent = "桶: " + CFG.bucketFixed;',
+    '/* 桶切换器：跳到目标桶的管理器（多桶挂载） */',
+    '(CFG.buckets || []).forEach(function (b) {',
+    '  var o = document.createElement("option");',
+    '  o.value = b.name;',
+    '  o.textContent = b.label;',
+    '  if (b.name === CFG.bucket) o.selected = true;',
+    '  el("bucketSel").appendChild(o);',
+    '});',
+    'el("bucketSel").onchange = function () {',
+    '  location.href = "/" + el("bucketSel").value + "/__manage";',
+    '};',
     'if (CFG.publicWrite) { el("btnLogin").className = "ghost hidden"; el("btnLogout").className = "ghost hidden"; }',
     'try {',
     '  var st = sessionStorage.getItem("cfb2-token");',
@@ -2810,81 +2966,189 @@ async function handle(request, env, ctx) {
     return await dispatch(request, env, ctx, cfg);
   } finally {
     if (cfg.usage && Object.keys(cfg.usage.counts).length) {
-      const url = new URL(request.url);
-      const resolved = resolveBucketKey(cfg, url);
-      const bucket = resolved.bucket || cfg.bucketFixed || '';
-      const pending = flushCounters(cfg, env, bucket).catch(() => {});
+      const bucket = cfg.primaryBucket || (cfg.buckets[0] && cfg.buckets[0].name) || '';
+      const pending = bucket ? flushCounters(cfg, env, bucket).catch(() => {}) : Promise.resolve();
       if (ctx && typeof ctx.waitUntil === 'function') ctx.waitUntil(pending);
     }
   }
 }
 
+/** 虚拟根页面（桶总览 / 公开桶聚合）。纯配置推导，0 次 B2 调用。 */
+function mountListPage(cfg, { publicRoot, isAdmin }) {
+  const title = publicRoot ? '公开目录' : '根目录';
+  const items = cfg.buckets.map((b) => ({
+    text: '[DIR] ' + (publicRoot ? b.label : b.name),
+    href: publicRoot ? '/share/' + b.name + '/' : '/' + b.name + '/',
+    sub: publicRoot ? '桶 ' + b.name + ' 的公开目录' : '桶 ' + b.name,
+  }));
+  const rows = items.map((it) =>
+    '<tr class="dir"><td><a href="' + escapeHtml(it.href) + '">' + escapeHtml(it.text) + '</a></td>'
+    + '<td class="muted" colspan="3">' + escapeHtml(it.sub) + '</td></tr>',
+  ).join('') || '<tr><td colspan="4" class="muted">（未配置任何桶）</td></tr>';
+
+  const crumbs = publicRoot
+    ? '<nav class="crumb"><span class="cur">公开目录</span></nav>'
+    : '<nav class="crumb"><span class="cur">根目录</span></nav>';
+  const adminBar = isAdmin
+    ? '<div class="sub"><a class="acc" href="' + MANAGE_PATH + '">文件管理器</a> · 共 ' + cfg.buckets.length + ' 个桶'
+      + (publicRoot ? '' : ' · 匿名用户只能访问 <a class="acc" href="/share/">/share/</a>') + '</div>'
+    : '';
+
+  return [
+    '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
+    '<meta name="viewport" content="width=device-width,initial-scale=1">',
+    '<title>' + title + ' - B2 Index</title>',
+    '<link rel="icon" href="data:,">',
+    '<style>',
+    themeCss(),
+    'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0;padding:32px}',
+    '.wrap{max-width:900px;margin:0 auto}',
+    '.crumb{font-size:18px;font-weight:600;margin:0 0 12px}',
+    '.crumb a{color:var(--acc)}.crumb a:hover{text-decoration:underline}',
+    '.acc{color:var(--acc)}',
+    'table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}',
+    'td{padding:12px 14px;border-bottom:1px solid var(--line);font-size:14px}',
+    'tr:last-child td{border-bottom:0}',
+    'tr.dir td{background:var(--folder)}',
+    'tr.dir td a{color:var(--folderTxt)}',
+    '.muted{color:var(--dim)}',
+    '</style></head><body><div class="wrap">',
+    crumbs,
+    adminBar,
+    '<table><tbody>' + rows + '</tbody></table>',
+    '</div><script>' + themeToggleScript() + '</script></body></html>',
+  ].join('\n');
+}
+
+/** 部署后引导：给每个挂载桶盲写 <share>/.keep（幂等，Class A 免费，0 次 Class C）。
+ *  用 Cache API 标记（键含挂载表指纹）去重；换个 colo 重复盲写也无害。 */
+let bootstrappedMounts = '';   // 本隔离实例已做过的引导（Cache 标记负责跨实例去重）
+
+async function bootstrapPublicDirs(cfg, env) {
+  if (!cfg.buckets.length) return;
+  const names = cfg.buckets.map((b) => b.name).join(',');
+  if (bootstrappedMounts === names) return;
+  const flagKey = USAGE_CACHE_ORIGIN + '/bootstrap/' + (await sha256Hex(names)).slice(0, 32);
+  const seen = await cacheGetJson(flagKey);
+  if (seen && seen.done) return;
+  await Promise.all(cfg.buckets.map(async (m) => {
+    const bc = bucketView(cfg, m);
+    try {
+      await b2Fetch(bc, 'PUT', objectUrl(bc, m.name, cfg.publicPrefix + '/.keep'), {
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: '',
+      });
+    } catch (error) {
+      console.error('[cf-b2-worker] 引导公开目录失败', m.name, error && error.message);
+    }
+  }));
+  await cachePutJson(flagKey, { done: true }, 30 * 86400);
+  bootstrappedMounts = names;
+}
+
 async function dispatch(request, env, ctx, cfg) {
   const url = new URL(request.url);
 
-  const missing = [];
-  if (!cfg.accessKeyId) missing.push('B2_KEY_ID / B2_APPLICATION_KEY_ID');
-  if (!cfg.secretAccessKey) missing.push('B2_APPLICATION_KEY');
-  if (cfg.bucketMode === 'fixed' && !cfg.bucketFixed) missing.push('BUCKET_NAME');
-  if (missing.length) {
-    return json({ ok: false, error: '缺少必需配置: ' + missing.join(', ') }, 500, request, cfg);
+  if (!cfg.buckets.length) {
+    return json({
+      ok: false,
+      error: '未配置任何桶：请添加 BUCKET_1 环境变量（JSON，含 BUCKET_NAME / KEY_ID / APPLICATION_KEY / ENDPOINT）'
+        + (cfg.mountProblems.length ? '；配置问题：' + cfg.mountProblems.join('；') : ''),
+    }, 500, request, cfg);
   }
 
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: corsHeaders(request, cfg) });
   }
 
-  /* ---- 管理 API（也支持 /<bucket>/__api/... 形式） ---- */
+  /* 部署后引导（异步，不阻塞响应）：给每个桶补建 share/ 占位目录 */
+  if (ctx && typeof ctx.waitUntil === 'function') {
+    ctx.waitUntil(bootstrapPublicDirs(cfg, env).catch(() => {}));
+  }
+
+  /* ---- 管理 API（/<bucket>/__api/... 与 /share/<bucket>/__api/...） ---- */
   if (url.pathname.includes(API_PREFIX)) {
     return apiRouter(request, env, ctx, cfg, url);
   }
 
-  /* ---- 文件管理器页面（也支持 /<bucket>/__manage 形式） ---- */
+  /* ---- 文件管理器页面（/<bucket>/__manage；匿名保留 401 挑战以便浏览器弹出登录） ---- */
   if (cfg.enableManage && url.pathname.endsWith(MANAGE_PATH)) {
     const auth = await checkAuth(request, cfg);
     if (!auth.ok) return challenge(request, cfg);
+    const base = url.pathname.slice(0, -MANAGE_PATH.length);
+    const name = resolveApiBucket(cfg, base, url);
+    if (!name || !applyBucket(cfg, name)) {
+      return Response.redirect(new URL('/' + cfg.buckets[0].name + MANAGE_PATH, url.origin).toString(), 302);
+    }
     return html(managePage(cfg, url));
   }
 
-  const resolved = resolveBucketKey(cfg, url);
-  const bucket = resolved.bucket;
-  if (!bucket) return deny('无法确定桶名', request, cfg, 400);
+  const mount = resolveMount(cfg, url.pathname);
+  const auth = await checkAuth(request, cfg);
+  const isAdmin = auth.ok;
+  const anonymous = !isAdmin;
+
+  /* 非法路径（穿越段）最先拒绝 */
+  if (mount.kind === 'bad') {
+    return deny('非法路径', request, cfg, 400);
+  }
+
+  /* 匿名：默认只有别名 /share/<桶>/** 的 GET；PUBLIC_PREFIX 留空时退回旧开放模式（整桶可读）。
+     规范路径 /<桶>/share/** 对匿名一律 308 到别名，保证公开内容只有单一 URL。 */
+  if (anonymous) {
+    const isRead = request.method === 'GET' || request.method === 'HEAD';
+    let allowed = false;
+    if (isRead && mount.kind === 'shareRoot') {
+      allowed = true;   // 公开聚合根本身就是匿名入口
+    } else if (isRead && mount.kind === 'bucket') {
+      const key = normalizeKey(mount.inner);
+      allowed = mount.alias
+        ? withinPrefix(key, cfg.publicPrefix)
+        : !cfg.publicPrefix && withinPrefix(key, cfg.publicPrefix);
+    }
+    if (!allowed) {
+      if (!isRead) {
+        return json({ ok: false, error: '匿名只有 /share/ 的浏览与下载权限（GET）' }, 401, request, cfg);
+      }
+      const target = mount.kind === 'bucket' && !mount.alias ? smartPublicRedirect(mount) : '/share/';
+      return Response.redirect(new URL(target, url.origin).toString(), 308);
+    }
+  }
+
+  /* ---- 虚拟根 / 未挂载 / 非法路径 ---- */
+  if (mount.kind === 'root' || mount.kind === 'shareRoot') {
+    if (request.method !== 'GET' && request.method !== 'HEAD') {
+      return deny((mount.kind === 'root' ? '根目录' : '/share/') + ' 是虚拟目录，不支持该操作', request, cfg, 403);
+    }
+    return html(mountListPage(cfg, { publicRoot: mount.kind === 'shareRoot', isAdmin }));
+  }
+  if (mount.kind === 'miss') {
+    if (anonymous) return Response.redirect(new URL('/share/', url.origin).toString(), 308);
+    return json({ ok: false, error: '未挂载的桶：' + (mount.name || '') }, 404, request, cfg);
+  }
+
+  /* ---- 挂载的桶 ---- */
+  applyBucket(cfg, mount.m.name);
+  const bucket = mount.m.name;
+  const resolved = {
+    bucket,
+    key: normalizeKey(mount.inner.replace(/^\/+/, '').replace(/\/+$/, '')),
+    isDir: mount.inner === '/' || mount.inner.endsWith('/'),
+  };
 
   switch (request.method) {
     case 'GET':
     case 'HEAD': {
-      /* 统一的访问口径：
-       *   管理员（Basic/Bearer 通过）   → 全部权限
-       *   匿名                          → 只能读/列 PUBLIC_PREFIX（默认 share）以内，其余拒绝
-       *                                  且访问根路径自动 302 到 /<PUBLIC_PREFIX>/
-       */
-      const auth = await checkAuth(request, cfg);
-      const isAdmin = auth.ok;
-      const anonymous = !isAdmin;
-      const publicPath = publicBase(cfg, bucket) + prefixWithSlash(cfg.publicPrefix);
-
       if (resolved.isDir) {
         // 目录 → 列表（HTML 或 JSON）
         const prefix = dirPrefix(
           url.searchParams.get('prefix') || (resolved.key ? resolved.key + '/' : ''),
         );
-        // 匿名列举：只允许在公开前缀内（PUBLIC_LIST），或全局开放 ALLOW_LIST_BUCKET
+        // 匿名只可能来自别名挂载（inner 必在公开前缀内），这里再做一次防御性校验
         const anonymousListingOk = anonymous && cfg.publicRead
           && ((cfg.publicPrefix && cfg.publicList && withinPrefix(prefix, cfg.publicPrefix)) || cfg.allowList);
-
-        if (!isAdmin && !cfg.allowList && !anonymousListingOk) {
-          // 匿名访问根路径 → 自动路由到公开目录
-          if (!prefix && cfg.publicPrefix) {
-            return Response.redirect(new URL(publicPath, url.origin).toString(), 302);
-          }
-          if (cfg.rootAction === 'welcome') return html(welcomePage(cfg, bucket, prefix, publicPath));
-          if (cfg.rootAction === 'redirect') {
-            return Response.redirect(new URL(MANAGE_PATH, url.origin).toString(), 302);
-          }
-          return json(
-            { ok: false, error: '目录列举未开放（ALLOW_LIST_BUCKET=false），请带鉴权访问' },
-            403, request, cfg,
-          );
+        if (anonymous && !cfg.allowList && !anonymousListingOk) {
+          return Response.redirect(new URL(smartPublicRedirect(mount), url.origin).toString(), 308);
         }
         const result = await listObjects(cfg, bucket, {
           prefix, delimiter: '/',
@@ -2896,15 +3160,23 @@ async function dispatch(request, env, ctx, cfg) {
         if (url.searchParams.get('format') === 'json') {
           return json({ ok: true, bucket, prefix, ...result }, 200, request, cfg);
         }
-        const base = cfg.bucketMode === 'path' ? '/' + bucket + '/' : '/';
+        const base = mount.alias ? '/share/' + bucket + '/' : '/' + bucket + '/';
         // 匿名视图不显示桶名，也不给出管理器入口
         const label = (auth.ok || !cfg.hideDetails) ? bucket : '公开目录';
+        const crumbPre = mount.alias
+          ? (auth.ok
+            ? [{ label: bucket, href: '/' + bucket + '/' }, { label: 'share', href: '/share/' + bucket + '/' }]
+            : [{ label: '公开目录', href: '/share/' }, { label: bucket, href: '/share/' + bucket + '/' }])
+          : [{ label: bucket, href: '/' + bucket + '/' }];
+        const relPrefix = mount.alias ? prefix.slice(cfg.publicPrefix.length + 1) : prefix;
         return html(renderDirectory(result, prefix, {
           base,
           label,
           showManage: auth.ok,
           hideKeep: cfg.hideKeep,
-          publicPrefix: cfg.publicPrefix,
+          crumbPre,
+          relPrefix,
+          upHref: mount.alias ? '/share/' : '/',
         }));
       }
 
@@ -2915,10 +3187,7 @@ async function dispatch(request, env, ctx, cfg) {
           return json({ ok: false, error: '该对象需要登录后访问' }, 403, request, cfg);
         }
         if (!withinPrefix(resolved.key, cfg.publicPrefix)) {
-          return json({
-            ok: false,
-            error: '匿名只能访问公开目录 ' + publicPath + '，请登录后访问其他对象',
-          }, 403, request, cfg);
+          return Response.redirect(new URL(smartPublicRedirect(mount), url.origin).toString(), 308);
         }
       }
 
@@ -2926,18 +3195,18 @@ async function dispatch(request, env, ctx, cfg) {
     }
 
     case 'PUT': {
-      if (!cfg.enableWrite) return deny('已禁用写入（ENABLE_WRITE=false）', request, cfg, 405);
       if (!resolved.key) return deny('缺少对象 key', request, cfg, 400);
       const auth = await checkAuth(request, cfg);
       if (!auth.ok) return deny(auth.reason, request, cfg, 401);
+      if (!cfg.enableWrite) return deny('已禁用写入（ENABLE_WRITE=false）', request, cfg, 405);
       return putObject(request, cfg, bucket, resolved.key);
     }
 
     case 'DELETE': {
-      if (!cfg.enableDelete) return deny('已禁用删除（ENABLE_DELETE=false）', request, cfg, 405);
       if (!resolved.key) return deny('缺少对象 key', request, cfg, 400);
       const auth = await checkAuth(request, cfg);
       if (!auth.ok) return deny(auth.reason, request, cfg, 401);
+      if (!cfg.enableDelete) return deny('已禁用删除（ENABLE_DELETE=false）', request, cfg, 405);
       const res = await deleteObject(cfg, bucket, resolved.key);
       return json(res, res.ok ? 200 : (res.status || 500), request, cfg);
     }

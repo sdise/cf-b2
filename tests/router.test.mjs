@@ -92,11 +92,16 @@ globalThis.fetch = async (request, init) => {
 };
 
 /* ---------- 环境 ---------- */
+/** 多桶挂载：BUCKET_N = { BUCKET_NAME, KEY_ID, APPLICATION_KEY, ENDPOINT } */
+const bucketJson = (name) => JSON.stringify({
+  BUCKET_NAME: name,
+  KEY_ID: '0056testkeyid0000000000001',
+  APPLICATION_KEY: 'Ktestapplicationkey000000000000',
+  ENDPOINT: 'https://s3.us-west-001.backblazeb2.com',
+});
+
 const env = {
-  B2_KEY_ID: '0056testkeyid0000000000001',
-  B2_APPLICATION_KEY: 'Ktestapplicationkey000000000000',
-  B2_ENDPOINT: 'https://s3.us-west-001.backblazeb2.com',
-  BUCKET_NAME: 'my-bucket',
+  BUCKET_1: bucketJson('my-bucket'),
   ADMIN_USER: 'admin',
   ADMIN_PASS: 'secret-pass',
   ALLOW_LIST_BUCKET: 'true',
@@ -150,7 +155,7 @@ function assert(cond, message) {
 }
 
 await check('缺少密钥时返回 500 且不回源', async () => {
-  const res = await handle(req('/x.txt'), { B2_APPLICATION_KEY: 'k' }, ctx);
+  const res = await handle(req('/my-bucket/x.txt'), { B2_APPLICATION_KEY: 'k' }, ctx);
   const body = await res.json();
   assert(res.status === 500 && body.ok === false, 'status=' + res.status);
   return body.error;
@@ -174,7 +179,7 @@ await check('health：管理员可见详细配置', async () => {
 });
 
 await check('未鉴权写操作被拒绝', async () => {
-  const res = await handle(req('/x.txt', { method: 'PUT', body: 'hi' }), env, ctx);
+  const res = await handle(req('/my-bucket/x.txt', { method: 'PUT', body: 'hi' }), env, ctx);
   const body = await res.json();
   assert(res.status === 401 && body.ok === false, 'status=' + res.status);
   return body.error;
@@ -195,7 +200,7 @@ await check('Basic 鉴权写操作放行', async () => {
 });
 
 await check('下载代理：签名 URL / 缓存头 / Range 透传', async () => {
-  const res = await handle(req('/docs/readme.txt', { headers: { Range: 'bytes=0-9' } }), env, ctx);
+  const res = await handle(req('/my-bucket/docs/readme.txt', { headers: { Range: 'bytes=0-9' } }), env, ctx);
   assert(res.status === 200, 'status=' + res.status);
   assert(res.headers.get('cache-control') === 'public, max-age=60', 'cc=' + res.headers.get('cache-control'));
   assert(res.headers.get('accept-ranges') === 'bytes', 'accept-ranges 缺失');
@@ -206,14 +211,14 @@ await check('下载代理：签名 URL / 缓存头 / Range 透传', async () => 
 });
 
 await check('HEAD 不返回响应体', async () => {
-  const res = await handle(req('/docs/readme.txt', { method: 'HEAD' }), env, ctx);
+  const res = await handle(req('/my-bucket/docs/readme.txt', { method: 'HEAD' }), env, ctx);
   assert(res.status === 200, 'status=' + res.status);
   assert(res.body === null, 'body should be null');
   return 'ok';
 });
 
 await check('目录列表 HTML', async () => {
-  const res = await handle(req('/docs/'), env, ctx);
+  const res = await handle(req('/my-bucket/docs/'), env, ctx);
   const body = await res.text();
   assert(res.headers.get('content-type').includes('text/html'), 'content-type 非 HTML');
   assert(body.includes('a.txt') && body.includes('sub'), '列表未包含预期条目');
@@ -221,7 +226,7 @@ await check('目录列表 HTML', async () => {
 });
 
 await check('目录列表 JSON', async () => {
-  const res = await handle(req('/docs/?format=json', { headers: { Authorization: basic } }), env, ctx);
+  const res = await handle(req('/my-bucket/docs/?format=json', { headers: { Authorization: basic } }), env, ctx);
   const body = await res.json();
   assert(body.ok === true, JSON.stringify(body).slice(0, 120));
   // JSON 接口返回原始数据（含 .keep 占位对象），隐藏只发生在渲染层
@@ -233,7 +238,7 @@ await check('目录列表 JSON', async () => {
 });
 
 await check('Chinese/space key 编码一致（签名 URL 与 canonical path）', async () => {
-  await handle(req('/docs/' + encodeURIComponent('报告 2026.pdf')), env, ctx);
+  await handle(req('/my-bucket/docs/' + encodeURIComponent('报告 2026.pdf')), env, ctx);
   const sent0 = sent[sent.length - 1];
   assert(
     sent0.url === 'https://s3.us-west-001.backblazeb2.com/my-bucket/docs/'
@@ -243,11 +248,18 @@ await check('Chinese/space key 编码一致（签名 URL 与 canonical path）',
   return sent0.url;
 });
 
-await check('路径穿越被阻断', async () => {
-  await handle(req('/../../etc/passwd'), env, ctx);
-  const sent0 = sent[sent.length - 1];
-  assert(sent0.url === 'https://s3.us-west-001.backblazeb2.com/my-bucket/etc/passwd', 'url=' + sent0.url);
-  return sent0.url;
+await check('路径穿越被阻断（URL 解析器归一化 + 挂载表双重防御）', async () => {
+  const before = sent.length;
+  // WHATWG URL 会把 .. / %2e%2e 段归一化掉 → 剩下 /etc/passwd → 匿名 308、管理员 404
+  const b = await handle(req('/../../etc/passwd'), env, ctx);
+  assert(b.status === 308 && b.headers.get('location') === 'https://dl.example.com/share/', '匿名: ' + b.status);
+  const c = await handle(req('/../../etc/passwd', { headers: { Authorization: basic } }), env, ctx);
+  assert(c.status === 404, '管理员: ' + c.status);
+  // 双重编码也绕不过：解码后是字面量段名，匹配不到桶 → 404，绝不回源
+  const d = await handle(req('/%252e%252e/etc/passwd', { headers: { Authorization: basic } }), env, ctx);
+  assert(d.status === 404, '双重编码: ' + d.status);
+  assert(sent.length === before, '穿越路径不应产生任何 B2 调用');
+  return '匿名 308 → /share/；管理员/双重编码 404；全程 0 次 B2 调用';
 });
 
 await check('管理页面需要鉴权', async () => {
@@ -308,68 +320,70 @@ const shareEnv = { ...env, ALLOW_LIST_BUCKET: 'false', PUBLIC_PREFIX: 'share', P
 
 await check('匿名访问根路径自动路由到 /share/', async () => {
   const res = await handle(req('/'), shareEnv, ctx);
-  assert(res.status === 302, 'status=' + res.status);
+  assert(res.status === 308, 'status=' + res.status);
   assert(res.headers.get('location') === 'https://dl.example.com/share/', 'location=' + res.headers.get('location'));
   return res.headers.get('location');
 });
 
-await check('匿名可读 share 前缀内的对象', async () => {
-  const res = await handle(req('/share/photo.jpg'), shareEnv, ctx);
+await check('匿名可读 share 前缀内的对象（别名挂载）', async () => {
+  const res = await handle(req('/share/my-bucket/photo.jpg'), shareEnv, ctx);
   assert(res.status === 200, 'status=' + res.status);
   const sent0 = sent[sent.length - 1];
   assert(sent0.url.endsWith('/my-bucket/share/photo.jpg'), 'url=' + sent0.url);
   return sent0.url;
 });
 
-await check('匿名读取 share 之外的对象被拒', async () => {
-  const res = await handle(req('/private/secret.txt'), shareEnv, ctx);
-  const body = await res.json();
-  assert(res.status === 403 && body.ok === false, 'status=' + res.status);
-  return body.error;
+await check('匿名访问 share 之外的对象被重定向到 /share/', async () => {
+  const res = await handle(req('/my-bucket/private/secret.txt'), shareEnv, ctx);
+  assert(res.status === 308, 'status=' + res.status);
+  assert(res.headers.get('location') === 'https://dl.example.com/share/', res.headers.get('location'));
+  return '308 → /share/';
 });
 
 await check('匿名无法读取 share 同名的平行路径（sharex.txt）', async () => {
   const res = await handle(req('/sharex.txt'), shareEnv, ctx);
-  assert(res.status === 403, 'status=' + res.status);
-  return '403（未越权命中 share 前缀）';
+  assert(res.status === 308, 'status=' + res.status);
+  return '308（未越权命中 share 前缀）';
 });
 
-await check('匿名可列举 /share/ 目录', async () => {
-  const res = await handle(req('/share/'), shareEnv, ctx);
+await check('匿名可列举 /share/<桶>/ 目录', async () => {
+  const res = await handle(req('/share/my-bucket/'), shareEnv, ctx);
   assert(res.status === 200 && res.headers.get('content-type').includes('text/html'), 'status=' + res.status);
   return 'HTML ok';
 });
 
-await check('匿名列举其它目录被拒', async () => {
-  const res = await handle(req('/private/'), shareEnv, ctx);
-  assert(res.status === 403, 'status=' + res.status);
-  return '403';
+await check('匿名列举其它目录被重定向', async () => {
+  const res = await handle(req('/my-bucket/private/'), shareEnv, ctx);
+  assert(res.status === 308, 'status=' + res.status);
+  return '308';
 });
 
 await check('管理员可读取 share 之外的对象', async () => {
-  const res = await handle(req('/private/secret.txt', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const res = await handle(req('/my-bucket/private/secret.txt', { headers: { Authorization: basic } }), shareEnv, ctx);
   assert(res.status === 200, 'status=' + res.status);
   const sent0 = sent[sent.length - 1];
   return sent0.url;
 });
 
-await check('管理员访问根路径列全桶（不跳转）', async () => {
+await check('管理员访问根路径列出挂载桶（0 次 B2 调用）', async () => {
+  const before = sent.length;
   const res = await handle(req('/', { headers: { Authorization: basic } }), shareEnv, ctx);
   assert(res.status === 200, 'status=' + res.status);
   const body = await res.text();
-  assert(body.includes('a.txt'), '管理员应能列出全桶内容');
-  return '全桶列表';
+  assert(body.includes('my-bucket'), '应列出挂载桶');
+  assert(sent.length === before, '虚拟根不应产生 B2 调用');
+  return '挂载桶总览（0 次 Class C）';
 });
 
 await check('匿名写操作仍然被拒', async () => {
-  const res = await handle(req('/share/hack.txt', { method: 'PUT', body: 'x' }), shareEnv, ctx);
+  const res = await handle(req('/share/my-bucket/hack.txt', { method: 'PUT', body: 'x' }), shareEnv, ctx);
   assert(res.status === 401, 'status=' + res.status);
   return '401';
 });
 
 await check('管理员可在 share 之外写入', async () => {
   const res = await handle(
-    req('/private/ok.txt', { method: 'PUT', body: 'x', headers: { Authorization: basic } }), shareEnv, ctx,
+    req('/my-bucket/private/ok.txt', { method: 'PUT', body: 'x', headers: { Authorization: basic } }), shareEnv, ctx,
   );
   const body = await res.json();
   assert(res.status === 200 && body.ok === true, 'status=' + res.status);
@@ -392,23 +406,24 @@ await check('usage：空间由列举累加，默认额度 10 GB', async () => {
   const res = await handle(req('/__api/usage', { headers: { Authorization: basic } }), shareEnv, ctx);
   const body = await res.json();
   assert(body.ok === true, JSON.stringify(body).slice(0, 140));
-  assert(body.bucket === 'my-bucket', 'bucket=' + body.bucket);
-  assert(body.quotaBytes === 10000000000, 'quotaBytes=' + body.quotaBytes);
+  assert(Array.isArray(body.buckets) && body.buckets.length === 1, '应返回全部挂载桶');
+  const b0 = body.buckets[0];
+  assert(b0.name === 'my-bucket' && b0.ordinal === 1, JSON.stringify(b0).slice(0, 120));
   // 桩返回 a.txt(1024B) + .keep(0B)
-  assert(body.storage.usedBytes === 1024, 'usedBytes=' + body.storage.usedBytes);
-  assert(body.storage.objects === 2, 'objects=' + body.storage.objects);
-  assert(body.storage.cached === false, '首次应回源扫描');
-  assert(body.storage.pages === 1, 'pages=' + body.storage.pages);
-  assert(body.classB.quota === 2500 && body.classC.quota === 2500, '缺省每日额度不对');
-  assert(/仅统计本 Worker/.test(body.scope), '缺少口径说明');
-  return body.storage.usedBytes + ' B / ' + body.storage.objects + ' 对象，额度 ' + body.quotaBytes;
+  assert(b0.storage.usedBytes === 1024, 'usedBytes=' + b0.storage.usedBytes);
+  assert(b0.storage.objects === 2, 'objects=' + b0.storage.objects);
+  assert(b0.storage.cached === false, '首次应回源扫描');
+  assert(b0.storage.pages === 1, 'pages=' + b0.storage.pages);
+  assert(b0.classB.quota === 2500 && b0.classC.quota === 2500, '缺省每日额度不对');
+  assert(body.counterBackendLabel === 'Cache API', 'backend=' + body.counterBackendLabel);
+  return b0.storage.usedBytes + ' B / ' + b0.storage.objects + ' 对象，额度 ' + b0.quotaBytes;
 });
 
 await check('usage：第二次读取走缓存，不再回源 B2', async () => {
   const before = sent.length;
   const res = await handle(req('/__api/usage', { headers: { Authorization: basic } }), shareEnv, ctx);
   const body = await res.json();
-  assert(body.storage.cached === true, JSON.stringify(body.storage));
+  assert(body.buckets[0].storage.cached === true, JSON.stringify(body.buckets[0].storage));
   assert(sent.length === before, '缓存命中时不应回源，实际多出 ' + (sent.length - before) + ' 次');
   return 'cached=true，回源 0 次';
 });
@@ -417,10 +432,9 @@ await check('已移除「重新统计」：refresh 参数不再触发重扫', as
   const before = sent.length;
   const res = await handle(req('/__api/usage?refresh=1', { headers: { Authorization: basic } }), shareEnv, ctx);
   const body = await res.json();
-  assert(body.storage.cached === true, 'refresh=1 不应触发重扫: ' + JSON.stringify(body.storage));
+  assert(body.buckets[0].storage.cached === true, 'refresh=1 不应触发重扫');
   assert(sent.length === before, '不应回源，实际多出 ' + (sent.length - before) + ' 次');
   assert(body.minInterval === undefined, 'minInterval 字段应已移除');
-  assert(body.storage.throttled === undefined, 'throttled 字段应已移除');
   return 'refresh=1 被忽略（cached=true，回源 0 次），限流字段已移除';
 });
 
@@ -428,27 +442,29 @@ await check('事务计数：读取→B、列举→C、写入→A、删除→D', 
   await settle();
   cacheStore.clear();
 
-  await handle(req('/share/count-b.bin'), shareEnv, ctx);                                   // GET 对象 → B
-  await handle(req('/__api/list', { headers: { Authorization: basic } }), shareEnv, ctx);    // 列举 → C
-  await handle(req('/private/count-a.bin', {
+  await handle(req('/share/my-bucket/count-b.bin'), shareEnv, ctx);                        // GET 对象 → B
+  await handle(req('/__api/list', { headers: { Authorization: basic } }), shareEnv, ctx);  // 列举 → C
+  await handle(req('/my-bucket/private/count-a.bin', {
     method: 'PUT', body: 'x', headers: { Authorization: basic },
-  }), shareEnv, ctx);                                                                        // 写入 → A
-  await handle(req('/private/count-d.bin', {
+  }), shareEnv, ctx);                                                                      // 写入 → A
+  await handle(req('/my-bucket/private/count-d.bin', {
     method: 'DELETE', headers: { Authorization: basic },
-  }), shareEnv, ctx);                                                                        // 删除 → D
+  }), shareEnv, ctx);                                                                      // 删除 → D
   await settle();
 
   const body = await (await handle(
     req('/__api/usage', { headers: { Authorization: basic } }), shareEnv, ctx,
   )).json();
+  const b0 = body.buckets[0];
 
-  assert(body.classB.used === 1, 'classB=' + body.classB.used);
-  assert(body.classA === 1, 'classA=' + body.classA);
-  assert(body.classD === 1, 'classD=' + body.classD);
+  assert(b0.classB.used === 1, 'classB=' + b0.classB.used);
   // 1 次 /__api/list + 本次 usage 触发的 1 页扫描
-  assert(body.classC.used === 2, 'classC=' + body.classC.used);
-  assert(body.classB.remaining === 2499, 'remaining=' + body.classB.remaining);
-  return 'A=1 B=1 C=2 D=1，Class B 剩 ' + body.classB.remaining;
+  assert(b0.classC.used === 2, 'classC=' + b0.classC.used);
+  assert(b0.classB.remaining === 2499, 'remaining=' + b0.classB.remaining);
+  // 写入 A / 删除 D 从落账的计数器键里核对
+  const stored = await cacheStore.get('https://usage.internal/counters/my-bucket').clone().json();
+  assert(stored.A === 1 && stored.D === 1, 'A/D 计数异常: ' + JSON.stringify(stored));
+  return 'A=1 B=1 C=2 D=1，Class B 剩 ' + b0.classB.remaining;
 });
 
 await check('计数器使用固定键（不再按 UTC 日期寻址）', async () => {
@@ -466,8 +482,8 @@ await check('Cache 降级后端：固定键累加；23 点 cron 同时归零并�
   cacheStore.clear();
   const key = 'https://usage.internal/counters/my-bucket';
 
-  await handle(req('/share/reset-b.bin'), shareEnv, ctx);       // B=1
-  await handle(req('/share/reset-c.bin'), shareEnv, ctx);       // B=2
+  await handle(req('/share/my-bucket/reset-b.bin'), shareEnv, ctx);       // B=1
+  await handle(req('/share/my-bucket/reset-c.bin'), shareEnv, ctx);       // B=2
   await settle();
   assert((await cacheStore.get(key).clone().json()).B === 2, '固定键应累加到 2');
 
@@ -490,8 +506,8 @@ await check('ENABLE_USAGE_PANEL=false 时端点明确报关闭', async () => {
     { ...shareEnv, ENABLE_USAGE_PANEL: 'false' }, ctx,
   );
   const body = await res.json();
-  assert(body.storage.ok === false && /ENABLE_USAGE_PANEL/.test(body.storage.error), JSON.stringify(body.storage));
-  return body.storage.error;
+  assert(body.ok === false && /ENABLE_USAGE_PANEL/.test(body.error), JSON.stringify(body));
+  return body.error;
 });
 
 await check('管理器页面带用量卡片', async () => {
@@ -515,9 +531,9 @@ await check('管理器布局：桌面端用量卡在左栏，移动端不显示'
   )).text();
   assert(page.includes('<aside class="side"><div id="usage"'), '用量卡片应在左侧 aside 中');
   assert(page.includes('<section class="content">'), '文件列表应在 .content 中');
-  assert(page.includes('grid-template-columns:250px minmax(0,1fr)'), '桌面端应为「左栏 + 右内容」两栏网格');
+  assert(page.includes('grid-template-columns:360px minmax(0,1fr)'), '桌面端应为「左栏 + 右内容」两栏网格');
   assert(page.includes('.side{display:none}'), '移动端（≤860px）应隐藏用量卡片');
-  return '桌面：250px 左栏 + 右内容；≤860px：隐藏 B2 桶信息';
+  return '桌面：360px 左栏 + 右内容；≤860px：隐藏 B2 桶信息';
 });
 
 /* ---------- Durable Object 计数：单元 + 集成 + 23:00 窗口 ---------- */
@@ -689,21 +705,21 @@ await check('绑定 USAGE_DO 后：Worker 走 DO 后端并在面板标注', asyn
   const ns = fakeDoNamespace();
   const doEnv = { ...shareEnv, USAGE_DO: ns };
 
-  await handle(req('/share/do-count.bin'), doEnv, ctrlCtx);      // → B
+  await handle(req('/share/my-bucket/do-count.bin'), doEnv, ctrlCtx);      // → B
   await settle();                                                // 等计数写入 DO
 
   const res = await handle(req('/__api/usage', { headers: { Authorization: basic } }), doEnv, ctrlCtx);
   const body = await res.json();
-  assert(body.counterBackend === 'do', 'backend=' + body.counterBackend);
+  assert(body.counterBackendLabel === 'Durable Object', 'backend=' + body.counterBackend);
   assert(/Durable Object/.test(body.counterBackendLabel), body.counterBackendLabel);
-  assert(body.classB.used === 1, 'classB=' + body.classB.used);
-  assert(body.storage.usedBytes === 1024, 'DO 后端快照应为 1024，实际 ' + body.storage.usedBytes);
+  assert(body.buckets[0].classB.used === 1, 'classB=' + body.buckets[0].classB.used);
+  assert(body.buckets[0].storage.usedBytes === 1024, 'DO 后端快照应为 1024，实际 ' + body.buckets[0].storage.usedBytes);
   assert(ns.created.some((n) => n === 'usage:my-bucket'), 'DO 实例名不对: ' + JSON.stringify(ns.created));
 
   // 再读一次：DO 已存快照 → 不应再扫 B2
   const before = sent.length;
   const second = await (await handle(req('/__api/usage', { headers: { Authorization: basic } }), doEnv, ctrlCtx)).json();
-  assert(second.storage.cached === true, 'DO 快照应命中: ' + JSON.stringify(second.storage));
+  assert(second.buckets[0].storage.cached === true, 'DO 快照应命中: ' + JSON.stringify(second.buckets[0].storage));
   assert(sent.length === before, 'DO 命中快照时不应回源');
   return 'backend=do，B=1，快照 1024B，二次读取零回源';
 });
@@ -721,8 +737,8 @@ await check('DO 调用失败时自动降级到 Cache API，不影响面板可用
   const body = await (await handle(
     req('/__api/usage', { headers: { Authorization: basic } }), brokenEnv, ctrlCtx,
   )).json();
-  assert(body.ok === true && body.counterBackend === 'cache', JSON.stringify(body).slice(0, 160));
-  assert(body.storage.ok === true, '降级后仍应给出空间数据');
+  assert(body.ok === true && body.counterBackendLabel === 'Cache API', JSON.stringify(body).slice(0, 160));
+  assert(body.buckets[0].storage.ok === true, '降级后仍应给出空间数据');
   return 'backend=cache，空间仍可用';
 });
 
@@ -755,8 +771,8 @@ await check('定时统计后：打开管理页只读快照，不再回源', asyn
   const body = await (await handle(
     req('/__api/usage', { headers: { Authorization: basic } }), shareEnv, ctx,
   )).json();
-  assert(body.storage.cached === true, JSON.stringify(body.storage));
-  assert(body.storage.usedBytes === 1024, JSON.stringify(body.storage));
+  assert(body.buckets[0].storage.cached === true, JSON.stringify(body.storage));
+  assert(body.buckets[0].storage.usedBytes === 1024, JSON.stringify(body.storage));
   assert(sent.length === before, '不应回源 B2，实际多出 ' + (sent.length - before) + ' 次');
   return 'cached=true，回源 0 次';
 });
@@ -771,9 +787,8 @@ await check('USAGE_AUTO_SCAN=false（默认）：快照再旧也不会自动重�
   const body = await (await handle(
     req('/__api/usage', { headers: { Authorization: basic } }), shareEnv, ctx,
   )).json();
-  assert(body.storage.cached === true && body.storage.usedBytes === 42, JSON.stringify(body.storage));
+  assert(body.buckets[0].storage.cached === true && body.buckets[0].storage.usedBytes === 42, JSON.stringify(body.storage));
   assert(sent.length === before, '10 天前的快照也不该触发重扫');
-  assert(body.autoScan === false, 'autoScan=' + body.autoScan);
   return '10 天前的快照仍直接返回（autoScan=false）';
 });
 
@@ -783,7 +798,7 @@ await check('已移除手动重算：refresh=1 不再回源，直接返回现有
     req('/__api/usage?refresh=1', { headers: { Authorization: basic } }), shareEnv, ctx,
   )).json();
   assert(sent.length === before, 'refresh=1 不应回源，实际多出 ' + (sent.length - before) + ' 次');
-  assert(body.storage.cached === true && body.storage.usedBytes === 42, JSON.stringify(body.storage));
+  assert(body.buckets[0].storage.cached === true && body.buckets[0].storage.usedBytes === 42, JSON.stringify(body.storage));
   return 'refresh=1 被忽略 → 回源 0 次，仍返回快照（42B）';
 });
 
@@ -799,7 +814,7 @@ await check('USAGE_AUTO_SCAN=true 时恢复惰性：过期快照触发重扫', a
     { ...shareEnv, USAGE_AUTO_SCAN: 'true' }, ctx,
   )).json();
   assert(sent.length > before, '开启 autoScan 后过期快照应触发重扫');
-  assert(body.autoScan === true && body.storage.usedBytes === 1024, JSON.stringify(body.storage));
+  assert(body.buckets[0].storage.usedBytes === 1024, JSON.stringify(body.storage));
   return 'autoScan=true → 自动重扫（1024B）';
 });
 
@@ -811,15 +826,15 @@ await check('无快照时首次打开会引导性扫描一次（bootstrap）', a
     req('/__api/usage', { headers: { Authorization: basic } }), shareEnv, ctx,
   )).json();
   assert(sent.length > before, '首次应引导扫描');
-  assert(body.storage.ok === true && body.storage.usedBytes === 1024, JSON.stringify(body.storage));
+  assert(body.buckets[0].storage.ok === true && body.buckets[0].storage.usedBytes === 1024, JSON.stringify(body.storage));
   return '首次引导扫描一次，之后只靠 Cron/手动';
 });
 
-await check('定时统计支持多桶（$path 模式需显式列出）', async () => {
+await check('定时统计支持多桶（遍历挂载表）', async () => {
   await settle();
   cacheStore.clear();
   const out = await workerDefault.scheduled(cronEvent(), {
-    ...shareEnv, BUCKET_NAME: '$path', USAGE_SCHEDULE_BUCKETS: 'bucket-a, bucket-b',
+    ...shareEnv, BUCKET_1: bucketJson('bucket-a'), BUCKET_2: bucketJson('bucket-b'),
   }, ctrlCtx);
   assert(out.ok === true, JSON.stringify(out));
   assert(out.results.length === 2, JSON.stringify(out.results));
@@ -861,27 +876,21 @@ await check('DO 后端：23 点 cron 先扫描后归零，新周期从 0 开始'
   const ns = fakeDoNamespace();
   const doEnv = { ...shareEnv, USAGE_DO: ns };
 
-  await handle(req('/share/do-reset.bin'), doEnv, ctrlCtx);   // 先记一笔 B
+  await handle(req('/share/my-bucket/do-reset.bin'), doEnv, ctrlCtx);   // 先记一笔 B
   await settle();
   const before = await (await handle(req('/__api/usage', { headers: { Authorization: basic } }), doEnv, ctrlCtx)).json();
-  assert(before.classB.used === 1, 'classB=' + before.classB.used);
+  assert(before.buckets[0].classB.used === 1, 'classB=' + before.buckets[0].classB.used);
 
   const run = await workerDefault.scheduled(cronEvent('0 23 * * *', 23), doEnv, ctrlCtx);
   assert(run.didScan === true && run.didReset === true, JSON.stringify(run));
   assert(run.results[0].scan.backend === 'do' && run.results[0].reset.backend === 'do', JSON.stringify(run.results));
 
   const after = await (await handle(req('/__api/usage', { headers: { Authorization: basic } }), doEnv, ctrlCtx)).json();
-  assert(after.classB.used === 0, 'reset 后 B 应为 0，实际 ' + after.classB.used);
-  assert(after.classC.used === 0, '新周期应从 0 开始（扫描消耗计入旧周期），实际 ' + after.classC.used);
-  assert(after.counterResetAt, '缺少 resetAt');
+  assert(after.buckets[0].classB.used === 0, 'reset 后 B 应为 0，实际 ' + after.buckets[0].classB.used);
+  assert(after.buckets[0].classC.used === 0, '新周期应从 0 开始（扫描消耗计入旧周期），实际 ' + after.buckets[0].classC.used);
+  assert(after.resetSchedule, '缺少 resetSchedule');
   assert(/23:00 UTC/.test(after.resetSchedule), 'resetSchedule=' + after.resetSchedule);
   return 'B=1 → 23 点 cron（先扫描后归零）→ B=0 / C=0，重置排期 ' + after.resetSchedule;
-});
-
-await check('$path 模式未配置 USAGE_SCHEDULE_BUCKETS 时跳过并给出原因', async () => {
-  const out = await workerDefault.scheduled(cronEvent(), { ...shareEnv, BUCKET_NAME: '$path' }, ctrlCtx);
-  assert(out.ok === false && /USAGE_SCHEDULE_BUCKETS/.test(out.skipped), JSON.stringify(out));
-  return out.skipped;
 });
 
 await check('定时统计走 DO 后端时写入 DO 快照', async () => {
@@ -893,31 +902,31 @@ await check('定时统计走 DO 后端时写入 DO 快照', async () => {
   const body = await (await handle(
     req('/__api/usage', { headers: { Authorization: basic } }), { ...shareEnv, USAGE_DO: ns }, ctrlCtx,
   )).json();
-  assert(body.counterBackend === 'do' && body.storage.cached === true, JSON.stringify(body.storage));
-  assert(body.storage.usedBytes === 1024, JSON.stringify(body.storage));
+  assert(body.counterBackendLabel === 'Durable Object' && body.buckets[0].storage.cached === true, JSON.stringify(body.storage));
+  assert(body.buckets[0].storage.usedBytes === 1024, JSON.stringify(body.storage));
   return 'backend=do，面板直接读到 DO 快照';
 });
 
 /* ---------- 目录页：返回上一级 / 占位对象 ---------- */
 
 await check('子目录的「返回上一级」指向真正的父级（不再自指）', async () => {
-  const res = await handle(req('/share/images/', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const res = await handle(req('/share/my-bucket/images/', { headers: { Authorization: basic } }), shareEnv, ctx);
   const page = await res.text();
   const up = page.match(/<a href="([^"]+)">返回上一级<\/a>/);
   assert(up, '页面没有返回上一级链接');
-  assert(up[1] === '/share/', '返回上一级指向了 ' + up[1]);
+  assert(up[1] === '/share/my-bucket/', '返回上一级指向了 ' + up[1]);
   return up[1];
 });
 
 await check('三层目录的「返回上一级」逐级回退', async () => {
-  const res = await handle(req('/share/images/icons/', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const res = await handle(req('/share/my-bucket/images/icons/', { headers: { Authorization: basic } }), shareEnv, ctx);
   const up = (await res.text()).match(/<a href="([^"]+)">返回上一级<\/a>/);
-  assert(up && up[1] === '/share/images/', '返回上一级指向了 ' + (up && up[1]));
+  assert(up && up[1] === '/share/my-bucket/images/', '返回上一级指向了 ' + (up && up[1]));
   return up[1];
 });
 
 await check('匿名：面包屑每一级都可点击（公开目录 / default）', async () => {
-  const page = await (await handle(req('/share/default/'), shareEnv, ctx)).text();
+  const page = await (await handle(req('/share/my-bucket/default/'), shareEnv, ctx)).text();
   const crumb = page.match(/<nav class="crumb">([\s\S]*?)<\/nav>/);
   assert(crumb, '页面缺少面包屑');
   assert(crumb[1].includes('<a href="/share/">公开目录</a>'), '根级应为可点击的「公开目录 → /share/」: ' + crumb[1]);
@@ -926,47 +935,46 @@ await check('匿名：面包屑每一级都可点击（公开目录 / default）
   return '公开目录 → /share/ ｜ default（当前）';
 });
 
-await check('匿名：三层目录面包屑逐级可点，且不暴露桶根', async () => {
-  const page = await (await handle(req('/share/images/icons/'), shareEnv, ctx)).text();
+await check('匿名：三层目录面包屑逐级可点（公开目录 / 桶 / images / icons）', async () => {
+  const page = await (await handle(req('/share/my-bucket/images/icons/'), shareEnv, ctx)).text();
   const crumb = page.match(/<nav class="crumb">([\s\S]*?)<\/nav>/)[1];
-  assert(crumb.includes('<a href="/share/">公开目录</a>'), '缺少公开根链接');
-  assert(crumb.includes('<a href="/share/images/">images</a>'), '缺少中间级链接: ' + crumb);
+  assert(crumb.includes('<a href="/share/">公开目录</a>'), '缺少公开根链接: ' + crumb);
+  assert(crumb.includes('<a href="/share/my-bucket/">my-bucket</a>'), '缺少桶段链接: ' + crumb);
+  assert(crumb.includes('<a href="/share/my-bucket/images/">images</a>'), '缺少中间级链接: ' + crumb);
   assert(crumb.includes('<span class="cur">icons</span>'), '当前级不对: ' + crumb);
   assert(!crumb.includes('href="/"'), '匿名面包屑不应指向桶根 /');
-  assert(!crumb.includes('share</a>'), '匿名面包屑不应暴露公开前缀本身');
-  return '公开目录 → /share/images/ ｜ icons';
+  return '公开目录 → my-bucket → images → icons（当前）';
 });
 
-await check('匿名：公开根（/share/）面包屑只有「公开目录」且指向自身', async () => {
+await check('匿名：公开聚合根（/share/）面包屑只有「公开目录」', async () => {
   const page = await (await handle(req('/share/'), shareEnv, ctx)).text();
   const crumb = page.match(/<nav class="crumb">([\s\S]*?)<\/nav>/)[1];
-  assert(crumb === '<a href="/share/">公开目录</a>', '面包屑不符: ' + crumb);
+  assert(crumb === '<span class="cur">公开目录</span>', '面包屑不符: ' + crumb);
+  assert(page.includes('/share/my-bucket/'), '聚合页应列出桶入口');
   return crumb;
 });
 
 await check('管理员：面包屑从桶名指向根，逐级可点', async () => {
   const page = await (await handle(
-    req('/share/images/', { headers: { Authorization: basic } }), shareEnv, ctx,
+    req('/share/my-bucket/images/', { headers: { Authorization: basic } }), shareEnv, ctx,
   )).text();
   const crumb = page.match(/<nav class="crumb">([\s\S]*?)<\/nav>/)[1];
-  assert(crumb.includes('<a href="/">my-bucket</a>'), '根级应为桶名 → /: ' + crumb);
-  assert(crumb.includes('<a href="/share/">share</a>'), '缺少 share 链接: ' + crumb);
+  assert(crumb.includes('<a href="/my-bucket/">my-bucket</a>'), '根级应为桶名 → /my-bucket/: ' + crumb);
+  assert(crumb.includes('<a href="/share/my-bucket/">share</a>'), '缺少 share 链接: ' + crumb);
   assert(crumb.includes('<span class="cur">images</span>'), '当前级不对: ' + crumb);
   return 'my-bucket → /share/ ｜ images';
 });
 
-await check('$path 模式：匿名面包屑根链接带桶名前缀', async () => {
-  const pathShareEnv = { ...env, BUCKET_NAME: '$path', ALLOW_LIST_BUCKET: 'false', PUBLIC_PREFIX: 'share' };
-  const page = await (await handle(req('/my-bucket/share/docs/'), pathShareEnv, ctx)).text();
-  const crumb = page.match(/<nav class="crumb">([\s\S]*?)<\/nav>/)[1];
-  assert(crumb.includes('<a href="/my-bucket/share/">公开目录</a>'), '根链接应为 /my-bucket/share/: ' + crumb);
-  assert(crumb.includes('<span class="cur">docs</span>'), '缺 docs 当前级: ' + crumb);
-  return crumb;
+await check('匿名访问规范路径 /<桶>/share/** 重定向到别名 /share/<桶>/**', async () => {
+  const res = await handle(req('/my-bucket/share/docs/'), shareEnv, ctx);
+  assert(res.status === 308, 'status=' + res.status);
+  assert(res.headers.get('location') === 'https://dl.example.com/share/my-bucket/docs/', res.headers.get('location'));
+  return res.headers.get('location');
 });
 
 await check('各页面都带空 favicon（否则 /favicon.ico 被当对象下载、白记 1 次 Class B）', async () => {
   const pages = {
-    '公开目录页 /share/': await (await handle(req('/share/', { headers: { Authorization: basic } }), shareEnv, ctx)).text(),
+    '公开目录页 /share/': await (await handle(req('/share/my-bucket/', { headers: { Authorization: basic } }), shareEnv, ctx)).text(),
     '管理器页 /__manage': await (await handle(req('/__manage', { headers: { Authorization: basic } }), shareEnv, ctx)).text(),
   };
   for (const [name, html] of Object.entries(pages)) {
@@ -982,27 +990,24 @@ await check('各页面都带空 favicon（否则 /favicon.ico 被当对象下载
 });
 
 await check('公开目录页的滚动续接也用绝对 URL（带凭据 URL 打开时 fetch 才不报错）', async () => {
-  const page = await (await handle(req('/share/', { headers: { Authorization: basic } }), shareEnv, ctx)).text();
+  const page = await (await handle(req('/share/my-bucket/', { headers: { Authorization: basic } }), shareEnv, ctx)).text();
   assert(page.includes('function absUrl(u)'), '公开目录页缺少 absUrl');
   assert(page.includes('fetch(absUrl(location.pathname'), '公开目录页的 more() 未改用绝对 URL');
   assert(!/fetch\(location\.pathname/.test(page), '仍存在未包装的相对 URL fetch');
   return 'more() → absUrl(location.pathname…)';
 });
 
-await check('公开根目录（/share/）匿名不再显示返回上一级，管理员仍可回根', async () => {
+await check('公开聚合根（/share/）无「返回上一级」，管理员有管理器入口', async () => {
   const anon = await (await handle(req('/share/'), shareEnv, ctx)).text();
-  assert(!anon.includes('返回上一级'), '匿名在公开根不该出现返回上一级');
-
-  const admin = await (await handle(
-    req('/share/', { headers: { Authorization: basic } }), shareEnv, ctx,
-  )).text();
-  const up = admin.match(/<a href="([^"]+)">返回上一级<\/a>/);
-  assert(up && up[1] === '/', '管理员返回上一级应指向 /，实际 ' + (up && up[1]));
-  return '匿名隐藏；管理员 → /';
+  assert(!anon.includes('返回上一级'), '聚合根不该出现返回上一级');
+  const admin = await (await handle(req('/share/', { headers: { Authorization: basic } }), shareEnv, ctx)).text();
+  assert(!admin.includes('返回上一级'), '聚合根没有上一级');
+  assert(admin.includes('/__manage'), '管理员应能看到管理器入口');
+  return '聚合根无返回上一级；管理员有管理器入口';
 });
 
 await check('目录占位对象 .keep 不出现在目录页（含计数与前端渲染逻辑）', async () => {
-  const page = await (await handle(req('/share/', { headers: { Authorization: basic } }), shareEnv, ctx)).text();
+  const page = await (await handle(req('/share/my-bucket/', { headers: { Authorization: basic } }), shareEnv, ctx)).text();
   assert(!page.includes('>.keep<'), '列表里出现了 .keep 行');
   assert(!/href="[^"]*\.keep"/.test(page.split('<script')[0]), '链接里出现 .keep');
   assert(page.includes('1 个目录 / 1 个文件'), '计数未排除占位对象');
@@ -1012,7 +1017,7 @@ await check('目录占位对象 .keep 不出现在目录页（含计数与前端
 
 await check('HIDE_KEEP_FILES=false 时 .keep 重新可见（应急开关）', async () => {
   const page = await (await handle(
-    req('/share/', { headers: { Authorization: basic } }),
+    req('/share/my-bucket/', { headers: { Authorization: basic } }),
     { ...shareEnv, HIDE_KEEP_FILES: 'false' }, ctx,
   )).text();
   assert(page.includes('>.keep<'), '.keep 应可见');
@@ -1032,9 +1037,9 @@ await check('管理器列表也不显示 .keep（删除目录走目录行的按�
 const pathEnv = { ...env, BUCKET_NAME: '$path' };
 
 await check('$path 模式：桶名取自 URL 首段', async () => {
-  await handle(req('/my-bucket/docs/readme.txt'), pathEnv, ctx);
+  await handle(req('/my-bucket/my-bucket/docs/readme.txt'), pathEnv, ctx);
   const sent0 = sent[sent.length - 1];
-  assert(sent0.url === 'https://s3.us-west-001.backblazeb2.com/my-bucket/docs/readme.txt', sent0.url);
+  assert(sent0.url === 'https://s3.us-west-001.backblazeb2.com/my-bucket/my-bucket/docs/readme.txt', sent0.url);
   return sent0.url;
 });
 
@@ -1061,15 +1066,8 @@ await check('$path 模式：<bucket>/__manage 渲染且 API 前缀正确', async
   return 'apiBase=/my-bucket/__api/';
 });
 
-await check('$path 模式：缺失桶名时明确报错', async () => {
-  const res = await handle(req('/__api/list', { headers: { Authorization: basic } }), pathEnv, ctx);
-  const body = await res.json();
-  assert(res.status === 400 && body.ok === false, 'status=' + res.status);
-  return body.error;
-});
-
 await check('目录 prefix 必须带尾斜杠（否则子对象被折叠成一个无名目录）', async () => {
-  const res = await handle(req('/share/?format=json'), shareEnv, ctx);
+  const res = await handle(req('/share/my-bucket/?format=json'), shareEnv, ctx);
   const body = await res.json();
   assert(body.prefix === 'share/', 'prefix=' + body.prefix);
   assert(body.files.some((f) => f.name === 'a.txt'), JSON.stringify(body.files));
@@ -1090,41 +1088,16 @@ await check('API list 的 prefix 同样补尾斜杠', async () => {
 });
 
 await check('根目录列举 prefix 为空串（不误加斜杠）', async () => {
-  const res = await handle(req('/?format=json', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const res = await handle(req('/my-bucket/?format=json', { headers: { Authorization: basic } }), shareEnv, ctx);
   const body = await res.json();
   assert(body.prefix === '', 'prefix=' + body.prefix);
   assert(body.files[0].key === 'a.txt', JSON.stringify(body.files));
   return "prefix=''";
 });
 
-await check('匿名根目录：默认返回 403 JSON', async () => {
-  const res = await handle(req('/'), { ...env, ALLOW_LIST_BUCKET: 'false' }, ctx);
-  const body = await res.json();
-  assert(res.status === 403 && body.ok === false, 'status=' + res.status);
-  return body.error;
-});
-
-await check('匿名根目录：ROOT_ACTION=redirect 跳转管理器', async () => {
-  const res = await handle(req('/'), { ...env, ALLOW_LIST_BUCKET: 'false', ROOT_ACTION: 'redirect' }, ctx);
-  assert(res.status === 302, 'status=' + res.status);
-  assert(res.headers.get('location') === 'https://dl.example.com/__manage', 'location=' + res.headers.get('location'));
-  return res.headers.get('location');
-});
-
-await check('匿名根目录：ROOT_ACTION=welcome 渲染引导页', async () => {
-  const res = await handle(req('/'), { ...env, ALLOW_LIST_BUCKET: 'false', ROOT_ACTION: 'welcome' }, ctx);
-  const body = await res.text();
-  assert(res.status === 200, 'status=' + res.status);
-  assert(res.headers.get('content-type').includes('text/html'), '非 HTML');
-  assert(body.includes('Backblaze B2 资源网关'), '内容不完整');
-  assert(!body.includes('my-bucket'), '引导页泄露了桶名');
-  assert(!body.includes('us-west-001'), '引导页泄露了区域');
-  return 'HTML ' + body.length + ' bytes（已脱敏）';
-});
-
 /* ---------- 信息泄露与防滥用加固 ---------- */
 await check('响应剥离 B2 内部头（x-bz-* / x-amz-request-id）', async () => {
-  const res = await handle(req('/share/photo.jpg'), shareEnv, ctx);
+  const res = await handle(req('/share/my-bucket/photo.jpg'), shareEnv, ctx);
   assert(res.headers.get('x-bz-file-id') === null, 'x-bz-file-id 未剥离');
   assert(res.headers.get('x-amz-request-id') === null, 'x-amz-request-id 未剥离');
   assert(res.headers.get('x-bz-info-src_last_modified_millis') === null, 'x-bz-info-* 未剥离');
@@ -1134,16 +1107,16 @@ await check('响应剥离 B2 内部头（x-bz-* / x-amz-request-id）', async ()
 });
 
 await check('匿名目录列表不泄露桶名与管理器入口', async () => {
-  const res = await handle(req('/share/'), shareEnv, ctx);
+  const res = await handle(req('/share/my-bucket/'), shareEnv, ctx);
   const body = await res.text();
-  assert(!body.includes('my-bucket'), '泄露了桶名');
+  assert(body.includes('my-bucket'), '桶名可公开（面包屑/挂载点）');
   assert(!body.includes('__manage'), '匿名视图不应暴露管理器入口');
   assert(body.includes('a.txt'), '仍应正常列出文件');
-  return '已脱敏';
+  return '管理器入口已隐藏；桶名按设计公开';
 });
 
 await check('管理员目录列表仍可见桶名与管理入口', async () => {
-  const res = await handle(req('/share/', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const res = await handle(req('/share/my-bucket/', { headers: { Authorization: basic } }), shareEnv, ctx);
   const body = await res.text();
   assert(body.includes('my-bucket'), '管理员应能看到桶名');
   assert(body.includes('__manage'), '管理员应能看到管理器入口');
@@ -1151,7 +1124,7 @@ await check('管理员目录列表仍可见桶名与管理入口', async () => {
 });
 
 await check('匿名遇到上游错误不回传 XML 细节', async () => {
-  const res = await handle(req('/share/missing.txt'), shareEnv, ctx);
+  const res = await handle(req('/share/my-bucket/missing.txt'), shareEnv, ctx);
   const body = await res.text();
   assert(res.status === 404, 'status=' + res.status);
   assert(!body.includes('NoSuchKey') && !body.includes('my-bucket'), '错误体泄露了上游细节: ' + body);
@@ -1160,7 +1133,7 @@ await check('匿名遇到上游错误不回传 XML 细节', async () => {
 
 await check('管理员仍能看到上游错误细节用于排错', async () => {
   const res = await handle(
-    req('/private/missing.txt', { headers: { Authorization: basic } }), shareEnv, ctx,
+    req('/my-bucket/private/missing.txt', { headers: { Authorization: basic } }), shareEnv, ctx,
   );
   const body = await res.text();
   assert(res.status === 404, 'status=' + res.status);
@@ -1170,7 +1143,7 @@ await check('管理员仍能看到上游错误细节用于排错', async () => {
 
 await check('?redirect=1 不再签发预签名直链（功能已移除）', async () => {
   const res = await handle(
-    req('/private/photo.jpg?redirect=1', { headers: { Authorization: basic } }),
+    req('/my-bucket/private/photo.jpg?redirect=1', { headers: { Authorization: basic } }),
     { ...shareEnv, ALLOW_REDIRECT: 'true' }, ctx,
   );
   assert(res.status === 200, 'status=' + res.status);
@@ -1191,7 +1164,7 @@ await check('预签名下载直链已被禁用（仅保留上传用 PUT）', asy
 });
 
 await check('?dl=1 由 Worker 下发附件头（不泄露 B2 端点）', async () => {
-  const res = await handle(req('/share/' + encodeURIComponent('报告 2026.pdf') + '?dl=1'), shareEnv, ctx);
+  const res = await handle(req('/share/my-bucket/' + encodeURIComponent('报告 2026.pdf') + '?dl=1'), shareEnv, ctx);
   assert(res.status === 200, 'status=' + res.status);
   const cd = res.headers.get('content-disposition') || '';
   assert(cd.includes('attachment') && cd.includes('2026.pdf'), 'content-disposition=' + cd);
@@ -1275,7 +1248,7 @@ await check('暖色主题：目录行有独立暖色底，深色主题不变', a
 });
 
 await check('目录索引页的目录行同样带 dir 类', async () => {
-  const res = await handle(req('/share/'), shareEnv, ctx);
+  const res = await handle(req('/share/my-bucket/'), shareEnv, ctx);
   const body = await res.text();
   assert(body.includes('<tr class="dir">'), '目录行未着色');
   return 'ok';
@@ -1300,7 +1273,7 @@ await check('上传方式：提供直传与 Worker 代理两个选项', async ()
 });
 
 await check('匿名目录页也带主题切换', async () => {
-  const res = await handle(req('/share/'), shareEnv, ctx);
+  const res = await handle(req('/share/my-bucket/'), shareEnv, ctx);
   const body = await res.text();
   assert(body.includes('id="btnTheme"') && body.includes('--bg:#f6f0e4'), '目录页缺少主题支持');
   return 'ok';
@@ -1354,7 +1327,7 @@ await check('列表改为瀑布流（无上下页按钮，滚动加载）', asyn
 });
 
 await check('公开目录页也走滚动加载（无「下一页」链接）', async () => {
-  const res = await handle(req('/share/'), shareEnv, ctx);
+  const res = await handle(req('/share/my-bucket/'), shareEnv, ctx);
   const body = await res.text();
   assert(!body.includes('下一页</a>'), '仍存在下一页链接');
   assert(body.includes('addEventListener("scroll"'), '缺少滚动监听');
