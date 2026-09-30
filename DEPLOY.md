@@ -187,38 +187,46 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 
 ### 3.2.1 登录状态是怎么检查与保持的？
 
-**Worker 侧完全无状态**——没有 Cookie、没有 Session、没有 KV/存储。每个请求独立判定一次：
+**Worker 侧不存任何会话数据**（没有 KV / Durable Object 存会话），每个请求独立判定一次：
 
 ```
-请求 → 取 Authorization 头
-      ├─ Bearer <token>   → 与 ADMIN_TOKEN 恒定时间比较（先 SHA-256 再逐位异或）
-      ├─ Basic base64(u:p)→ atob 后与 ADMIN_USER / ADMIN_PASS 分别恒定时间比较
-      └─ 无 / 不匹配      → 写操作 401；未配置任何凭据时写操作一律拒绝（fail-closed）
+请求 → 依次尝试
+      ├─ Cookie cfb2_session  → 校验 HMAC 签名与过期时间（管理页「鉴权」按钮签发）
+      ├─ Bearer <token>       → 与 ADMIN_TOKEN 恒定时间比较（先 SHA-256 再逐位异或）
+      ├─ Basic base64(u:p)    → atob 后与 ADMIN_USER / ADMIN_PASS 分别恒定时间比较
+      └─ 无 / 都不匹配        → 写操作 401；未配置任何凭据时写操作一律拒绝（fail-closed）
 ```
 
-判定发生在 `checkAuth()`，一次请求 1 次比较，JIT 无任何缓存态。
+判定发生在 `checkAuth()`，一次请求最多 1 次比较，JIT 无任何缓存态。
 
-**"保持登录"是谁的功劳？** 是**浏览器**：
+**登录入口在哪？** 没有独立登录页：匿名页面（`/share/`、`/share/<桶>/`）右上角/底部那个「登录」按钮就是**当前页面路径 + `__manage`**，例如 `/share/` → `/share/__manage`。点它 → Worker 返回 `401 + WWW-Authenticate: Basic` → 浏览器弹出原生登录框 → 认证通过后浏览器自动为同源请求带上凭据。
 
-1. 首次访问 `/__manage`，Worker 返回 `401 + WWW-Authenticate: Basic realm="B2 Manager"`；
-2. 浏览器弹出原生登录框，输入后**按 origin + realm 缓存凭据**；
-3. 之后同源请求（含 XHR/fetch，默认 `credentials: same-origin`）**浏览器自动带上 `Authorization: Basic ...`**，所以你感觉"一直登录着"。
+**为什么要多一枚会话 Cookie？** 因为 Basic 凭据由浏览器按 origin + realm 缓存，而 Bearer 令牌只存在页面里——`Authorization` 只能挂在**请求头**上，`<a href>`、`window.open()` 这类**导航请求**由浏览器发起，JS 无法附加头。于是管理页点「下载」可能被当成匿名请求，非公开前缀的对象被 308 重定向到 `/share/`。管理页「鉴权」按钮会在校验通过后换取一枚 Cookie，之后导航请求也带身份。
+
+会话 Cookie 的性状：
+
+| 项 | 值 |
+| --- | --- |
+| 名称 / 有效期 | `cfb2_session` / 7 天（`Max-Age`） |
+| 值 | `<过期时间戳>.<HMAC-SHA256>`，密钥由 `ADMIN_TOKEN` + `ADMIN_USER` + `ADMIN_PASS` 派生 |
+| 属性 | `HttpOnly`（JS 读不到）、`SameSite=Lax`（跨站写操作不带 ⇒ 天然防 CSRF）、HTTPS 下 `Secure`、`Path=/` |
 
 推论与注意：
 
-- Worker 无法在服务端"踢人"——Basic 凭据是静态环境变量，改 `ADMIN_PASS` 并重新部署才会让旧凭据失效。
-- 管理器在 Bearer 模式下把令牌存在 `sessionStorage`（关标签即失效），Basic 模式下只存在页面内存与浏览器凭据缓存里。
+- 密钥由管理员凭据派生 ⇒ **改任一凭据并重新部署，所有已签发会话立即失效**（无需额外存储即可"服务端踢人"）。
+- Cookie 只在 `POST /__api/login` 校验通过后才下发（即管理页「鉴权」按钮）；该接口不接受 GET，也不写缓存。
+- 带 `Cookie` 或 `Authorization` 的请求**不读也不写**共享缓存（见 3.3），避免管理员视图泄漏给匿名用户。
+- 访问 `/__manage`、`/share/__manage`、`/<桶>/__manage` 均返回 `401 + WWW-Authenticate` 挑战（浏览器原生弹窗 / curl -u 仍可用）。
 - `PUBLIC_WRITE=true` 会跳过一切校验（等于公开网盘），不要开。
-- 想让"退出"立刻生效，建议用 **Bearer 令牌模式**（`ADMIN_TOKEN`），退出即清除本地令牌；Basic 模式受浏览器缓存限制（见下）。
 
 ### 3.2.2 退出登录
 
-管理器右上角新增 **「退出」** 按钮，点击后：
+管理器右上角 **「退出」** 按钮，点击后：
 
 1. 清空页面内的用户名/密码/令牌与 `sessionStorage` 里的令牌；
-2. 调 `POST /__api/logout`（服务端返回 `401 + WWW-Authenticate`，诱导浏览器丢弃缓存的 Basic 凭据）；
+2. 调 `POST /__api/logout`（服务端下发 `Set-Cookie: cfb2_session=; Max-Age=0` 清除会话，并返回 `401 + WWW-Authenticate`，诱导浏览器丢弃缓存的 Basic 凭据）；
 3. 再发一次带错误凭据（`logout:logout`）的请求，触发浏览器凭据缓存失效；
-4. 0.9 秒后刷新页面 → 若凭据确已清除，会重新弹出登录框。
+4. 0.9 秒后跳到 `/share/`（公开目录首页）→ 若凭据确已清除，再点「登录」会重新弹出登录框。
 
 > 已知限制：**Basic 认证的凭据缓存由浏览器管理**，部分浏览器/版本不会因子资源 401 而清除，退出后可能仍自动登录。
 > 此时可选：① 关闭标签页或浏览器；② 用 Bearer 令牌模式（退出即时生效）；③ Chrome：`chrome://settings/clearBrowserData` 勾选"密码及其他登录数据"，或地址栏左侧锁图标 → 清除站点数据。
@@ -246,8 +254,8 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 | `ALLOW_REDIRECT` | `false` | 允许 `/<key>?redirect=1` 返回 302 到预签名 URL，把大文件流量完全交给 B2（会绕过 CF 缓存） |
 | `UPLOAD_CACHE_CONTROL` | 空 | 上传时写入对象的 Cache-Control，例如 `public, max-age=31536000, immutable` |
 
-缓存生效范围：**仅 GET、且无 Range、且无 Authorization 头、且状态码 200**。
-带 Range 的请求不写缓存（避免半段内容污染 Cache API）。
+缓存生效范围：**仅 GET、且无 Range、且无 `Authorization` 头、且无 `Cookie` 头、且状态码 200**。
+带 Range 的请求不写缓存（避免半段内容污染 Cache API）；带凭据/Cookie 的请求同样不读写共享缓存，避免管理员视图被匿名用户命中。
 
 ### 3.4 上传
 
@@ -467,7 +475,7 @@ crons = ["0 23 * * *"]     # 每天 23:00 UTC：同一次触发里「先刷新�
 | 对象内容 `/share/**` | ✅（这是公开目录的用途） |
 | 对象内部 ID（`x-bz-file-id` 等） | ❌（已剥离） |
 | 上游错误 XML（含桶名） | ❌（匿名只看到 `Not Found` / `Forbidden`） |
-| 管理器入口 `/__manage` | ❌（匿名视图不给出链接） |
+| 全局管理器入口 `/__manage` | ❌（匿名视图不给出裸链接；只给「当前路径 + `__manage`」的登录按钮，例如 `/share/<桶>/__manage`） |
 
 即使知道端点和桶名也无法直连：桶为 Private，S3 请求必须带有效 SigV4 签名，`f00x.backblazeb2.com` 友好 URL 同样需要授权令牌——密钥只存在于 Worker 的 Secret 里。
 
@@ -483,9 +491,11 @@ crons = ["0 23 * * *"]     # 每天 23:00 UTC：同一次触发里「先刷新�
 | `/` | GET | 匿名 → 302 到 `/<PUBLIC_PREFIX>/`（默认 `/share/`）；管理员 → 列出全桶 |
 | `/share/<key>` | GET | 匿名可直接下载的公开对象；`/share/` 可作为公开目录索引 |
 | `/<prefix>/` | GET | 目录列表（HTML；`?format=json` 返回 JSON；`?cursor=` 翻页；`?limit=` 每页条数） |
-| `/__manage` | GET | 网页文件管理器（需鉴权） |
+| `/__manage` | GET | 网页文件管理器（需鉴权；无会话时返回 401 Basic 挑战） |
 | `/<bucket>/__manage` | GET | `$path` 模式下的管理器，自动把 API 前缀带上桶名 |
-| `/__api/logout` | POST | 退出登录（返回 401 + `WWW-Authenticate`，促浏览器丢弃缓存凭据） |
+| `/share/__manage` | GET | 公开目录的管理器入口（＝「登录」按钮的指向）；匿名访问触发 Basic 弹窗 |
+| `/__api/login` | POST | 校验 `{token}` 或 `{user,pass}`（管理页「鉴权」按钮调用），通过则 `Set-Cookie` 下发会话；失败 401 且不下发 Cookie |
+| `/__api/logout` | POST | 退出登录（清除会话 Cookie；返回 401 + `WWW-Authenticate`，促浏览器丢弃缓存凭据） |
 | `/__api/*` | 见下节 | 管理 API（需鉴权，`/health`、`/logout` 除外） |
 | `/<bucket>/__api/*` | 同上 | `$path` 模式下显式指定桶；也可用 `/__api/*?bucket=<桶名>` |
 | `/__api/usage` | GET | B2 用量：空间快照 + Class A/B/C/D 计数（**无手动重算参数**）。需管理员鉴权 |
@@ -618,8 +628,9 @@ curl -X PUT -T ./demo.bin \
 - 下载（走 Worker：`/<key>?dl=1`，由 Worker 下发 `Content-Disposition: attachment`；**不再提供 B2 直链**）
 - 重命名（服务端复制 + 删除）
 - 新建目录、删除文件/目录
+- 登录：公开目录页底部的「登录」按钮＝当前路径 + `__manage`，或直接访问 `/__manage` → 浏览器原生 Basic 弹窗
 - 右上角输入 Basic 用户名/密码或 Bearer 令牌后点"鉴权"；若浏览器已完成 Basic 弹窗登录，通常无需再填
-- 右上角 **「退出」**：清除本地凭据并触发浏览器丢弃缓存的 Basic 凭据（详见 3.2.2）
+- 右上角 **「退出」**：清除会话 Cookie 与本地凭据，并触发浏览器丢弃缓存的 Basic 凭据（详见 3.2.2）
 - 亮色主题下**目录行**为暖色底 + 琥珀色文字，文件行为浅色卡片；深色模式维持单色不变
 
 ### 6.1 两种上传方式怎么选
@@ -878,7 +889,7 @@ B2_ORIGIN='https://b2.mose19960101.workers.dev,https://b2.edgeoneai.cc.cd' node 
 
 | 现象 | 原因 / 处理 |
 | --- | --- |
-| 访问根域名显示 `目录列举未开放（ALLOW_LIST_BUCKET=false）` | **预期行为**，不是故障：根路径＝目录列举，默认不允许匿名枚举。三种选择：① 直接访问具体对象 `/<key>`（公开读已生效）；② 先访问 `/__manage` 用 Basic 登录，浏览器缓存凭据后根路径即可列出；③ 设置 `ROOT_ACTION=welcome` 渲染引导页，或 `ROOT_ACTION=redirect` 直接跳转管理器；确实要公开枚举才设 `ALLOW_LIST_BUCKET=true` |
+| 访问根域名显示 `目录列举未开放（ALLOW_LIST_BUCKET=false）` | **预期行为**，不是故障：根路径＝目录列举，默认不允许匿名枚举。三种选择：① 直接访问具体对象 `/<key>`（公开读已生效）；② 先访问 `/share/__manage`（即公开目录页的「登录」按钮）完成 Basic 登录，浏览器缓存凭据后根路径即可列出；③ 设置 `ROOT_ACTION=welcome` 渲染引导页，或 `ROOT_ACTION=redirect` 直接跳转管理器；确实要公开枚举才设 `ALLOW_LIST_BUCKET=true` |
 | 全部请求返回 `SignatureDoesNotMatch` | `B2_ENDPOINT` 与 `B2_REGION` 不对应；或 keyID/applicationKey 复制错误/带了空格；确认 Key 有该桶权限 |
 | `AuthorizationQueryParametersError` / presign 403 | 预签名 URL 过期（`PRESIGN_EXPIRES`）；或客户端改了 URL 参数 |
 | `AuthorizationHeaderMalformed` | 端点前缀多写了 `/`、或 region 推导错误 → 显式设置 `B2_REGION` |

@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | 站点首页 | https://b2.edgeoneai.cc.cd/ | 匿名访问根路径自动 302 到公开目录 `/share/` |
 | 公开目录 | https://b2.edgeoneai.cc.cd/share/ | 匿名可浏览 + 下载（？format=json 返回 JSON） |
-| 文件管理器 | https://b2.edgeoneai.cc.cd/__manage | Basic 鉴权后可上传/删除/重命名/建目录 |
+| 文件管理器 | https://b2.edgeoneai.cc.cd/__manage | 登录后可上传/下载/删除/重命名/建目录（匿名入口为 `/share/__manage`） |
 | 备用域名 | https://b2.mose19960101.workers.dev/ | 同一 Worker 的 `workers.dev` 入口 |
 | 健康检查 | https://b2.edgeoneai.cc.cd/__api/health | 匿名只返回最小信息，不含桶名/区域 |
 
@@ -41,7 +41,8 @@ cf-b2-worker/
 │  │  ├─ constants.js      # 共享常量（端点默认值、不可签名的头、转发白名单…）
 │  │  ├─ crypto.js         # SHA-256 / HMAC / 十六进制 / RFC3986 编码 / key 归一化
 │  │  ├─ sigv4.js          # 内置 AWS Signature V4 实现（含派生密钥缓存）
-│  │  ├─ auth.js           # Basic / Bearer 恒定时间比较鉴权
+│  │  ├─ auth.js           # Basic / Bearer 恒定时间比较鉴权 + 会话 Cookie 校验
+│  │  ├─ session.js        # 会话 Cookie 的签发/校验（HMAC 签名，密钥由管理员凭据派生）
 │  │  ├─ http.js           # JSON/HTML 响应、安全响应头、CORS、上游错误清洗
 │  │  ├─ config.js         # BUCKET_N 解析、多桶挂载、端点推导、桶级视图
 │  │  ├─ prefix.js         # 公开前缀归一化与边界判断
@@ -66,7 +67,7 @@ cf-b2-worker/
 ```
 
 > **为什么要拆分？** 单文件超过 3000 行后，定位一个函数要在同一份文件里来回翻；改动无法按模块 review，
-> 也容易误伤无关代码。现在按职责拆成 17 个模块，`tools/build.mjs` 再合并回**一个** `dist/b2-worker.js`——
+> 也容易误伤无关代码。现在按职责拆成 18 个模块，`tools/build.mjs` 再合并回**一个** `dist/b2-worker.js`——
 > 既拿到可维护性，又保留「零依赖、单文件、可直接粘贴到控制台」的部署体验。
 > 产物是自动生成的（文件头有告警），**请只改 `src/` 下的源码**。
 
@@ -82,7 +83,9 @@ npm run check   # 校验 dist/ 与 src/ 是否一致（CI 用）
 - `manage-ui.test.mjs`：把管理器页内联脚本放进极简假 DOM 中真实执行，验证「分片大小 / 并发数」输入框的
   默认值来自服务端配置、上下限钳制、非法值回落、切换通道时收紧上限、以及 localStorage 记忆回填。
 - `router.test.mjs`：桩化 `fetch` / `caches`，覆盖鉴权、下载代理、Range 透传、目录列表 HTML/JSON、
-  中文与空格 key 编码、路径穿越防护、`$path` 多桶模式、预签名、分片上传、管理页渲染。
+  中文与空格 key 编码、路径穿越防护、`$path` 多桶模式、预签名、分片上传、管理页渲染，
+  以及会话 Cookie 链路（登录接口下发 HttpOnly Cookie、带 Cookie 后非公开对象不再 308、
+  匿名页「登录」按钮指向当前路径 + `__manage`）。
 
 ---
 
@@ -164,7 +167,7 @@ cron(每周) → b2_authorize_account → b2_get_download_authorization(validDur
 | Web 文件管理器 | 静态欢迎页 | ❌ | ✅ 内置（浏览/上传/直链/删除/重命名/拖拽/分片） |
 | Range 处理 | ✅ 含 CF 缺陷重试 | ❌ | ✅ 继承并修正了重试边界 |
 | 缓存 | 依赖桶元数据 | ❌ | ✅ Cache API + Cache-Control 覆写 + `X-B2-Cache` 标记 |
-| 鉴权 | ❌ | ❌ | ✅ Basic / Bearer 恒定时间比较，默认拒绝 |
+| 鉴权 | ❌ | ❌ | ✅ 会话 Cookie / Bearer / Basic 恒定时间比较，默认拒绝 |
 | 安全 | 路径未做穿越防护、无条件透传 key | 生成的 Worker 无白名单 | ✅ `../` 归一化、写删开关、CORS 白名单、敏感信息不入库 |
 | 体积 / 复杂度 | 中 | 中（双 Worker） | 源码 17 个模块；产物单文件约 3500 行 |
 
@@ -189,8 +192,10 @@ cron(每周) → b2_authorize_account → b2_get_download_authorization(validDur
 | 目录列表 | `GET /<prefix>/` 返回 HTML；`?format=json` 返回 JSON；`?cursor=` 翻页（服务器渲染首批 + 滚动续接） |
 | 目录层级 | 目录页顶部是**可点击面包屑**（匿名：`公开目录 / images / icons`，管理员：`桶名 / share / …`），另有「返回上一级」；匿名在公开根不显示返回入口 |
 | 目录占位 | 新建目录会写 0 字节 `<prefix>/.keep` 作为占位（对象存储没有真目录）；列表默认隐藏它（`HIDE_KEEP_FILES`） |
-| Web 管理器 | `GET /__manage`（Basic/Bearer 鉴权） |
-| 管理 API | `/__api/list`、`/presign`、`/object`、`/copy`、`/mkdir`、`/multipart/*`、`/usage`、`/health` |
+| 登录入口 | 匿名页面的「登录」按钮＝**当前路径 + `__manage`**（`/share/` → `/share/__manage`，`/share/<桶>/` → `/share/<桶>/__manage`），由浏览器原生 Basic 弹窗完成认证；没有独立登录页 |
+| 会话 Cookie | 管理页「鉴权」按钮会调 `POST /__api/login`，校验通过后下发签名会话 Cookie（`HttpOnly`+`SameSite=Lax`，7 天），使**导航类请求**（点「下载」）也带身份；`/__api/logout` 清除会话并跳回 `/share/` |
+| Web 管理器 | `GET /__manage`（会话 Cookie / Bearer / Basic 任一通过即可；匿名访问返回 401 Basic 挑战） |
+| 管理 API | `/__api/list`、`/presign`、`/object`、`/copy`、`/mkdir`、`/multipart/*`、`/usage`、`/health`、`/login`、`/logout` |
 | B2 用量面板 | 管理页**左栏**（桌面 250px 窄栏；移动端 ≤860px 落到列表下方）：只显示桶名、已用空间/额度（含百分比与进度条）、对象数、Class B/C 已用与剩余、计数后端，**其余不显示**。**空间快照与计数归零都由同一个 Cron `scheduled()` 驱动**（默认 23:00 UTC：先统计、后归零），管理页只读快照、**已移除「重新统计」按钮与功能**；次数由 **Durable Object 原子计数**（随每次 B2 请求实时累加；未绑定 DO 时自动降级 Cache API） |
 | 上传 | 代理 `PUT /<key>`（≤100MB）；浏览器默认走预签名直传；超限自动分片 |
 | 兼容性 | `$path` / `$host` / 固定桶；`RCLONE_DOWNLOAD=true` 兼容 `rclone --b2-download-url` |
@@ -250,7 +255,16 @@ curl -I https://<你的域名>/test.txt
 # 列举
 curl -u admin:你的密码 "https://<你的域名>/?format=json"
 
-# 打开网页管理器
+# 换取会话 Cookie（管理页「鉴权」按钮用的就是这个接口；
+# 供浏览器导航类请求带身份，例如点「下载」时不会因匿名被 308 到 /share/）
+curl -i -c cookie.txt -X POST https://<你的域名>/__api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"user":"admin","pass":"你的密码"}'
+
+# 用会话 Cookie 下载非公开前缀的对象（不再被 308 到 /share/）
+curl -b cookie.txt -o test.txt https://<你的域名>/test.txt?dl=1
+
+# 打开网页管理器（浏览器弹出 Basic 登录框；公开目录页的「登录」按钮指向 /share/__manage）
 浏览器访问 https://<你的域名>/__manage
 ```
 

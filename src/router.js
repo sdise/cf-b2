@@ -44,10 +44,12 @@ export function mountListPage(cfg, { publicRoot, isAdmin }) {
   const crumbs = publicRoot
     ? '<nav class="crumb"><span class="cur">公开目录</span></nav>'
     : '<nav class="crumb"><span class="cur">根目录</span></nav>';
+  // 匿名入口 = 当前页面路径 + __manage（公开聚合根 /share/ → /share/__manage）
+  const entryBase = publicRoot ? '/' + String(cfg.publicPrefix || '').replace(/^\/+|\/+$/g, '') + '/' : '/';
   const adminBar = isAdmin
     ? '<div class="sub"><a class="acc" href="' + MANAGE_PATH + '">文件管理器</a> · 共 ' + cfg.buckets.length + ' 个桶'
       + (publicRoot ? '' : ' · 匿名用户只能访问 <a class="acc" href="/share/">/share/</a>') + '</div>'
-    : '';
+    : '<div class="sub"><a class="btn" href="' + escapeHtml(entryBase + MANAGE_PATH.slice(1)) + '">登录</a></div>';
 
   return [
     '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
@@ -61,6 +63,8 @@ export function mountListPage(cfg, { publicRoot, isAdmin }) {
     '.crumb{font-size:18px;font-weight:600;margin:0 0 12px}',
     '.crumb a{color:var(--acc)}.crumb a:hover{text-decoration:underline}',
     '.acc{color:var(--acc)}',
+    '.btn{display:inline-block;padding:7px 16px;background:var(--acc);color:var(--btn);border-radius:8px;text-decoration:none;font-size:14px}',
+    '.btn:hover{text-decoration:none;opacity:.9}',
     'table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}',
     'td{padding:12px 14px;border-bottom:1px solid var(--line);font-size:14px}',
     'tr:last-child td{border-bottom:0}',
@@ -126,7 +130,7 @@ export async function dispatch(request, env, ctx, cfg) {
     return apiRouter(request, env, ctx, cfg, url);
   }
 
-  /* ---- 文件管理器页面（/<bucket>/__manage；匿名保留 401 挑战以便浏览器弹出登录） ---- */
+  /* ---- 文件管理器页面（/<bucket>/__manage；匿名保留 401 挑战以便浏览器弹出登录框） ---- */
   if (cfg.enableManage && url.pathname.endsWith(MANAGE_PATH)) {
     const auth = await checkAuth(request, cfg);
     if (!auth.ok) return challenge(request, cfg);
@@ -233,6 +237,8 @@ export async function dispatch(request, env, ctx, cfg) {
           crumbPre,
           relPrefix,
           upHref: mount.alias ? '/share/' : '/',
+          // 匿名视图的「登录」= 当前路径 + __manage（走浏览器原生 Basic 弹窗，不泄露任何数据）
+          loginHref: base + MANAGE_PATH.slice(1),
         }));
       }
 

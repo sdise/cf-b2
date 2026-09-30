@@ -12,6 +12,8 @@ export function renderDirectory(data, prefix, opts = {}) {
   // 管理员删除目录用的 API 基址（挂载点感知：/<桶>/__api/ 或 /share/<桶>/__api/）
   const apiBase = base.replace(/\/+$/, '') + API_PREFIX;
   const bucketName = opts.bucket || '';
+  // 匿名用户的登录入口：当前路径 + __manage（走浏览器原生 Basic 弹窗）
+  const loginHref = opts.loginHref || (base + MANAGE_PATH.slice(1));
 
   const rows = [];
   // 目录占位对象（<prefix>/.keep）不参与展示与计数
@@ -58,10 +60,11 @@ export function renderDirectory(data, prefix, opts = {}) {
 
   for (const file of files) {
     const href = base + escapeHtml(relPrefix + file.name);
+    // 「下载」必须带 ?dl=1：否则只是普通导航，浏览器会按 Content-Type 内联展示，不会触发下载
     rows.push('<tr><td>[FILE] <a href="' + href + '">' + escapeHtml(file.name) + '</a></td>'
       + '<td>' + humanSize(file.size) + '</td>'
       + '<td>' + escapeHtml(file.lastModified) + '</td>'
-      + '<td><a href="' + href + '">下载</a></td></tr>');
+      + '<td><a href="' + href + '?dl=1">下载</a></td></tr>');
   }
 
   const initCount = data.folders.length + files.length;
@@ -105,7 +108,7 @@ export function renderDirectory(data, prefix, opts = {}) {
     '    out += \'<tr><td>[FILE] <a href="\' + href + \'">\' + esc(f.name) + \'</a></td>\'',
     '      + "<td>" + human(f.size) + "</td>"',
     '      + \'<td class="muted">\' + esc(f.lastModified) + "</td>"',
-    '      + \'<td><a href="\' + href + \'">下载</a></td></tr>\';',
+    '      + \'<td><a href="\' + href + \'?dl=1">下载</a></td></tr>\';',
     '  });',
     '  return out;',
     '}',
@@ -186,8 +189,12 @@ export function renderDirectory(data, prefix, opts = {}) {
     'tr.dir td a{color:var(--folderTxt)}tr.dir td [data-act]{color:var(--folderTxt)}',
     'a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}',
     '.empty{color:var(--dim);padding:24px;text-align:center}.muted{color:var(--dim)}',
+    '.btn{display:inline-block;padding:6px 14px;background:var(--acc);color:var(--btn);border-radius:8px;text-decoration:none;font-size:13px}',
+    '.btn:hover{text-decoration:none;opacity:.9}',
     '</style></head><body><div class="wrap">',
-    '<div class="top"><button id="btnTheme">深色模式</button><span class="grow"></span></div>',
+    '<div class="top"><button id="btnTheme">深色模式</button><span class="grow"></span>'
+      + (showManage ? '' : '<a class="btn" href="' + escapeHtml(loginHref) + '">登录</a>')
+      + '</div>',
     crumbsHtml,
     '<div class="sub">' + data.folders.length + ' 个目录 / ' + files.length
       + ' 个文件'
@@ -205,8 +212,9 @@ export function renderDirectory(data, prefix, opts = {}) {
 
 /** 匿名访问未被授权目录时的引导页（ROOT_ACTION=welcome） */
 export function welcomePage(cfg, bucketLabel, prefix, publicPath) {
-  const manageUrl = MANAGE_PATH;
+  // 登录入口 = 公开目录路径 + __manage（例如 /share/ → /share/__manage）
   const shareUrl = publicPath || '/';
+  const manageUrl = (shareUrl.endsWith('/') ? shareUrl : shareUrl + '/') + MANAGE_PATH.slice(1);
   return [
     '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
@@ -241,7 +249,7 @@ export function welcomePage(cfg, bucketLabel, prefix, publicPath) {
       : '<p style="margin-top:14px">当前桶：<code>' + escapeHtml(bucketLabel) + '</code>'
         + (prefix ? ' · 前缀 <code>' + escapeHtml(prefix) + '</code>' : '')
         + ' · 区域 <code>' + escapeHtml(cfg.region) + '</code></p>'),
-    '<a class="btn" href="' + manageUrl + '">进入文件管理器</a>',
+    '<a class="btn" href="' + manageUrl + '">登录</a>',
     '</div><script>' + themeToggleScript() + '</script></body></html>',
   ].join('\n');
 }

@@ -76,8 +76,11 @@ export async function readObject(request, env, ctx, cfg, bucket, key, options = 
   const method = request.method;
 
   // 1) Cache API 命中（仅整对象 GET）
+  //    带凭据的请求（Authorization 头 / 会话 Cookie）不读写共享缓存：
+  //    保持「已登录请求直连上游」的既有语义，避免把管理员的响应写进边缘缓存。
   const cacheable = cfg.useCache && cfg.cacheMaxAge > 0 && method === 'GET'
-    && !request.headers.get('range') && !request.headers.get('authorization');
+    && !request.headers.get('range') && !request.headers.get('authorization')
+    && !request.headers.get('cookie');
   if (cacheable) {
     try {
       const cached = await caches.default.match(request.url);

@@ -7,6 +7,7 @@ export const DEFAULT_ENDPOINT = 'https://s3.us-west-001.backblazeb2.com';
 
 export const API_PREFIX = '/__api/';
 export const MANAGE_PATH = '/__manage';
+/** 由「当前路径 + __manage」拼出登录/管理器入口：匿名入口是 /share/，故默认是 /share/__manage */
 
 /** 这些头来自客户端或 Cloudflare 平台，参与签名会导致 SignatureDoesNotMatch */
 export const UNSIGNABLE_HEADERS = new Set([

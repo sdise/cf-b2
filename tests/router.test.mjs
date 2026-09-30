@@ -1257,13 +1257,14 @@ await check('响应剥离 B2 内部头（x-bz-* / x-amz-request-id）', async ()
   return '内部头已剥离，ETag 保留';
 });
 
-await check('匿名目录列表不泄露桶名与管理器入口', async () => {
+await check('匿名目录列表不泄露全局管理器入口（登录按钮＝当前路径 + __manage）', async () => {
   const res = await handle(req('/share/my-bucket/'), shareEnv, ctx);
   const body = await res.text();
   assert(body.includes('my-bucket'), '桶名可公开（面包屑/挂载点）');
-  assert(!body.includes('__manage'), '匿名视图不应暴露管理器入口');
+  assert(!/href="\/__manage"/.test(body), '匿名视图不应暴露裸的全局管理器入口');
+  assert(body.includes('/share/my-bucket/__manage'), '应给出当前路径 + __manage 的登录入口');
   assert(body.includes('a.txt'), '仍应正常列出文件');
-  return '管理器入口已隐藏；桶名按设计公开';
+  return '登录入口 /share/my-bucket/__manage；无裸 /__manage';
 });
 
 await check('管理员目录列表仍可见桶名与管理入口', async () => {
@@ -1542,6 +1543,105 @@ await check('管理器内嵌前端 JS 可解析', async () => {
   const { Script } = await import('node:vm');
   for (const [, code] of scripts) new Script(code);   // 仅做语法编译校验
   return scripts.length + ' 个脚本块';
+});
+
+/* ---------- 会话 Cookie / 下载链路（修复「点下载被重定向到 /share/」） ---------- */
+
+let sessionCookie = '';
+
+await check('登录接口：错误凭据 401 且不下发 Cookie；正确凭据下发 HttpOnly 会话', async () => {
+  const post = (payload) => handle(req('/__api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }), env, ctx);
+
+  const bad = await post({ user: 'admin', pass: 'wrong' });
+  assert(bad.status === 401, '错误凭据 status=' + bad.status);
+  assert(!bad.headers.get('set-cookie'), '失败不应下发 Cookie');
+
+  const ok = await post({ user: 'admin', pass: 'secret-pass' });
+  const cookie = ok.headers.get('set-cookie') || '';
+  assert(ok.status === 200, 'status=' + ok.status);
+  assert(/^cfb2_session=[^;]+/.test(cookie), '未下发会话 Cookie: ' + cookie);
+  assert(cookie.includes('HttpOnly'), 'Cookie 应带 HttpOnly: ' + cookie);
+  assert(cookie.includes('SameSite=Lax'), 'Cookie 应带 SameSite=Lax: ' + cookie);
+  sessionCookie = cookie.split(';')[0];
+  return sessionCookie.slice(0, 22) + '…';
+});
+
+await check('会话 Cookie：管理页放行、非公开对象不再被 308 到 /share/', async () => {
+  // PUBLIC_PREFIX=share 时，非 share/ 前缀的对象对匿名用户是 308 → /share/
+  // （这正是「点下载跳转到公开目录、没有触发下载」的成因）
+  const envPub = { ...env, PUBLIC_PREFIX: 'share' };
+  const anon = await handle(req('/my-bucket/private/a.txt'), envPub, ctx);
+  assert(anon.status === 308, '匿名 status=' + anon.status);
+  assert(
+    anon.headers.get('location') === 'https://dl.example.com/share/',
+    '匿名 location=' + anon.headers.get('location'),
+  );
+
+  const authed = await handle(
+    req('/my-bucket/private/a.txt?dl=1', { headers: { Cookie: sessionCookie } }), envPub, ctx,
+  );
+  assert(authed.status === 200, '带 Cookie status=' + authed.status);
+  assert(
+    (authed.headers.get('content-disposition') || '').includes('attachment'),
+    'dl=1 应返回附件下载头: ' + authed.headers.get('content-disposition'),
+  );
+
+  const manage = await handle(req('/__manage', { headers: { Cookie: sessionCookie } }), envPub, ctx);
+  assert(manage.status === 200, '管理页 status=' + manage.status);
+  return '匿名 308 → /share/；带 Cookie → 200 且带附件头';
+});
+
+await check('伪造的会话 Cookie 无效（签名校验）', async () => {
+  const res = await handle(req('/__manage', { headers: { Cookie: 'cfb2_session=9999999999.deadbeef' } }), env, ctx);
+  assert(res.status === 401, 'status=' + res.status);
+  return '401';
+});
+
+await check('退出登录：清除会话 Cookie，退出后重定向到 /share/', async () => {
+  const res = await handle(
+    req('/__api/logout', { method: 'POST', headers: { Authorization: basic, Cookie: sessionCookie } }), env, ctx,
+  );
+  const cookie = res.headers.get('set-cookie') || '';
+  assert(res.status === 401, 'status=' + res.status);
+  assert(cookie.includes('cfb2_session=') && cookie.includes('Max-Age=0'), '未清除 Cookie: ' + cookie);
+
+  const envPub = { ...env, PUBLIC_PREFIX: 'share' };
+  const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), envPub, ctx)).text();
+  const m = page.match(/"exitUrl":"([^"]*)"/);
+  assert(m, '管理页未给出退出目标 exitUrl');
+  assert(m[1] === '/share/', '退出目标应为 /share/，实际 ' + m[1]);
+
+  // 未配置公开前缀时退回站点根
+  const page2 = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
+  const m2 = page2.match(/"exitUrl":"([^"]*)"/);
+  assert(m2 && m2[1] === '/', '无公开前缀时退出目标应为 /，实际 ' + (m2 ? m2[1] : '未找到'));
+  return 'Max-Age=0；退出 → /share/';
+});
+
+await check('目录页「下载」链接带 ?dl=1（否则浏览器只会内联展示）', async () => {
+  const body = await (await handle(req('/my-bucket/docs/', { headers: { Authorization: basic } }), env, ctx)).text();
+  assert(body.includes('?dl=1'), '下载链接缺少 ?dl=1');
+  return 'ok';
+});
+
+await check('匿名目录页的「登录」= 当前路径 + __manage（不再有独立登录页）', async () => {
+  const body = await (await handle(req('/my-bucket/docs/'), env, ctx)).text();
+  assert(body.includes('/my-bucket/__manage'), '登录入口应为当前路径 + __manage');
+  assert(!body.includes('__login'), '不应再出现独立登录页');
+  return '/my-bucket/__manage';
+});
+
+await check('公开目录的「登录」入口：/share/ → /share/__manage，/share/<桶>/ → /share/<桶>/__manage', async () => {
+  const envPub = { ...env, PUBLIC_PREFIX: 'share' };
+  const root = await (await handle(req('/share/'), envPub, ctx)).text();
+  assert(root.includes('/share/__manage'), '公开聚合根入口错误');
+  const dir = await (await handle(req('/share/my-bucket/'), envPub, ctx)).text();
+  assert(dir.includes('/share/my-bucket/__manage'), '公开目录入口错误');
+  return '/share/__manage、/share/my-bucket/__manage';
 });
 
 console.log(failed === 0 ? '\n全部通过 ✅' : '\n失败 ' + failed + ' 项 ❌');

@@ -45,6 +45,7 @@ const DEFAULT_ENDPOINT = 'https://s3.us-west-001.backblazeb2.com';
 
 const API_PREFIX = '/__api/';
 const MANAGE_PATH = '/__manage';
+/** 由「当前路径 + __manage」拼出登录/管理器入口：匿名入口是 /share/，故默认是 /share/__manage */
 
 /** 这些头来自客户端或 Cloudflare 平台，参与签名会导致 SignatureDoesNotMatch */
 const UNSIGNABLE_HEADERS = new Set([
@@ -392,10 +393,119 @@ function challenge(request, cfg) {
  * 未配置任何凭据时一律默认拒绝，避免误把私有桶变成公共网盘。
  */
 
+/* ---------- src/lib/session.js ---------- */
+/* 会话 Cookie：让「导航类请求」也能带管理员身份 */
+
+/**
+ * 为什么需要它？
+ *   Basic / Bearer 都只能挂在 **请求头** 上，而 `<a href>`、`window.open()` 这类
+ *   普通导航由浏览器发起，JS 无法附加 Authorization 头。于是管理页里点「下载」时，
+ *   Worker 会把管理员当成匿名用户，把非公开前缀的对象 308 重定向到 /share/。
+ *
+ * 做法：
+ *   登录接口校验凭据后下发一枚 **HMAC 签名** 的 Cookie（HttpOnly），
+ *   之后的导航请求浏览器自动携带，鉴权、下载、Range 全部照常走原生链路。
+ *
+ * 安全性：
+ *   - 值形如 `<过期时间戳>.<HMAC>`，密钥由管理员凭据派生 ⇒ 无法伪造；
+ *     且一旦 ADMIN_TOKEN / ADMIN_USER / ADMIN_PASS 变更，旧会话全部自动失效。
+ *   - HttpOnly（JS 读不到）、SameSite=Lax（跨站 POST/PUT/DELETE 不带 ⇒ 天然防 CSRF）、
+ *     HTTPS 下加 Secure。
+ */
+
+
+const SESSION_COOKIE = 'cfb2_session';
+
+/** 会话有效期：7 天 */
+const SESSION_TTL = 7 * 24 * 60 * 60;
+
+/** 派生会话密钥：任一管理员凭据变化都会让已签发的会话失效 */
+function sessionSecret(cfg) {
+  return [cfg.adminToken, cfg.adminUser, cfg.adminPass].filter(Boolean).join('\u0000');
+}
+
+/** 是否具备签发会话的条件（即配置了管理员凭据） */
+function sessionAvailable(cfg) {
+  return Boolean(sessionSecret(cfg));
+}
+
+async function sign(cfg, exp) {
+  const key = encoder.encode(sessionSecret(cfg));
+  return toHex(await hmac(key, 'cfb2-session\n' + exp));
+}
+
+/** 签发会话值（未配置凭据时返回空串，调用方据此跳过 Set-Cookie） */
+async function issueSession(cfg, ttl = SESSION_TTL) {
+  if (!sessionAvailable(cfg)) return '';
+  const exp = Math.floor(Date.now() / 1000) + Math.max(1, ttl);
+  return exp + '.' + await sign(cfg, exp);
+}
+
+/** 校验会话值：过期 / 格式错 / 签名不符 一律拒绝 */
+async function verifySession(cfg, value) {
+  if (!sessionAvailable(cfg) || !value) return false;
+  const dot = String(value).indexOf('.');
+  if (dot <= 0) return false;
+  const exp = Number(String(value).slice(0, dot));
+  if (!Number.isInteger(exp) || exp * 1000 < Date.now()) return false;
+  return safeEqual(String(value).slice(dot + 1), await sign(cfg, exp));
+}
+
+/** 从 Cookie 头里取指定名字的值 */
+function readCookie(header, name) {
+  if (!header) return '';
+  for (const part of String(header).split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    if (part.slice(0, i).trim() === name) {
+      try {
+        return decodeURIComponent(part.slice(i + 1).trim());
+      } catch {
+        return part.slice(i + 1).trim();
+      }
+    }
+  }
+  return '';
+}
+
+/** 生成 Set-Cookie 头；value 为空串表示「清除」 */
+function sessionCookie(cfg, value, secure = true, maxAge = SESSION_TTL) {
+  const bits = [
+    SESSION_COOKIE + '=' + encodeURIComponent(value || ''),
+    'Path=/',
+    'HttpOnly',
+    'SameSite=Lax',
+    'Max-Age=' + (value ? maxAge : 0),
+  ];
+  if (secure) bits.push('Secure');
+  return bits.join('; ');
+}
+
 /* ---------- src/lib/auth.js ---------- */
 /* 由 src/b2-worker.js 拆分而来：原 L622-L674 */
 
 
+
+
+/**
+ * 登录页/登录接口使用的凭据校验：直接收「令牌」或「用户名 + 密码」，
+ * 不必先拼一个 Authorization 头。
+ */
+async function verifyLogin(cfg, { token = '', user = '', pass = '' } = {}) {
+  const basicReady = Boolean(cfg.adminUser && cfg.adminPass);
+  if (!cfg.adminToken && !basicReady) {
+    return { ok: false, reason: '未配置 ADMIN_TOKEN 或完整的 ADMIN_USER/ADMIN_PASS（两者都需设置）' };
+  }
+  if (token) {
+    if (cfg.adminToken && await safeEqual(token, cfg.adminToken)) return { ok: true, mode: 'token' };
+    return { ok: false, reason: '令牌无效' };
+  }
+  if (!basicReady) return { ok: false, reason: '本部署只配置了 ADMIN_TOKEN，请改用令牌登录' };
+  if (await safeEqual(user, cfg.adminUser) && await safeEqual(pass, cfg.adminPass)) {
+    return { ok: true, mode: 'basic' };
+  }
+  return { ok: false, reason: '用户名或密码错误' };
+}
 
 async function checkAuth(request, cfg) {
   if (cfg.publicWrite) return { ok: true, mode: 'public' };
@@ -405,6 +515,11 @@ async function checkAuth(request, cfg) {
   if (!cfg.adminToken && !basicReady) {
     return { ok: false, reason: '未配置 ADMIN_TOKEN 或完整的 ADMIN_USER/ADMIN_PASS（两者都需设置），操作已被默认拒绝' };
   }
+
+  // 会话 Cookie 优先：它是签名过的强凭据，且是「下载」这类导航请求唯一的身份来源。
+  // 校验失败不直接返回，继续往下尝试 Authorization 头。
+  const session = readCookie(request.headers.get('cookie'), SESSION_COOKIE);
+  if (session && await verifySession(cfg, session)) return { ok: true, mode: 'session' };
 
   const authorization = request.headers.get('authorization') || '';
 
@@ -529,8 +644,11 @@ async function readObject(request, env, ctx, cfg, bucket, key, options = {}) {
   const method = request.method;
 
   // 1) Cache API 命中（仅整对象 GET）
+  //    带凭据的请求（Authorization 头 / 会话 Cookie）不读写共享缓存：
+  //    保持「已登录请求直连上游」的既有语义，避免把管理员的响应写进边缘缓存。
   const cacheable = cfg.useCache && cfg.cacheMaxAge > 0 && method === 'GET'
-    && !request.headers.get('range') && !request.headers.get('authorization');
+    && !request.headers.get('range') && !request.headers.get('authorization')
+    && !request.headers.get('cookie');
   if (cacheable) {
     try {
       const cached = await caches.default.match(request.url);
@@ -1810,6 +1928,7 @@ async function readJsonBody(request) {
 
 
 
+
 function resolveApiBucket(cfg, basePath, url) {
   const segs = basePath.split('/').filter(Boolean);
   let name = '';
@@ -1832,7 +1951,7 @@ async function apiRouter(request, env, ctx, cfg, url) {
     return new Response(null, { status: 204, headers: corsHeaders(request, cfg) });
   }
 
-  // 退出登录：Worker 本身无会话，这里返回 401 诱导浏览器丢弃缓存的 Basic 凭据
+  // 退出登录：清掉会话 Cookie，并返回 401 诱导浏览器丢弃缓存的 Basic 凭据
   if (action === 'logout') {
     return new Response(
       JSON.stringify({ ok: true, message: '本地凭据已清除；浏览器缓存的 Basic 凭据可能需要关闭标签页或浏览器' }),
@@ -1842,10 +1961,30 @@ async function apiRouter(request, env, ctx, cfg, url) {
           'Content-Type': 'application/json; charset=utf-8',
           'WWW-Authenticate': 'Basic realm="B2 Manager", charset="UTF-8"',
           'Cache-Control': 'no-store',
+          'Set-Cookie': sessionCookie(cfg, '', url.protocol === 'https:'),
           ...corsHeaders(request, cfg),
         },
       },
     );
+  }
+
+  /* 登录：校验凭据后下发会话 Cookie。
+     Basic / Bearer 只能挂在请求头上，而「下载」是普通导航（<a href> / window.open），
+     JS 加不上头 —— 于是管理员点下载会被当成匿名、被 308 重定向到 /share/。
+     用 Cookie 让导航类请求也带得上管理员身份。 */
+  if (action === 'login') {
+    if (request.method !== 'POST') return deny('登录请用 POST', request, cfg, 405);
+    const body = await readJsonBody(request);
+    const auth = await verifyLogin(cfg, {
+      token: String(body.token || ''),
+      user: String(body.user || ''),
+      pass: String(body.pass || ''),
+    });
+    if (!auth.ok) return deny(auth.reason, request, cfg, 401);
+    const value = await issueSession(cfg);
+    const res = json({ ok: true, mode: auth.mode }, 200, request, cfg);
+    if (value) res.headers.set('Set-Cookie', sessionCookie(cfg, value, url.protocol === 'https:'));
+    return res;
   }
 
   // health 无需鉴权，但匿名只能拿到最小信息（不暴露区域 / 桶模式）
@@ -2246,9 +2385,14 @@ function managePage(cfg, url) {
   // 对象访问根路径（挂载点前缀），下载一律走这里，不再用预签名直链
   const objectBase = basePath.endsWith('/') ? basePath : basePath + '/';
 
+  // 「退出」后的去向：公开目录根（默认 /share/）；未配置公开前缀时退回站点根 /
+  const publicHome = '/' + String(cfg.publicPrefix || '').replace(/^\/+|\/+$/g, '') + '/';
+  const exitUrl = cfg.publicPrefix ? publicHome : '/';
+
   const configJson = inlineJson({
     apiBase,
     basePath: objectBase,
+    exitUrl,
     defaultBucket,
     bucket: cfg.bucketFixed,
     buckets: cfg.buckets.map((b) => ({ name: b.name, label: b.label })),
@@ -2897,8 +3041,18 @@ function managePage(cfg, url) {
     '};',
     'el("btnLogin").onclick = function () {',
     '  SELECT = null;',
-    '  if (CFG.hasToken) TOKEN = el("fPass").value; else TOKEN = "";',
-    '  call("health").then(function (r) {',
+    '  var u = el("fUser").value, p = el("fPass").value;',
+    '  if (CFG.hasToken) TOKEN = p; else TOKEN = "";',
+    '  /* 先换取会话 Cookie：Basic / Bearer 只能挂在 fetch 的请求头上，',
+    '     而「下载」是 window.open 普通导航 —— 没有 Cookie 就会被当成匿名，',
+    '     非公开前缀的对象会被 308 重定向到 /share/。 */',
+    '  fetch(API + "login", {',
+    '    method: "POST", credentials: "same-origin",',
+    '    headers: { "Content-Type": "application/json" },',
+    '    body: JSON.stringify({ token: CFG.hasToken ? p : "", user: u, pass: p })',
+    '  }).catch(function () { return null; }).then(function () {',
+    '    return call("health");',
+    '  }).then(function (r) {',
     '    var okAuth = r.data && r.data.authenticated;',
     '    if (okAuth) { try { sessionStorage.setItem("cfb2-token", TOKEN || ""); } catch (e) {} }',
     '    toast(okAuth ? "鉴权成功" : "鉴权失败", !okAuth);',
@@ -2921,7 +3075,7 @@ function managePage(cfg, url) {
     '    .catch(function () {})',
     '    .then(function () {',
     '      toast("已退出：本地凭据已清除。若浏览器仍自动登录，请关闭标签页/浏览器，或改用 Bearer 令牌模式（退出即时生效）。");',
-    '      setTimeout(function () { location.reload(); }, 900);',
+    '      setTimeout(function () { location.replace(CFG.exitUrl || "/"); }, 900);',
     '    });',
     '};',
     '/* 移动端「更多」折叠：默认收起，点击在 moreMenu 上切换 more-open（桌面该按钮被隐藏，不影响） */',
@@ -3063,6 +3217,8 @@ function renderDirectory(data, prefix, opts = {}) {
   // 管理员删除目录用的 API 基址（挂载点感知：/<桶>/__api/ 或 /share/<桶>/__api/）
   const apiBase = base.replace(/\/+$/, '') + API_PREFIX;
   const bucketName = opts.bucket || '';
+  // 匿名用户的登录入口：当前路径 + __manage（走浏览器原生 Basic 弹窗）
+  const loginHref = opts.loginHref || (base + MANAGE_PATH.slice(1));
 
   const rows = [];
   // 目录占位对象（<prefix>/.keep）不参与展示与计数
@@ -3109,10 +3265,11 @@ function renderDirectory(data, prefix, opts = {}) {
 
   for (const file of files) {
     const href = base + escapeHtml(relPrefix + file.name);
+    // 「下载」必须带 ?dl=1：否则只是普通导航，浏览器会按 Content-Type 内联展示，不会触发下载
     rows.push('<tr><td>[FILE] <a href="' + href + '">' + escapeHtml(file.name) + '</a></td>'
       + '<td>' + humanSize(file.size) + '</td>'
       + '<td>' + escapeHtml(file.lastModified) + '</td>'
-      + '<td><a href="' + href + '">下载</a></td></tr>');
+      + '<td><a href="' + href + '?dl=1">下载</a></td></tr>');
   }
 
   const initCount = data.folders.length + files.length;
@@ -3156,7 +3313,7 @@ function renderDirectory(data, prefix, opts = {}) {
     '    out += \'<tr><td>[FILE] <a href="\' + href + \'">\' + esc(f.name) + \'</a></td>\'',
     '      + "<td>" + human(f.size) + "</td>"',
     '      + \'<td class="muted">\' + esc(f.lastModified) + "</td>"',
-    '      + \'<td><a href="\' + href + \'">下载</a></td></tr>\';',
+    '      + \'<td><a href="\' + href + \'?dl=1">下载</a></td></tr>\';',
     '  });',
     '  return out;',
     '}',
@@ -3237,8 +3394,12 @@ function renderDirectory(data, prefix, opts = {}) {
     'tr.dir td a{color:var(--folderTxt)}tr.dir td [data-act]{color:var(--folderTxt)}',
     'a{color:var(--acc);text-decoration:none}a:hover{text-decoration:underline}',
     '.empty{color:var(--dim);padding:24px;text-align:center}.muted{color:var(--dim)}',
+    '.btn{display:inline-block;padding:6px 14px;background:var(--acc);color:var(--btn);border-radius:8px;text-decoration:none;font-size:13px}',
+    '.btn:hover{text-decoration:none;opacity:.9}',
     '</style></head><body><div class="wrap">',
-    '<div class="top"><button id="btnTheme">深色模式</button><span class="grow"></span></div>',
+    '<div class="top"><button id="btnTheme">深色模式</button><span class="grow"></span>'
+      + (showManage ? '' : '<a class="btn" href="' + escapeHtml(loginHref) + '">登录</a>')
+      + '</div>',
     crumbsHtml,
     '<div class="sub">' + data.folders.length + ' 个目录 / ' + files.length
       + ' 个文件'
@@ -3256,8 +3417,9 @@ function renderDirectory(data, prefix, opts = {}) {
 
 /** 匿名访问未被授权目录时的引导页（ROOT_ACTION=welcome） */
 function welcomePage(cfg, bucketLabel, prefix, publicPath) {
-  const manageUrl = MANAGE_PATH;
+  // 登录入口 = 公开目录路径 + __manage（例如 /share/ → /share/__manage）
   const shareUrl = publicPath || '/';
+  const manageUrl = (shareUrl.endsWith('/') ? shareUrl : shareUrl + '/') + MANAGE_PATH.slice(1);
   return [
     '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
@@ -3292,7 +3454,7 @@ function welcomePage(cfg, bucketLabel, prefix, publicPath) {
       : '<p style="margin-top:14px">当前桶：<code>' + escapeHtml(bucketLabel) + '</code>'
         + (prefix ? ' · 前缀 <code>' + escapeHtml(prefix) + '</code>' : '')
         + ' · 区域 <code>' + escapeHtml(cfg.region) + '</code></p>'),
-    '<a class="btn" href="' + manageUrl + '">进入文件管理器</a>',
+    '<a class="btn" href="' + manageUrl + '">登录</a>',
     '</div><script>' + themeToggleScript() + '</script></body></html>',
   ].join('\n');
 }
@@ -3345,10 +3507,12 @@ function mountListPage(cfg, { publicRoot, isAdmin }) {
   const crumbs = publicRoot
     ? '<nav class="crumb"><span class="cur">公开目录</span></nav>'
     : '<nav class="crumb"><span class="cur">根目录</span></nav>';
+  // 匿名入口 = 当前页面路径 + __manage（公开聚合根 /share/ → /share/__manage）
+  const entryBase = publicRoot ? '/' + String(cfg.publicPrefix || '').replace(/^\/+|\/+$/g, '') + '/' : '/';
   const adminBar = isAdmin
     ? '<div class="sub"><a class="acc" href="' + MANAGE_PATH + '">文件管理器</a> · 共 ' + cfg.buckets.length + ' 个桶'
       + (publicRoot ? '' : ' · 匿名用户只能访问 <a class="acc" href="/share/">/share/</a>') + '</div>'
-    : '';
+    : '<div class="sub"><a class="btn" href="' + escapeHtml(entryBase + MANAGE_PATH.slice(1)) + '">登录</a></div>';
 
   return [
     '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
@@ -3362,6 +3526,8 @@ function mountListPage(cfg, { publicRoot, isAdmin }) {
     '.crumb{font-size:18px;font-weight:600;margin:0 0 12px}',
     '.crumb a{color:var(--acc)}.crumb a:hover{text-decoration:underline}',
     '.acc{color:var(--acc)}',
+    '.btn{display:inline-block;padding:7px 16px;background:var(--acc);color:var(--btn);border-radius:8px;text-decoration:none;font-size:14px}',
+    '.btn:hover{text-decoration:none;opacity:.9}',
     'table{width:100%;border-collapse:collapse;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden}',
     'td{padding:12px 14px;border-bottom:1px solid var(--line);font-size:14px}',
     'tr:last-child td{border-bottom:0}',
@@ -3427,7 +3593,7 @@ async function dispatch(request, env, ctx, cfg) {
     return apiRouter(request, env, ctx, cfg, url);
   }
 
-  /* ---- 文件管理器页面（/<bucket>/__manage；匿名保留 401 挑战以便浏览器弹出登录） ---- */
+  /* ---- 文件管理器页面（/<bucket>/__manage；匿名保留 401 挑战以便浏览器弹出登录框） ---- */
   if (cfg.enableManage && url.pathname.endsWith(MANAGE_PATH)) {
     const auth = await checkAuth(request, cfg);
     if (!auth.ok) return challenge(request, cfg);
@@ -3534,6 +3700,8 @@ async function dispatch(request, env, ctx, cfg) {
           crumbPre,
           relPrefix,
           upHref: mount.alias ? '/share/' : '/',
+          // 匿名视图的「登录」= 当前路径 + __manage（走浏览器原生 Basic 弹窗，不泄露任何数据）
+          loginHref: base + MANAGE_PATH.slice(1),
         }));
       }
 

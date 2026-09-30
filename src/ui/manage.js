@@ -12,9 +12,14 @@ export function managePage(cfg, url) {
   // 对象访问根路径（挂载点前缀），下载一律走这里，不再用预签名直链
   const objectBase = basePath.endsWith('/') ? basePath : basePath + '/';
 
+  // 「退出」后的去向：公开目录根（默认 /share/）；未配置公开前缀时退回站点根 /
+  const publicHome = '/' + String(cfg.publicPrefix || '').replace(/^\/+|\/+$/g, '') + '/';
+  const exitUrl = cfg.publicPrefix ? publicHome : '/';
+
   const configJson = inlineJson({
     apiBase,
     basePath: objectBase,
+    exitUrl,
     defaultBucket,
     bucket: cfg.bucketFixed,
     buckets: cfg.buckets.map((b) => ({ name: b.name, label: b.label })),
@@ -663,8 +668,18 @@ export function managePage(cfg, url) {
     '};',
     'el("btnLogin").onclick = function () {',
     '  SELECT = null;',
-    '  if (CFG.hasToken) TOKEN = el("fPass").value; else TOKEN = "";',
-    '  call("health").then(function (r) {',
+    '  var u = el("fUser").value, p = el("fPass").value;',
+    '  if (CFG.hasToken) TOKEN = p; else TOKEN = "";',
+    '  /* 先换取会话 Cookie：Basic / Bearer 只能挂在 fetch 的请求头上，',
+    '     而「下载」是 window.open 普通导航 —— 没有 Cookie 就会被当成匿名，',
+    '     非公开前缀的对象会被 308 重定向到 /share/。 */',
+    '  fetch(API + "login", {',
+    '    method: "POST", credentials: "same-origin",',
+    '    headers: { "Content-Type": "application/json" },',
+    '    body: JSON.stringify({ token: CFG.hasToken ? p : "", user: u, pass: p })',
+    '  }).catch(function () { return null; }).then(function () {',
+    '    return call("health");',
+    '  }).then(function (r) {',
     '    var okAuth = r.data && r.data.authenticated;',
     '    if (okAuth) { try { sessionStorage.setItem("cfb2-token", TOKEN || ""); } catch (e) {} }',
     '    toast(okAuth ? "鉴权成功" : "鉴权失败", !okAuth);',
@@ -687,7 +702,7 @@ export function managePage(cfg, url) {
     '    .catch(function () {})',
     '    .then(function () {',
     '      toast("已退出：本地凭据已清除。若浏览器仍自动登录，请关闭标签页/浏览器，或改用 Bearer 令牌模式（退出即时生效）。");',
-    '      setTimeout(function () { location.reload(); }, 900);',
+    '      setTimeout(function () { location.replace(CFG.exitUrl || "/"); }, 900);',
     '    });',
     '};',
     '/* 移动端「更多」折叠：默认收起，点击在 moreMenu 上切换 more-open（桌面该按钮被隐藏，不影响） */',

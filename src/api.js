@@ -4,7 +4,8 @@ import { API_PREFIX } from './lib/constants.js';
 import { applyBucket, bucketView, endpointInfo } from './lib/config.js';
 import { b2Fetch, copyObject, deleteObject, extractError, listObjects, multipartAbort, multipartComplete, multipartCreate, objectUrl, purgeObjectCache, putObject, readObject } from './lib/b2.js';
 import { b2GetBucketCors, b2UpdateBucketCors, corsRuleFor, readJsonBody } from './lib/b2-native.js';
-import { checkAuth, signerOf } from './lib/auth.js';
+import { checkAuth, signerOf, verifyLogin } from './lib/auth.js';
+import { issueSession, sessionCookie } from './lib/session.js';
 import { corsHeaders, deny, json } from './lib/http.js';
 import { dirPrefix, normalizeKey, readInt } from './lib/crypto.js';
 import { flushCounters, usageState } from './lib/usage.js';
@@ -32,7 +33,7 @@ export async function apiRouter(request, env, ctx, cfg, url) {
     return new Response(null, { status: 204, headers: corsHeaders(request, cfg) });
   }
 
-  // 退出登录：Worker 本身无会话，这里返回 401 诱导浏览器丢弃缓存的 Basic 凭据
+  // 退出登录：清掉会话 Cookie，并返回 401 诱导浏览器丢弃缓存的 Basic 凭据
   if (action === 'logout') {
     return new Response(
       JSON.stringify({ ok: true, message: '本地凭据已清除；浏览器缓存的 Basic 凭据可能需要关闭标签页或浏览器' }),
@@ -42,10 +43,30 @@ export async function apiRouter(request, env, ctx, cfg, url) {
           'Content-Type': 'application/json; charset=utf-8',
           'WWW-Authenticate': 'Basic realm="B2 Manager", charset="UTF-8"',
           'Cache-Control': 'no-store',
+          'Set-Cookie': sessionCookie(cfg, '', url.protocol === 'https:'),
           ...corsHeaders(request, cfg),
         },
       },
     );
+  }
+
+  /* 登录：校验凭据后下发会话 Cookie。
+     Basic / Bearer 只能挂在请求头上，而「下载」是普通导航（<a href> / window.open），
+     JS 加不上头 —— 于是管理员点下载会被当成匿名、被 308 重定向到 /share/。
+     用 Cookie 让导航类请求也带得上管理员身份。 */
+  if (action === 'login') {
+    if (request.method !== 'POST') return deny('登录请用 POST', request, cfg, 405);
+    const body = await readJsonBody(request);
+    const auth = await verifyLogin(cfg, {
+      token: String(body.token || ''),
+      user: String(body.user || ''),
+      pass: String(body.pass || ''),
+    });
+    if (!auth.ok) return deny(auth.reason, request, cfg, 401);
+    const value = await issueSession(cfg);
+    const res = json({ ok: true, mode: auth.mode }, 200, request, cfg);
+    if (value) res.headers.set('Set-Cookie', sessionCookie(cfg, value, url.protocol === 'https:'));
+    return res;
   }
 
   // health 无需鉴权，但匿名只能拿到最小信息（不暴露区域 / 桶模式）
