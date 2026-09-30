@@ -163,7 +163,7 @@ cron(每周) → b2_authorize_account → b2_get_download_authorization(validDur
 | 目录占位 | 新建目录会写 0 字节 `<prefix>/.keep` 作为占位（对象存储没有真目录）；列表默认隐藏它（`HIDE_KEEP_FILES`） |
 | Web 管理器 | `GET /__manage`（Basic/Bearer 鉴权） |
 | 管理 API | `/__api/list`、`/presign`、`/object`、`/copy`、`/mkdir`、`/multipart/*`、`/usage`、`/health` |
-| B2 用量面板 | 管理页顶部：桶名、已用空间/额度（进度条）、对象数、Class B/C 已用与剩余、更新时间与「重新统计」。**空间快照与计数归零都由同一个 Cron `scheduled()` 驱动**（默认 `["0 23 * * *", "0 0 * * *"]`：23 点统计、0 点归零），管理页只读快照；次数由 **Durable Object 原子计数**（随每次 B2 请求实时累加；未绑定 DO 时自动降级 Cache API） |
+| B2 用量面板 | 管理页**左栏**（桌面 250px 窄栏；移动端 ≤860px 落到列表下方）：只显示桶名、已用空间/额度（含百分比与进度条）、对象数、Class B/C 已用与剩余、计数后端，**其余不显示**。**空间快照与计数归零都由同一个 Cron `scheduled()` 驱动**（默认 23:00 UTC：先统计、后归零），管理页只读快照、**已移除「重新统计」按钮与功能**；次数由 **Durable Object 原子计数**（随每次 B2 请求实时累加；未绑定 DO 时自动降级 Cache API） |
 | 上传 | 代理 `PUT /<key>`（≤100MB）；浏览器默认走预签名直传；超限自动分片 |
 | 兼容性 | `$path` / `$host` / 固定桶；`RCLONE_DOWNLOAD=true` 兼容 `rclone --b2-download-url` |
 

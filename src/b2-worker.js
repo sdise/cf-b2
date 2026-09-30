@@ -393,15 +393,14 @@ function loadConfig(env) {
     enableUsage: readBool(env.ENABLE_USAGE_PANEL, true),
     // 「总空间」基准：默认按 B2 免费额度 10 GB（十进制）展示进度
     storageQuotaBytes: Math.max(0, readInt(env.STORAGE_QUOTA_BYTES, 10 * 1000 * 1000 * 1000)),
-    // 空间扫描结果缓存时长（秒），默认 6 小时
+    // 空间扫描结果缓存时长（秒），默认 6 小时（仅 usageAutoScan=true 时用作过期判断）
     usageCacheTtl: Math.max(60, readInt(env.USAGE_CACHE_TTL, 21600)),
-    // 手动「重新统计」的最小间隔（秒），默认 5 分钟
-    usageMinInterval: Math.max(0, readInt(env.USAGE_MIN_INTERVAL, 300)),
     // 单次扫描最多翻多少页（每页 1000 个对象 = 1 次 Class C）
     usageScanMaxPages: Math.max(1, Math.min(200, readInt(env.USAGE_SCAN_MAX_PAGES, 20))),
     // 空间统计模式：
-    //   false（默认）= 只在 Cron 触发（scheduled）或手动「重新统计」时扫描
+    //   false（默认）= 快照只由 Cron（scheduled）刷新；首次读取若还没有快照会引导性扫一次
     //   true         = 额外允许惰性自动扫描（TTL 过期或落入窗口）
+    // 注：已移除"手动重新统计"，任何请求路径都不会强制重扫
     usageAutoScan: readBool(env.USAGE_AUTO_SCAN, false),
     // 惰性窗口（仅 usageAutoScan=true 时生效）：UTC 进入该小时后当天第一次读取强制重扫（-1 关闭）
     usageRefreshHour: (() => {
@@ -885,8 +884,9 @@ async function multipartAbort(cfg, bucket, key, uploadId) {
  *      只统计 current 版本，non-current / hidden 版本不计（比账单口径略小）。
  *   2) 次数：在唯一的出网点 b2Fetch 上按 B2 事务类别计数，写进 Cache API，
  *      按 UTC 日切；Cache API 没有原子操作，高并发下会丢极少量计数。
- * 频率控制：扫描结果缓存 usageCacheTtl（默认 6h）；手动刷新受 usageMinInterval
- * （默认 5min）限流；打开管理页只读缓存、不主动打 B2。
+ * 频率控制：快照只由 Cron（scheduled）刷新；首次读取若还没有快照会引导性扫一次；
+ * usageCacheTtl / USAGE_AUTO_SCAN 仅在使用者显式开启「惰性自动扫描」时起作用。
+ * 打开管理页只读已有快照，不主动打 B2。
  */
 
 const USAGE_CACHE_ORIGIN = 'https://usage.internal';
@@ -1090,12 +1090,13 @@ export class UsageCounter {
   /**
    * 一次调用同时完成「读计数器」与「是否该重扫空间」的仲裁。
    * 仲裁在 DO 内串行执行 → 多个数据中心同时打开页面也只会有一个真正去扫。
+   * 空间快照平时只由 Cron（scheduled）刷新；这里的重扫仅限「还没有快照」的引导场景，
+   * 以及显式开启 USAGE_AUTO_SCAN 之后的惰性刷新。
    */
   async onSync(request, now) {
     await this.load();
     const body = await request.json().catch(() => ({}));
     const ttlMs = Math.max(0, Number(body.ttl) || 0) * 1000;
-    const minIntervalMs = Math.max(0, Number(body.minInterval) || 0) * 1000;
     const windowHour = Number.isFinite(body.windowHour) ? body.windowHour : -1;
 
     const snapshot = this.data.storage;
@@ -1104,16 +1105,12 @@ export class UsageCounter {
     const autoScan = body.autoScan === true;
 
     let shouldScan = false;
-    let throttled = false;
     let windowed = false;
     let bootstrap = false;
 
     if (!snapshotAt) {
       shouldScan = true;              // 首次还没有任何快照 → 引导性扫一次
       bootstrap = true;
-    } else if (body.refresh === true) {
-      if (ageMs < minIntervalMs) throttled = true;
-      else shouldScan = true;
     } else if (autoScan && ttlMs > 0 && ageMs >= ttlMs) {
       shouldScan = true;              // 仅在显式开启惰性自动扫描时才按 TTL 重扫
     } else if (autoScan && shouldWindowScan(now, windowHour, this.data.windowDay)) {
@@ -1136,10 +1133,8 @@ export class UsageCounter {
       counters: this.counters(),
       storage: snapshot || null,
       shouldScan,
-      throttled,
       windowed,
       bootstrap,
-      minInterval: Math.round(minIntervalMs / 1000),
       ageSeconds: Number.isFinite(ageMs) ? Math.round(ageMs / 1000) : -1,
     }, 200);
   }
@@ -1251,7 +1246,7 @@ async function resetCounters(cfg, env, bucket) {
 }
 
 /** 空间快照（对外统一形状） */
-function snapshotShape(bucket, source, { cached, throttled, ageSeconds }) {
+function snapshotShape(bucket, source, { cached, ageSeconds }) {
   return {
     ok: true,
     bucket,
@@ -1261,13 +1256,12 @@ function snapshotShape(bucket, source, { cached, throttled, ageSeconds }) {
     complete: source.complete !== false,
     at: source.at || '',
     cached: Boolean(cached),
-    throttled: Boolean(throttled),
     ageSeconds: Number.isFinite(ageSeconds) ? ageSeconds : 0,
   };
 }
 
 /** 降级后端：Cache API（按数据中心独立，读-改-写非原子） */
-async function usageStateViaCache(cfg, bucket, refresh) {
+async function usageStateViaCache(cfg, bucket) {
   const cached = await cacheGetJson(storageCacheKey(bucket));
   const cachedAt = cached && cached.at ? Date.parse(cached.at) : 0;
   const ageMs = cachedAt ? Date.now() - cachedAt : Infinity;
@@ -1277,10 +1271,7 @@ async function usageStateViaCache(cfg, bucket, refresh) {
     && shouldWindowScan(new Date(), cfg.usageRefreshHour, cached.windowDay);
 
   let shouldScan = false;
-  let throttled = false;
   if (!cachedAt) shouldScan = true;
-  else if (refresh && ageMs < cfg.usageMinInterval * 1000) throttled = true;
-  else if (refresh) shouldScan = true;
   else if (cfg.usageAutoScan && ageMs >= cfg.usageCacheTtl * 1000) shouldScan = true;
   else if (windowed) shouldScan = true;
 
@@ -1289,8 +1280,8 @@ async function usageStateViaCache(cfg, bucket, refresh) {
     return {
       backend: 'cache',
       counters,
-      storage: snapshotShape(bucket, cached, { cached: true, throttled, ageSeconds: Math.round(ageMs / 1000) }),
-      throttled, windowed, minInterval: cfg.usageMinInterval,
+      storage: snapshotShape(bucket, cached, { cached: true, ageSeconds: Math.round(ageMs / 1000) }),
+      windowed,
     };
   }
 
@@ -1300,7 +1291,7 @@ async function usageStateViaCache(cfg, bucket, refresh) {
       backend: 'cache',
       counters,
       storage: { ok: false, error: scan.error, status: scan.status },
-      throttled, windowed, minInterval: cfg.usageMinInterval,
+      windowed,
     };
   }
 
@@ -1314,31 +1305,30 @@ async function usageStateViaCache(cfg, bucket, refresh) {
   return {
     backend: 'cache',
     counters,
-    storage: snapshotShape(bucket, stored, { cached: false, throttled, ageSeconds: 0 }),
-    throttled, windowed, minInterval: cfg.usageMinInterval,
+    storage: snapshotShape(bucket, stored, { cached: false, ageSeconds: 0 }),
+    windowed,
   };
 }
 
 /**
  * 用量统一入口：绑定了 USAGE_DO 就走 Durable Object（全局一致 + 原子），
- * 否则退化到 Cache API。refresh=true 表示用户点了「重新统计」。
+ * 否则退化到 Cache API。空间快照由 Cron 刷新；首次读取若还没有快照会引导性扫一次。
+ * 没有「手动重新统计」入口 —— 任何请求路径都不会强制重扫。
  */
-async function usageState(cfg, env, bucket, refresh) {
+async function usageState(cfg, env, bucket) {
   const stub = usageDoStub(env, bucket);
-  if (!stub) return usageStateViaCache(cfg, bucket, refresh);
+  if (!stub) return usageStateViaCache(cfg, bucket);
 
   let state;
   try {
     state = await doCall(stub, 'sync', {
       ttl: cfg.usageCacheTtl,
-      minInterval: cfg.usageMinInterval,
-      refresh,
       windowHour: cfg.usageRefreshHour,
       autoScan: cfg.usageAutoScan,
     });
   } catch (error) {
     console.error('[cf-b2-worker] DO 读取失败，本次改用 Cache API 口径:', error && error.message);
-    return usageStateViaCache(cfg, bucket, refresh);
+    return usageStateViaCache(cfg, bucket);
   }
 
   if (!state.shouldScan) {
@@ -1347,13 +1337,9 @@ async function usageState(cfg, env, bucket, refresh) {
       counters: state.counters,
       resetAt: state.resetAt || '',
       storage: state.storage
-        ? snapshotShape(bucket, state.storage, {
-          cached: true, throttled: state.throttled, ageSeconds: state.ageSeconds,
-        })
+        ? snapshotShape(bucket, state.storage, { cached: true, ageSeconds: state.ageSeconds })
         : { ok: false, error: '暂无快照' },
-      throttled: state.throttled,
       windowed: state.windowed,
-      minInterval: state.minInterval,
     };
   }
 
@@ -1364,9 +1350,7 @@ async function usageState(cfg, env, bucket, refresh) {
       counters: state.counters,
       resetAt: state.resetAt || '',
       storage: { ok: false, error: scan.error, status: scan.status },
-      throttled: state.throttled,
       windowed: state.windowed,
-      minInterval: state.minInterval,
     };
   }
 
@@ -1381,12 +1365,8 @@ async function usageState(cfg, env, bucket, refresh) {
     backend: 'do',
     counters: saved.counters,
     resetAt: state.resetAt || '',
-    storage: snapshotShape(bucket, saved.storage, {
-      cached: false, throttled: state.throttled, ageSeconds: 0,
-    }),
-    throttled: state.throttled,
+    storage: snapshotShape(bucket, saved.storage, { cached: false, ageSeconds: 0 }),
     windowed: state.windowed,
-    minInterval: state.minInterval,
   };
 }
 
@@ -1585,16 +1565,13 @@ async function apiRouter(request, env, ctx, cfg, url) {
   switch (action) {
     /* ---- B2 用量（空间 + 事务计数） ---- */
     case 'usage': {
-      const refresh = url.searchParams.get('refresh') === '1';
       const state = cfg.enableUsage
-        ? await usageState(cfg, env, targetBucket, refresh)
+        ? await usageState(cfg, env, targetBucket)
         : {
           backend: 'off',
           counters: { A: 0, B: 0, C: 0, D: 0, at: '' },
           storage: { ok: false, error: '用量面板已关闭（ENABLE_USAGE_PANEL=false）' },
-          throttled: false,
           windowed: false,
-          minInterval: cfg.usageMinInterval,
         };
 
       // 本请求刚发生的 B2 调用（例如本次扫描本身）也一并计入展示
@@ -1614,11 +1591,10 @@ async function apiRouter(request, env, ctx, cfg, url) {
         storage: state.storage,
         counterBackend: state.backend,
         counterBackendLabel: state.backend === 'do'
-          ? 'Durable Object（全局一致、原子）'
-          : (state.backend === 'cache' ? 'Cache API（按数据中心独立，近似）' : '已关闭'),
+          ? 'Durable Object'
+          : (state.backend === 'cache' ? 'Cache API' : '已关闭'),
         windowed: state.windowed,
         windowHour: cfg.usageRefreshHour,
-        minInterval: state.minInterval,
         autoScan: cfg.usageAutoScan,
         scheduledBuckets: scheduledBuckets(cfg),
         classA: used.A,
@@ -1954,10 +1930,14 @@ function renderDirectory(data, prefix, opts = {}) {
     '    ? \'<span class="spin"></span> 正在加载…\'',
     '    : (NEXT ? "已加载 " + LOADED + " 项 · 继续往下滚动加载更多" : "已加载 " + LOADED + " 项 · 到底了");',
     '}',
+    '/* 请求一律用绝对 URL。若页面是通过 https://user:pass@host/… 打开的（书签里带了凭据），',
+    '   相对 URL 会让 fetch 直接抛 “Request cannot be constructed from a URL that includes credentials”，',
+    '   列表会一直卡在「正在加载…」。location.origin 不含凭据，同源请求浏览器会自动带上已缓存的 Basic 认证。 */',
+    'function absUrl(u) { return /^[a-z][a-z0-9+.-]*:\\/\\//i.test(u) ? u : location.origin + u; }',
     'function more() {',
     '  if (LOADING || !NEXT) return;',
     '  LOADING = true; paint();',
-    '  fetch(location.pathname + "?format=json&cursor=" + encodeURIComponent(NEXT), { credentials: "same-origin" })',
+    '  fetch(absUrl(location.pathname + "?format=json&cursor=" + encodeURIComponent(NEXT)), { credentials: "same-origin" })',
     '    .then(function (r) { return r.json(); })',
     '    .then(function (d) {',
     '      LOADING = false;',
@@ -1982,6 +1962,8 @@ function renderDirectory(data, prefix, opts = {}) {
     '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
     '<title>' + escapeHtml(prefix || '/') + ' - B2 Index</title>',
+    // 空 favicon：避免浏览器自动请求 /favicon.ico（会被当对象下载，白记 1 次 Class B）
+    '<link rel="icon" href="data:,">',
     '<style>',
     themeCss(),
     'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0;padding:32px}',
@@ -2028,6 +2010,8 @@ function welcomePage(cfg, bucketLabel, prefix, publicPath) {
     '<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
     '<title>B2 资源网关</title>',
+    // 空 favicon：避免浏览器自动请求 /favicon.ico（会被当对象下载，白记 1 次 Class B）
+    '<link rel="icon" href="data:,">',
     '<style>',
     themeCss(),
     'body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,Arial,sans-serif;background:var(--bg);color:var(--txt);margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh}',
@@ -2107,6 +2091,8 @@ function managePage(cfg, url) {
     '<html lang="zh-CN"><head><meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width,initial-scale=1">',
     '<title>B2 文件管理器</title>',
+    // 空 favicon：避免浏览器自动请求 /favicon.ico（会被当对象下载，白记 1 次 Class B）
+    '<link rel="icon" href="data:,">',
     '<style>',
     themeCss(),
     '*{box-sizing:border-box}',
@@ -2120,7 +2106,51 @@ function managePage(cfg, url) {
     'button.ghost{background:var(--chip);color:var(--txt);border-color:var(--line)}',
     'button.mini{padding:3px 7px;font-size:12px;background:var(--chip);border-color:var(--line);color:var(--txt)}',
     'button:disabled{opacity:.45;cursor:not-allowed}',
-    'main{max-width:1180px;margin:0 auto;padding:20px}',
+    // 桌面端：左侧用量卡片（250px 窄栏），右侧文件列表
+    'main{max-width:1280px;margin:0 auto;padding:20px;display:grid;grid-template-columns:250px minmax(0,1fr);gap:20px;align-items:start}',
+    '.content{min-width:0}',
+    // 表格列宽用 class 而不用内联样式，移动端断点才能覆盖
+    '.c-size{width:110px}.c-time{width:180px}.c-act{width:300px;text-align:right}.act{text-align:right}',
+    // 移动端「更多」折叠区：桌面用 display:contents，子项直接参与 header 的 flex 布局
+    // order 的取值刻意让桌面视觉顺序与改造前完全一致
+    '.more{display:contents}',
+    '.more-toggle{display:none}',
+    '.more>*{order:1}',
+    '#btnMkdir{order:2}#upMode{order:3}',
+    '.more .set,.more #btnTheme{order:4}',
+    '#btnUpload{order:5}',
+    // 移动端：① 不显示 B2 桶信息 ② 顶部只常显「新建目录 / 上传方式 / 上传」，其余折叠
+    // ③ 隐藏「修改时间」并拉宽「操作」，让「复制/下载/重命名/删除」放得下、好点
+    '@media (max-width:860px){',
+    'main{grid-template-columns:1fr;gap:14px}',
+    '.side{display:none}',
+    'header{padding:10px 12px;gap:8px}',
+    '.more{display:none;order:9;width:100%;flex-wrap:wrap;gap:10px;align-items:center;margin-top:6px;padding-top:10px;border-top:1px solid var(--line)}',
+    '.more.more-open{display:flex}',
+    '.more>*{order:0}',
+    '.more .grow{display:none}',
+    '.more h1{font-size:14px}',
+    '.more-toggle{display:inline-block;order:4}',
+    '#btnMkdir{order:1}#upMode{order:2}#btnUpload{order:3}',
+    // 文件列表：文件行为「两行」（第一行 名称+大小，第二行 四个操作按钮整行铺开；
+    // 390px 下按钮挤在名称右侧会让名称只剩 ~58px，长文件名折成 10 行）。
+    // 目录行保持「一行」：名称占满、删除按钮尾部右对齐（目录只有一个按钮，放得下）。
+    'table,tbody,tr,td{display:block}',
+    'thead{display:none}',
+    'table{border:0;background:transparent}',
+    'tbody tr{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;padding:10px 4px;border-bottom:1px solid var(--line);background:var(--card)}',
+    'tbody tr:last-child{border-bottom:0}',
+    'tbody td{padding:0;border:0;overflow-wrap:anywhere}',
+    'tbody td:empty{display:none}',
+    'tbody td:nth-child(2){text-align:right;white-space:nowrap;color:var(--dim);font-size:12px;align-self:center}',
+    'tbody td:nth-child(3){display:none}',
+    'tbody td.act{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;text-align:left}',
+    'tbody td.act .mini{flex:1 1 72px;min-height:42px;padding:8px 6px;font-size:13px}',
+    'tbody tr.dir{display:flex;align-items:center;gap:8px;background:var(--folder)}',
+    'tbody tr.dir td:first-child{flex:1;min-width:0}',
+    'tbody tr.dir td.act{display:block;text-align:right;flex:0 0 auto;grid-column:auto}',
+    'tbody tr.dir td.act .mini{flex:0 0 auto;padding:8px 18px}',
+    '}',
     '#status{margin-top:14px;font-size:12px;display:flex;align-items:center;gap:8px;justify-content:center}',
     '#status .spin{width:12px;height:12px;border:2px solid var(--line);border-top-color:var(--acc);border-radius:50%;animation:sp 0.8s linear infinite}',
     '@keyframes sp{to{transform:rotate(360deg)}}',
@@ -2140,16 +2170,18 @@ function managePage(cfg, url) {
     '.set{display:flex;align-items:center;gap:4px;color:var(--dim);font-size:12px;white-space:nowrap}',
     '.set input{width:62px;padding:4px 6px}',
     '.crumb a{color:var(--acc);cursor:pointer}',
-    '.usage{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;margin-bottom:14px;font-size:13px}',
-    '.usage .row{display:flex;flex-wrap:wrap;gap:18px;align-items:baseline}',
-    '.usage .kv{display:flex;gap:6px;align-items:baseline}',
+    '.usage{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px 14px;font-size:13px}',
+    '.usage .row{display:flex;flex-direction:column;gap:8px}',
+    '.usage .kv{display:flex;gap:6px;align-items:baseline;flex-wrap:wrap}',
     '.usage .v{font-weight:600;font-size:15px}',
-    '.usage .bar{height:6px;border-radius:4px;background:var(--chip);overflow:hidden;margin-top:8px;max-width:420px}',
+    '.usage .bar{height:6px;border-radius:4px;background:var(--chip);overflow:hidden;margin-top:8px}',
     '.usage .bar>i{display:block;height:100%;background:var(--acc)}',
     '.usage .over{color:#c2410c}',
-    '.usage .foot{margin-top:8px;color:var(--dim);font-size:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center}',
+    '.usage .foot{margin-top:10px;padding-top:8px;border-top:1px solid var(--line);color:var(--dim);font-size:12px}',
     '</style></head><body>',
     '<header>',
+    // 折叠区（桌面 display:contents → 顺序与改造前完全一致）
+    '<div class="more" id="moreMenu">',
     '<h1>Backblaze B2 文件管理器</h1>',
     '<span class="muted" id="bucketLabel"></span>',
     '<span class="grow"></span>',
@@ -2158,27 +2190,31 @@ function managePage(cfg, url) {
     '<button class="ghost" id="btnLogin">鉴权</button>',
     '<button class="ghost" id="btnLogout">退出</button>',
     '<button class="ghost" id="btnRefresh">刷新</button>',
-    '<button class="ghost" id="btnMkdir">新建目录</button>',
-    '<select id="upMode">',
-    '<option value="direct">直传（推荐）</option>',
-    '<option value="worker">Worker 代理</option>',
-    '</select>',
     '<label class="set" title="分片大小（MiB）。直传单次 PUT 上限为 5–95，Worker 代理受 MAX_UPLOAD_BYTES 约束；B2 硬上限 100MiB。">分片',
     '<input id="partSize" type="number" min="5" max="95" step="1" value="' + defaultPartMiB + '">MiB</label>',
     '<label class="set" title="分片并发上传数，1–10。越大越快，但更吃带宽/上游限流。">并发',
     '<input id="conc" type="number" min="1" max="10" step="1" value="' + defaultConc + '"></label>',
     '<button class="ghost" id="btnTheme">深色模式</button>',
+    '</div>',
+    // 移动端常显：更多 / 新建目录 / 上传方式 / 上传
+    '<button class="ghost more-toggle" id="btnMore" aria-expanded="false">更多 ▾</button>',
+    '<button class="ghost" id="btnMkdir">新建目录</button>',
+    '<select id="upMode">',
+    '<option value="direct">直传（推荐）</option>',
+    '<option value="worker">Worker 代理</option>',
+    '</select>',
     '<button id="btnUpload">上传</button>',
     '<input type="file" id="file" multiple class="hidden">',
     '</header>',
     '<main>',
-    '<div id="usage" class="usage"></div>',
+    '<aside class="side"><div id="usage" class="usage"></div></aside>',
+    '<section class="content">',
     '<nav class="crumb" id="crumb" style="margin-bottom:12px"></nav>',
-    '<div class="muted" id="tuneHint" style="margin-bottom:10px;font-size:12px"></div>',
-    '<table><thead><tr><th>名称</th><th style="width:110px">大小</th>',
-    '<th style="width:180px">修改时间</th><th style="width:300px;text-align:right">操作</th></tr></thead>',
+    '<table><thead><tr><th>名称</th><th class="c-size">大小</th>',
+    '<th class="c-time">修改时间</th><th class="c-act">操作</th></tr></thead>',
     '<tbody id="tb"></tbody></table>',
     '<div id="status" class="muted"></div>',
+    '</section>',
     '</main>',
     '<div id="toast"></div>',
     '<script id="cfg" type="application/json">' + configJson + '</script>',
@@ -2187,6 +2223,11 @@ function managePage(cfg, url) {
     '(function () {',
     'var CFG = JSON.parse(document.getElementById("cfg").textContent);',
     'var API = CFG.apiBase;',
+    '/* 请求一律用绝对 URL。若页面是通过 https://user:pass@host/… 打开的（书签里带了凭据），',
+    '   相对 URL 会让 fetch 直接抛 “Request cannot be constructed from a URL that includes credentials”，',
+    '   用量面板会显示「不可用」、文件列表也一个都列不出来。location.origin 不含凭据，',
+    '   同源请求浏览器会自动带上已缓存的 Basic 认证。 */',
+    'function absUrl(u) { return /^[a-z][a-z0-9+.-]*:\\/\\//i.test(u) ? u : location.origin + u; }',
     'var PREFIX = "";',
     'var NEXT = "";',
     'var LOADING = false;',
@@ -2225,7 +2266,7 @@ function managePage(cfg, url) {
     '  opts = opts || {};',
     '  opts.headers = buildHeaders(!!opts.body);',
     '  opts.credentials = "same-origin";',
-    '  return fetch(API + path, opts).then(function (r) {',
+    '  return fetch(absUrl(API + path), opts).then(function (r) {',
     '    return r.json().then(function (j) { return { ok: r.ok && j.ok !== false, status: r.status, data: j }; });',
     '  });',
     '}',
@@ -2245,13 +2286,13 @@ function managePage(cfg, url) {
     '    if (name.charAt(name.length - 1) === "/") name = name.slice(0, -1);',
     '    rows += "<tr class=\\"dir\\"><td>[DIR] <a data-act=\\"dir\\" data-p=\\"" + esc(p) + "\\">" + esc(name) + "</a></td>"',
     '      + "<td class=\\"muted\\">目录</td><td></td>"',
-    '      + "<td style=\\"text-align:right\\"><button class=\\"mini\\" data-act=\\"deldir\\" data-k=\\"" + esc(p + ".keep") + "\\">删除</button></td></tr>";',
+    '      + "<td class=\\"act\\"><button class=\\"mini\\" data-act=\\"deldir\\" data-k=\\"" + esc(p + ".keep") + "\\">删除</button></td></tr>";',
     '  });',
     '  (data.files || []).filter(function (f) { return f.name !== ".keep"; }).forEach(function (f) {',
     '    var k = esc(PREFIX + f.name);',
     '    rows += "<tr><td>" + esc(f.name) + "</td><td>" + size(f.size) + "</td>"',
     '      + "<td class=\\"muted\\">" + esc(f.lastModified) + "</td>"',
-    '      + \'<td style="text-align:right">\'',
+    '      + \'<td class="act">\'',
     '      + \'<button class="mini" data-act="copy" data-k="\' + k + \'">复制</button> \'',
     '      + \'<button class="mini" data-act="dl" data-k="\' + k + \'">下载</button> \'',
     '      + \'<button class="mini" data-act="ren" data-k="\' + k + \'">重命名</button> \'',
@@ -2376,10 +2417,6 @@ function managePage(cfg, url) {
     '  var cap = partCapMB();',
     '  var p = clampField("partSize", 5, cap, defaultPartMB());',
     '  var c = clampField("conc", 1, 10, CFG.uploadConcurrency || 3);',
-    '  if (el("tuneHint")) {',
-    '    el("tuneHint").textContent = "分片 " + p + " MiB × 并发 " + c',
-    '      + "（当前通道上限 " + cap + " MiB）";',
-    '  }',
     '  saveTuning();',
     '  return { part: p, conc: c };',
     '}',
@@ -2532,7 +2569,7 @@ function managePage(cfg, url) {
     '  opts = opts || { direct: true };',
     '  return new Promise(function (resolve, reject) {',
     '    var xhr = new XMLHttpRequest();',
-    '    xhr.open("PUT", url, true);',
+    '    xhr.open("PUT", absUrl(url), true);',
     '    xhr.setRequestHeader("Content-Type", ct);',
     '    if (!opts.direct) {',
     '      var h = buildHeaders(false);',
@@ -2645,10 +2682,10 @@ function managePage(cfg, url) {
     '  el("fUser").value = "";',
     '  el("fPass").value = "";',
     '  try { sessionStorage.removeItem("cfb2-token"); } catch (e) {}',
-    '  fetch(API + "logout", { method: "POST", credentials: "same-origin", headers: { Accept: "application/json" } })',
+    '  fetch(absUrl(API + "logout"), { method: "POST", credentials: "same-origin", headers: { Accept: "application/json" } })',
     '    .catch(function () {})',
     '    .then(function () {',
-    '      return fetch(API + "health", {',
+    '      return fetch(absUrl(API + "health"), {',
     '        credentials: "same-origin",',
     '        headers: { Accept: "application/json", Authorization: "Basic " + btoa("logout:logout") },',
     '      });',
@@ -2659,6 +2696,16 @@ function managePage(cfg, url) {
     '      setTimeout(function () { location.reload(); }, 900);',
     '    });',
     '};',
+    '/* 移动端「更多」折叠：默认收起，点击在 moreMenu 上切换 more-open（桌面该按钮被隐藏，不影响） */',
+    'if (el("moreMenu") && el("btnMore")) {',
+    '  el("btnMore").onclick = function () {',
+    '    var m = el("moreMenu");',
+    '    var open = !m.classList.contains("more-open");',
+    '    if (open) m.classList.add("more-open"); else m.classList.remove("more-open");',
+    '    el("btnMore").textContent = open ? "更多 ▴" : "更多 ▾";',
+    '    el("btnMore").setAttribute("aria-expanded", open ? "true" : "false");',
+    '  };',
+    '}',
     'el("upMode").onchange = function () { saveMode(); syncTuning(); };',
     'try {',
     '  var sm = localStorage.getItem("cfb2-upmode");',
@@ -2690,8 +2737,9 @@ function managePage(cfg, url) {
     '  var over = quota > 0 && used >= quota;',
     '  return "<span class=\\"kv\\"><span class=\\"muted\\">" + label + "</span>"',
     '    + "<span class=\\"v" + (over ? " over" : "") + "\\">" + used + "</span>"',
-    '    + "<span class=\\"muted\\">/ " + (quota || "-") + (quota ? "（剩 " + Math.max(0, quota - used) + "）" : "") + "</span></span>";',
+    '    + "<span class=\\"muted\\">/ " + (quota || "-") + "</span></span>";',
     '}',
+    '/* 用量卡片：只展示「桶 / 已用空间 / 对象数 / Class B / Class C / 计数后端」，其余一律不展示 */',
     'function renderUsage(d) {',
     '  var s = (d && d.storage) || {};',
     '  var quota = d.quotaBytes || 0;',
@@ -2701,37 +2749,27 @@ function managePage(cfg, url) {
     '  } else {',
     '    var used = s.usedBytes || 0;',
     '    html += "<div class=\\"row\\">"',
-    '      + "<span><span class=\\"muted\\">桶</span> <span class=\\"v\\">" + esc(d.bucket || "") + "</span></span>"',
-    '      + "<span><span class=\\"muted\\">已用空间</span> <span class=\\"v\\">" + sizeD(used) + "</span>"',
-    '      + (quota ? " <span class=\\"muted\\">/ " + sizeD(quota) + "（" + pct(used, quota) + "）</span>" : "") + "</span>"',
-    '      + "<span><span class=\\"muted\\">对象数</span> <span class=\\"v\\">" + (s.objects || 0) + "</span>"',
-    '      + (s.complete === false ? " <span class=\\"over\\">（扫描到上限，实际更多）</span>" : "") + "</span>"',
+    '      + "<span class=\\"kv\\"><span class=\\"muted\\">桶</span><span class=\\"v\\">" + esc(d.bucket || "") + "</span></span>"',
+    '      + (quota',
+    '        ? "<span class=\\"kv\\"><span class=\\"muted\\">已用空间:</span><span class=\\"v\\">" + pct(used, quota) + "</span></span>"',
+    '          + "<span class=\\"muted\\" style=\\"padding-left:2px\\">" + sizeD(used) + " / " + sizeD(quota) + "</span>"',
+    '        : "<span class=\\"kv\\"><span class=\\"muted\\">已用空间</span><span class=\\"v\\">" + sizeD(used) + "</span></span>")',
+    '      + "<span class=\\"kv\\"><span class=\\"muted\\">对象数</span><span class=\\"v\\">" + (s.objects || 0) + "</span>"',
+    '      + (s.complete === false ? "<span class=\\"over\\">（扫描到上限，实际更多）</span>" : "") + "</span>"',
     '      + "</div>";',
     '    if (quota) html += \'<div class="bar"><i style="width:\' + Math.min(100, used / quota * 100) + \'%"></i></div>\';',
     '  }',
     '  html += "<div class=\\"row\\" style=\\"margin-top:10px\\">"',
-    '    + quotaCell("Class B（读取）", (d.classB || {}).used || 0, (d.classB || {}).quota || 0)',
-    '    + quotaCell("Class C（列举）", (d.classC || {}).used || 0, (d.classC || {}).quota || 0)',
-    '    + "<span class=\\"kv\\"><span class=\\"muted\\">Class A</span><span class=\\"v\\">" + (d.classA || 0) + "</span></span>"',
+    '    + quotaCell("Class B:", (d.classB || {}).used || 0, (d.classB || {}).quota || 0)',
+    '    + quotaCell("Class C:", (d.classC || {}).used || 0, (d.classC || {}).quota || 0)',
     '    + "</div>";',
-    '  var foot = [];',
-    '  if (s.at) foot.push("空间更新于 " + esc(s.at.replace("T", " ").slice(0, 16)) + " UTC" + (s.cached ? "（缓存）" : ""));',
-    '  if (s.throttled) foot.push("刷新过于频繁，已用缓存（最小间隔 " + (d.minInterval || 0) + " 秒）");',
-    '  if (s.ok !== false && s.pages) foot.push("本次扫描 " + s.pages + " 次 Class C");',
-    '  foot.push("计数重置：" + esc(d.resetSchedule || "-") + "（由 Cron scheduled 触发）"',
-    '    + (d.counterResetAt ? "，上次 " + esc(String(d.counterResetAt).replace("T", " ").slice(0, 16)) + " UTC" : ""));',
-    '  if (d.counterBackendLabel) foot.push("计数后端：" + esc(d.counterBackendLabel));',
-    '  if (d.autoScan === false) foot.push("空间快照由 Cron 定时刷新（不会自动重扫）");',
-    '  if (d.windowed) foot.push("本次是 UTC " + d.windowHour + ":00 窗口内的当日终值扫描");',
-    '  if (d.scope) foot.push(esc(d.scope));',
-    '  html += \'<div class="foot">\' + foot.map(function (t) { return "<span>" + t + "</span>"; }).join("")',
-    '    + \'<button class="mini" id="btnUsageRefresh">重新统计</button></div>\';',
+    '  html += \'<div class="foot"><span>计数后端：\' + esc(d.counterBackendLabel || "-") + "</span></div>";',
     '  el("usage").innerHTML = html;',
     '}',
-    'function loadUsage(refresh) {',
+    'function loadUsage() {',
     '  if (!el("usage")) return;',
     '  el("usage").innerHTML = \'<span class="muted">正在读取用量…</span>\';',
-    '  call("usage" + q(refresh ? { refresh: "1" } : {})).then(function (r) {',
+    '  call("usage").then(function (r) {',
     '    if (!r.ok || !r.data || r.data.ok === false) {',
     '      el("usage").innerHTML = \'<span class="muted">用量面板不可用：\' + esc((r.data && r.data.error) || r.status) + "</span>";',
     '      return;',
@@ -2741,10 +2779,7 @@ function managePage(cfg, url) {
     '    el("usage").innerHTML = \'<span class="muted">用量面板不可用：\' + esc(e.message) + "</span>";',
     '  });',
     '}',
-    'el("usage").addEventListener("click", function (e) {',
-    '  if (e.target && e.target.id === "btnUsageRefresh") loadUsage(true);',
-    '});',
-    'loadUsage(false);',
+    'loadUsage();',
     'el("bucketLabel").textContent = CFG.bucketMode === "fixed"',
     '  ? ("桶: " + CFG.bucketFixed)',
     '  : (CFG.bucketMode === "path" ? "桶: 按 URL 首段动态解析" : "桶: 按主机名首段动态解析");',

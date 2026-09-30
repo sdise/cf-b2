@@ -100,7 +100,7 @@ workers_dev = true
 #   HIDE_KEEP_FILES = "true"              # 隐藏目录占位对象 <prefix>/.keep
 #   RCLONE_DOWNLOAD = "false"             # 兼容 rclone --b2-download-url
 #
-#   # --- B2 用量面板（管理页顶部卡片）---
+#   # --- B2 用量面板（管理页左栏卡片；移动端置底）---
 #   # 背景：Backblaze 没有公开的「空间 / 事务次数」查询 API，所以：
 #   #   空间 = 遍历 ListObjectsV2 累加（每 1000 对象 1 次 Class C，只算 current 版本）
 #   #   次数 = 本 Worker 自己按 B2 事务类别计数（DO 优先，未绑定则 Cache API）
@@ -111,9 +111,8 @@ workers_dev = true
 #   CLASS_C_DAILY_QUOTA = "2500"
 #   USAGE_SCAN_HOURS = "23"               # scheduled() 里刷新空间快照的 UTC 小时
 #   USAGE_RESET_HOURS = "23"              # scheduled() 里归零计数的 UTC 小时（默认与统计同点）
-#   USAGE_AUTO_SCAN = "false"             # 是否允许"惰性自动扫描"（默认只由 Cron/手动触发）
+#   USAGE_AUTO_SCAN = "false"             # 是否允许"惰性自动扫描"（默认只由 Cron 触发）
 #   USAGE_CACHE_TTL = "21600"             # 仅 USAGE_AUTO_SCAN=true 时用作过期判断
-#   USAGE_MIN_INTERVAL = "300"            # 手动「重新统计」的最小间隔（秒）
 #   USAGE_REFRESH_AT_UTC_HOUR = "-1"      # 惰性窗口（默认关闭）
 #   USAGE_SCHEDULE_BUCKETS = ""           # $path/$host 多桶模式必须显式列出，如 "bucket-a,bucket-b"
 #   USAGE_DO_WRITE_EVERY = "1"            # DO 计数每累计多少批落盘（1 = 每批都写）

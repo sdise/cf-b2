@@ -261,7 +261,6 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 
 ```
 分片 [ 25 ] MiB   并发 [ 3 ]     ← 页面头部，改完立即生效（当前浏览器）
-分片 25 MiB × 并发 3（当前通道上限 95 MiB）   ← 面包屑下方实时提示
 ```
 
 | 输入框 | 范围 | 说明 |
@@ -275,13 +274,21 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 
 ### 3.5 B2 用量面板
 
-管理页顶部会显示一张卡片：桶名、已用空间 / 总额度（含进度条）、对象数、Class B/C 已用与剩余、以及数据更新时间与「重新统计」按钮。
+管理页的用量卡片**只展示这 6 项，其余一概不显示**：桶名、已用空间（百分比为主值、数值行为第二行）、对象数、Class B、Class C、计数后端。
 
 ```
-桶 ayxz-bucket   已用空间 3.2 GB / 10.0 GB（32.1%）   对象数 1,284
-Class B（读取） 128 / 2500（剩 2372）   Class C（列举） 12 / 2500（剩 2488）   Class A 47
-空间更新于 2026-09-30 07:12 UTC（缓存） · 本次扫描 2 次 Class C · 次数按 UTC 每日 00:00 归零
+桶 ayxz-bucket
+已用空间: 32.1%
+3.2 GB / 10.0 GB
+对象数 1,284
+Class B: 128 / 2500
+Class C: 12 / 2500
+计数后端：Durable Object
 ```
+
+**位置**：**桌面端固定在最左侧一栏**（250px 窄栏），右侧是文件列表与浏览；**移动端（≤860px）整卡隐藏**。
+
+卡片上**没有「重新统计」按钮，也没有对应功能** —— 空间快照只由 Cron（`scheduled()`）刷新，唯一例外是从未有过快照时的首次引导扫描。
 
 #### 这些数字是怎么来的（重要）
 
@@ -361,14 +368,15 @@ npx wrangler deploy
 | 动作 | 触发 | 频率 / 成本 |
 | --- | --- | --- |
 | 事务计数（写入） | **每个发往 B2 的请求结束时**（`ctx.waitUntil`，异步） | 1 次 DO 调用（或 1 次 Cache 读+写），**不额外请求 B2**；`USAGE_DO_WRITE_EVERY>1` 时按批合并落盘 |
-| 面板数字（读取） | **打开/刷新管理页时读一次** | 页面没有轮询/定时器，数字不会自己变（想更新就刷新页面或点「重新统计」） |
+| 面板数字（读取） | **打开/刷新管理页时读一次** | 页面没有轮询/定时器，数字不会自己变（刷新页面即可，数字取自快照） |
 | 打开管理页 | 页面加载 | 只读已有快照；**只有 DO/缓存判定需要时才扫描** |
 | 空间扫描 | **Cron Triggers → `scheduled()`** | 由你在 Worker 上配置的 Cron 决定（推荐每天 23:00 UTC 一次）；**不依赖有人访问页面** |
 | 首次引导 | 第一次打开用量面板且从无快照 | 只扫一次，之后一律只读快照 |
-| 点「重新统计」 | 手动 | 受 `USAGE_MIN_INTERVAL` 限流（默认 5 分钟），超频直接回快照并提示 |
 | 计数归零 | 与统计同一条 cron（默认 UTC 23:00） | 由 `USAGE_RESET_HOURS` 决定；DO 全局一次、Cache 后端按 colo 各自执行 |
 
-**空间统计由 Cron 驱动（不是惰性统计）**：`USAGE_AUTO_SCAN` 默认 `false`，意味着**快照过期也不会自动重扫**——只在三种情况下扫描：① Cron 触发 `scheduled()`；② 从未有快照时的首次引导；③ 手动点「重新统计」。
+**空间统计由 Cron 驱动（不是惰性统计）**：`USAGE_AUTO_SCAN` 默认 `false`，意味着**快照过期也不会自动重扫**——只有两种情况下会扫描：① Cron 触发 `scheduled()`；② 从未有快照时的首次引导。
+
+> **已移除「手动重新统计」**：`/__api/usage?refresh=1` 参数已被忽略，任何请求路径都不再强制重扫；`USAGE_MIN_INTERVAL` 与响应里的 `throttled`/`minInterval` 字段一并删除。想立刻要新数字只能等下一次 Cron（或临时把 `USAGE_AUTO_SCAN` 设为 `true`）。
 
 ```toml
 # wrangler.toml
@@ -384,16 +392,17 @@ crons = ["0 23 * * *"]     # 每天 23:00 UTC：同一次触发里「先刷新�
 
 **成本**：一次全量扫描 = ⌈对象数 ÷ 1000⌉ 次 Class C。1 万对象 = 10 次，约占每日免费额度（2,500 次）的 0.4%；默认单次扫描上限 20 页（2 万对象），超出会标注"扫描到上限，实际更多"。
 
+> **关于 `/favicon.ico`**：三个页面的 `<head>` 里都放了空 favicon（`<link rel="icon" href="data:,">`）。浏览器默认会自动请求 `/favicon.ico`，而该路径在固定桶模式下会被当作**对象下载**（`HEAD/GET` 非列举型 → 记 Class B），于是每次打开/刷新页面都白记 1 次 Class B，控制台还会出现 404 报错。空 favicon 让浏览器不再发这个请求。
+
 | 变量 | 默认 | 说明 |
 | --- | --- | --- |
 | `ENABLE_USAGE_PANEL` | `true` | 是否启用用量面板与 `/__api/usage` |
 | `STORAGE_QUOTA_BYTES` | `10000000000` | 「总空间」基准（十进制 10 GB）；设 `0` 不显示比例 |
 | `USAGE_CACHE_TTL` | `21600`（6h） | 仅 `USAGE_AUTO_SCAN=true` 时用作"多久算过期"；Cron 模式不用它（快照默认留 2 天） |
-| `USAGE_MIN_INTERVAL` | `300`（5min） | 手动重新统计的最小间隔 |
 | `USAGE_SCAN_MAX_PAGES` | `20` | 单次扫描最多页数（每页 1000 对象） |
 | `USAGE_SCAN_HOURS` | `23` | `scheduled()` 里刷新空间快照的 UTC 小时（`*`=每次，`-`=从不） |
 | `USAGE_RESET_HOURS` | `23` | `scheduled()` 里重置 Class A/B/C/D 的 UTC 小时；默认与统计同点（一条 cron 搞定），改成 `0` 可贴齐 B2 官方 00:00 GMT |
-| `USAGE_AUTO_SCAN` | `false` | `false` = 只由 Cron 与手动触发（推荐）；`true` = 额外允许惰性自动扫描 |
+| `USAGE_AUTO_SCAN` | `false` | `false` = 只由 Cron 触发（推荐）；`true` = 额外允许惰性自动扫描 |
 | `USAGE_REFRESH_AT_UTC_HOUR` | `-1` | 惰性窗口：UTC 进入该小时后当天首次读取强制重扫；默认关闭（已有 Cron） |
 | `USAGE_SCHEDULE_BUCKETS` | 空 | Cron 要统计的桶（逗号分隔）；固定桶模式留空即用 `BUCKET_NAME` |
 | `USAGE_DO_WRITE_EVERY` | `1` | DO 计数每累计多少批才落盘（1 = 每次都写，最精确） |
@@ -446,7 +455,7 @@ crons = ["0 23 * * *"]     # 每天 23:00 UTC：同一次触发里「先刷新�
 | `/__api/logout` | POST | 退出登录（返回 401 + `WWW-Authenticate`，促浏览器丢弃缓存凭据） |
 | `/__api/*` | 见下节 | 管理 API（需鉴权，`/health`、`/logout` 除外） |
 | `/<bucket>/__api/*` | 同上 | `$path` 模式下显式指定桶；也可用 `/__api/*?bucket=<桶名>` |
-| `/__api/usage` | GET | B2 用量：空间统计 + Class A/B/C/D 计数；`?refresh=1` 手动重算（受 `USAGE_MIN_INTERVAL` 限流）。需管理员鉴权 |
+| `/__api/usage` | GET | B2 用量：空间快照 + Class A/B/C/D 计数（**无手动重算参数**）。需管理员鉴权 |
 | 任意 | OPTIONS | CORS 预检，返回 204 |
 
 > **判断规则**：路径以 `/` 结尾视为"目录"→ 返回列表；否则视为"对象"→ 走下载/上传/删除。

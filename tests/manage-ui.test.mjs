@@ -24,6 +24,17 @@ const assert = (cond, msg) => { if (!cond) throw new Error(msg); };
 /* ---------- 极简假 DOM ---------- */
 
 function fakeElement(id = '') {
+  // 有状态的 classList（Set 支撑），用于验证「更多」折叠的展开/收起
+  const classSet = new Set();
+  const classList = {
+    add: (...cs) => { cs.forEach((c) => classSet.add(c)); },
+    remove: (...cs) => { cs.forEach((c) => classSet.delete(c)); },
+    contains: (c) => classSet.has(c),
+    toggle(c) {
+      if (classSet.has(c)) { classSet.delete(c); return false; }
+      classSet.add(c); return true;
+    },
+  };
   const el = {
     id,
     value: '',
@@ -39,7 +50,7 @@ function fakeElement(id = '') {
     files: null,
     onchange: null,
     onclick: null,
-    classList: { add() {}, remove() {}, contains: () => false },
+    classList,
     addEventListener() {},
     removeEventListener() {},
     appendChild(child) { this.children.push(child); this.firstChild = this.children[0]; return child; },
@@ -87,8 +98,10 @@ function buildSandbox(html) {
     json: async () => data,
     text: async () => JSON.stringify(data),
   });
+  const requests = [];
   const fetchStub = async (input) => {
     const target = String(typeof input === 'string' ? input : (input && input.url) || '');
+    requests.push(target);
     if (target.includes('/usage')) {
       return okJson({
         ok: true,
@@ -96,17 +109,16 @@ function buildSandbox(html) {
         quotaBytes: 10000000000,
         storage: {
           ok: true, usedBytes: 2147483648, objects: 12, pages: 3,
-          complete: true, cached: true, throttled: false, at: '2026-09-30T02:00:00.000Z',
+          complete: true, cached: true, at: '2026-09-30T02:00:00.000Z',
         },
         classA: 7,
         classB: { used: 128, quota: 2500, remaining: 2372 },
         classC: { used: 12, quota: 2500, remaining: 2488 },
         classD: 0,
         counterBackend: 'do',
-        counterBackendLabel: 'Durable Object（全局一致、原子）',
+        counterBackendLabel: 'Durable Object',
         windowed: true,
         windowHour: 23,
-        minInterval: 300,
         scanSchedule: '23:00 UTC',
         resetSchedule: '0:00 UTC',
         counterResetAt: '2026-09-30T00:00:12.000Z',
@@ -170,7 +182,7 @@ function buildSandbox(html) {
 
   const scripts = [...html.matchAll(/<script(?![^>]*type="application\/json")[^>]*>([\s\S]*?)<\/script>/g)]
     .map((m) => m[1]);
-  return { sandbox, els, scripts, storage };
+  return { sandbox, els, scripts, storage, requests };
 }
 
 const ctxStub = { waitUntil() {}, passThroughOnException() {} };
@@ -199,27 +211,116 @@ await check('内联脚本可在假 DOM 中完整执行（初始化不抛错）',
   return scripts.length + ' 个脚本块执行通过';
 });
 
-await check('用量卡片渲染：空间、进度、Class B/C 计数与重算按钮', async () => {
+await check('用量卡片只显示指定字段：桶/空间/对象数/Class B/Class C/计数后端', async () => {
   const { sandbox, els, scripts } = buildSandbox(await render(env));
   for (const code of scripts) vm.runInNewContext(code, sandbox);
   await new Promise((resolve) => setImmediate(resolve));   // 等 loadUsage 的异步链跑完
 
   const card = String(els.get('usage').innerHTML || '');
-  assert(card.includes('demo-bucket'), '缺少桶名: ' + card.slice(0, 160));
-  assert(card.includes('2.1 GB'), '已用空间未格式化（十进制单位）: ' + card.slice(0, 160));
-  assert(card.includes('10.0 GB'), '缺少总额度');
-  assert(/21\.5%/.test(card), '缺少占用百分比: ' + (card.match(/[\d.]+%/) || []).join());
-  assert(card.includes('Class B（读取）') && card.includes('128'), 'Class B 计数缺失');
-  assert(card.includes('Class C（列举）') && card.includes('12'), 'Class C 计数缺失');
-  assert(card.includes('剩 2372'), '缺少剩余次数');
-  assert(card.includes('btnUsageRefresh'), '缺少重新统计按钮');
-  assert(card.includes('本次扫描 3 次 Class C'), '缺少扫描成本提示');
-  assert(card.includes('缓存'), '未标注数据来自缓存');
+
+  // —— 应当展示的 ——
+  assert(card.includes('demo-bucket'), '缺少桶名: ' + card);
+  assert(card.includes('已用空间:</span>'), '应为「已用空间:」带冒号: ' + card);
+  assert(/21\.5%/.test(card), '缺少占用百分比（应作为主值）: ' + (card.match(/[\d.]+%/) || []).join());
+  assert(card.includes('2.1 GB / 10.0 GB'), '第二行应为「已用 / 总额」: ' + card);
+  assert(card.indexOf('21.5%') < card.indexOf('2.1 GB'), '百分比应在数值行之前: ' + card);
+  assert(card.includes('对象数') && card.includes('12'), '缺少对象数');
+  assert(card.includes('Class B:</span>') && card.includes('128'), 'Class B 计数缺失');
+  assert(card.includes('Class C:</span>') && card.includes('12'), 'Class C 计数缺失');
+  assert(/128<\/span><span class="muted">\/ 2500/.test(card), 'Class B 应为「14/ 2500」形态: ' + card);
   assert(card.includes('计数后端：Durable Object'), '未标注计数后端');
-  assert(card.includes('计数重置：0:00 UTC'), '未标注重置排期: ' + (card.match(/计数重置[^<]*/) || []).join());
-  assert(card.includes('上次 2026-09-30 00:00 UTC'), '未标注上次重置时间');
-  assert(card.includes('当日终值扫描'), '未标注窗口扫描');
-  return card.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+
+  // —— 不应再展示的（含已移除的「重新统计」按钮与剩余次数）——
+  const gone = ['btnUsageRefresh', '重新统计', 'Class A', '计数重置', '本次扫描',
+    '当日终值扫描', '仅统计本 Worker', '空间更新于', '缓存',
+    '（读取）', '（列举）', '（剩 '];
+  for (const g of gone) assert(!card.includes(g), '仍展示了「' + g + '」: ' + card);
+
+  return card.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+});
+
+await check('所有 API 请求都用绝对 URL（修复「带凭据 URL → 面板不可用」）', async () => {
+  const { sandbox, requests, scripts } = buildSandbox(await render(env));
+  for (const code of scripts) vm.runInNewContext(code, sandbox);
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert(requests.length > 0, '没有捕获到任何请求');
+  const relative = requests.filter((u) => !/^https?:\/\//i.test(u));
+  assert(relative.length === 0, '仍存在相对 URL 请求: ' + relative.join(', '));
+  assert(requests.every((u) => u.startsWith('https://x/')), '请求应指向 location.origin: ' + requests.join(', '));
+  assert(requests.some((u) => u.includes('/__api/usage')), '缺少 usage 请求: ' + requests.join(', '));
+
+  const page = await render(env);
+  assert(page.includes('function absUrl(u)'), '缺少 absUrl 辅助函数');
+  assert(page.includes('fetch(absUrl(API + path)'), 'call() 未改用绝对 URL');
+  assert(page.includes('xhr.open("PUT", absUrl(url), true)'), 'putXHR() 未改用绝对 URL');
+  assert(page.includes('fetch(absUrl(API + "logout")'), 'logout 未改用绝对 URL');
+  assert(page.includes('fetch(absUrl(API + "health")'), 'health 未改用绝对 URL');
+  return requests.length + ' 个请求全为绝对 URL，5 处调用点已改';
+});
+
+await check('移动端顶部：只常显「新建目录 / 上传方式 / 上传」，其余收进折叠区', async () => {
+  const page = await render(env);
+  const m = page.match(/<div class="more" id="moreMenu">([\s\S]*?)<\/div>/);
+  assert(m, '缺少折叠区容器 <div class="more" id="moreMenu">');
+
+  const inside = m[1];
+  for (const id of ['bucketLabel', 'fUser', 'fPass', 'btnLogin', 'btnLogout', 'btnRefresh', 'partSize', 'conc', 'btnTheme']) {
+    assert(inside.includes('id="' + id + '"'), id + ' 应位于折叠区内');
+  }
+  assert(inside.includes('<h1>Backblaze B2 文件管理器</h1>'), '标题应位于折叠区内');
+
+  const outside = page.replace(m[0], '');
+  for (const id of ['btnMkdir', 'upMode', 'btnUpload', 'btnMore']) {
+    assert(outside.includes('id="' + id + '"'), id + ' 应常显在折叠区之外');
+  }
+  assert(page.includes('.more{display:contents}'), '桌面端折叠区应为 display:contents（顺序不变）');
+  return '折叠区 10 项；常显 新建目录 / 直传 / 上传 / 更多';
+});
+
+await check('移动端「更多」可点击展开 / 收起（含按钮文案与 aria）', async () => {
+  const { sandbox, els, scripts } = buildSandbox(await render(env));
+  for (const code of scripts) vm.runInNewContext(code, sandbox);
+
+  const menu = els.get('moreMenu');
+  const btn = els.get('btnMore');
+  assert(menu && btn, '缺少 moreMenu / btnMore');
+  assert(typeof btn.onclick === 'function', 'btnMore 未绑定点击事件');
+  assert(!menu.classList.contains('more-open'), '默认应为收起状态');
+
+  btn.onclick();
+  assert(menu.classList.contains('more-open'), '点击后应加上 more-open');
+  assert(btn.textContent === '更多 ▴', '展开后按钮文案应变化: ' + btn.textContent);
+
+  btn.onclick();
+  assert(!menu.classList.contains('more-open'), '再次点击应移除 more-open');
+  assert(btn.textContent === '更多 ▾', '收起后文案应还原: ' + btn.textContent);
+  return '收起 → 展开（更多 ▴）→ 收起（更多 ▾）';
+});
+
+await check('移动端：文件行改为「名称+大小」一行、四个操作按钮整行铺开', async () => {
+  const page = await render(env);
+
+  // 桌面端：列宽改用 class 控制，取值与改造前一致
+  assert(page.includes('<th class="c-size">大小</th>'), '大小列应改用 class');
+  assert(page.includes('<th class="c-time">修改时间</th>'), '修改时间列应改用 class');
+  assert(page.includes('<th class="c-act">操作</th>'), '操作列应改用 class');
+  assert(page.includes('.c-size{width:110px}.c-time{width:180px}.c-act{width:300px;text-align:right}'), '桌面列宽应保持 110/180/300');
+  assert(!page.includes('style="width:110px"') && !page.includes('style="width:300px'), '不应再依赖内联列宽');
+  assert(!page.includes('style="text-align:right"'), '仍有内联 text-align:right 残留');
+  assert(page.includes('<td class="act">'), '文件行操作单元格未改用 class="act"');
+
+  // 移动端：表头隐藏、修改时间隐藏、按钮整行 flex 铺开
+  assert(page.includes('thead{display:none}'), '移动端应隐藏表头');
+  assert(page.includes('tbody td:nth-child(3){display:none}'), '移动端应隐藏「修改时间」列');
+  assert(page.includes('tbody td.act{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:8px;text-align:left}'), '移动端操作按钮应整行 flex 铺开');
+  assert(page.includes('tbody td.act .mini{flex:1 1 72px;min-height:42px'), '移动端按钮应均分宽度且高度 ≥42px');
+  // 目录行保持单行：名称 flex:1 占满，删除按钮尾部右对齐（不换行、不两行布局）
+  assert(page.includes('tbody tr.dir{display:flex;align-items:center;gap:8px;background:var(--folder)}'), '目录行应为单行 flex 布局');
+  assert(page.includes('tbody tr.dir td:first-child{flex:1;min-width:0}'), '目录行名称应占满剩余宽度');
+  assert(page.includes('tbody tr.dir td.act{display:block;text-align:right;flex:0 0 auto;grid-column:auto}'), '目录行删除按钮应尾部右对齐且不换行');
+  assert(page.includes('tbody td:empty{display:none}'), '空单元格不应占位');
+  return '文件两行（按钮铺开）；目录单行（名称占满+删除右对齐）';
 });
 
 await check('默认值来自服务端配置：分片 25 MiB / 并发 3', async () => {
@@ -227,8 +328,8 @@ await check('默认值来自服务端配置：分片 25 MiB / 并发 3', async (
   for (const code of scripts) vm.runInNewContext(code, sandbox);
   assert(Number(els.get('partSize').value) === 25, 'partSize=' + els.get('partSize').value);
   assert(Number(els.get('conc').value) === 3, 'conc=' + els.get('conc').value);
-  assert(/分片 25 MiB × 并发 3/.test(els.get('tuneHint').textContent), els.get('tuneHint').textContent);
-  return els.get('tuneHint').textContent;
+  assert(els.get('tuneHint') === undefined, 'tuneHint 元素应已移除');
+  return '25 MiB / 3（无提示行）';
 });
 
 await check('自定义配置生效：分片 8 MiB / 并发 5', async () => {
@@ -246,7 +347,6 @@ await check('直传通道：分片大小被钳制在 5–95 MiB，空值回落�
   els.get('partSize').value = '999';
   els.get('partSize').onchange();
   assert(els.get('partSize').value === 95, '上限未钳制: ' + els.get('partSize').value);
-  assert(/分片 95 MiB/.test(els.get('tuneHint').textContent), els.get('tuneHint').textContent);
 
   els.get('partSize').value = '1';
   els.get('partSize').onchange();
@@ -269,7 +369,6 @@ await check('并发数被钳制在 1–10，并写入 localStorage', async () =>
   els.get('conc').value = '99';
   els.get('conc').onchange();
   assert(Number(els.get('conc').value) === 10, '并发上限未钳制: ' + els.get('conc').value);
-  assert(/并发 10/.test(els.get('tuneHint').textContent), els.get('tuneHint').textContent);
 
   els.get('conc').value = '0.5';
   els.get('conc').onchange();
@@ -295,7 +394,6 @@ await check('切到 Worker 代理通道后上限收紧到 90 MiB', async () => {
   els.get('upMode').value = 'worker';
   els.get('upMode').onchange();
   assert(els.get('partSize').value === 90, '切换后未按 MAX_UPLOAD_BYTES 收紧: ' + els.get('partSize').value);
-  assert(/上限 90 MiB/.test(els.get('tuneHint').textContent), els.get('tuneHint').textContent);
   return '95 → 90 MiB';
 });
 

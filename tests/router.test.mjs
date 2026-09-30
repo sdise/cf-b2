@@ -413,12 +413,15 @@ await check('usage：第二次读取走缓存，不再回源 B2', async () => {
   return 'cached=true，回源 0 次';
 });
 
-await check('usage：手动刷新受 USAGE_MIN_INTERVAL 限流', async () => {
+await check('已移除「重新统计」：refresh 参数不再触发重扫', async () => {
+  const before = sent.length;
   const res = await handle(req('/__api/usage?refresh=1', { headers: { Authorization: basic } }), shareEnv, ctx);
   const body = await res.json();
-  assert(body.storage.throttled === true, JSON.stringify(body.storage));
-  assert(body.minInterval === 300, 'minInterval=' + body.minInterval);
-  return 'throttled=true（最小间隔 ' + body.minInterval + 's）';
+  assert(body.storage.cached === true, 'refresh=1 不应触发重扫: ' + JSON.stringify(body.storage));
+  assert(sent.length === before, '不应回源，实际多出 ' + (sent.length - before) + ' 次');
+  assert(body.minInterval === undefined, 'minInterval 字段应已移除');
+  assert(body.storage.throttled === undefined, 'throttled 字段应已移除');
+  return 'refresh=1 被忽略（cached=true，回源 0 次），限流字段已移除';
 });
 
 await check('事务计数：读取→B、列举→C、写入→A、删除→D', async () => {
@@ -497,10 +500,24 @@ await check('管理器页面带用量卡片', async () => {
   )).text();
   assert(page.includes('id="usage"'), '缺少用量容器');
   assert(page.includes('function loadUsage'), '缺少加载逻辑');
-  assert(page.includes('btnUsageRefresh'), '缺少「重新统计」按钮');
-  assert(page.includes('Class B（读取）') && page.includes('Class C（列举）'), '缺少事务分类展示');
-  assert(page.includes('loadUsage(false)'), '页面应只读缓存地加载一次');
-  return '卡片就位';
+  assert(!page.includes('btnUsageRefresh') && !page.includes('重新统计'), '「重新统计」按钮应已移除');
+  assert(page.includes('Class B:') && page.includes('Class C:'), '缺少事务分类展示');
+  assert(!page.includes('（读取）') && !page.includes('（列举）'), 'Class 标签不应再带分类后缀');
+  assert(!page.includes('（剩 '), '不应再展示剩余次数');
+  assert(!page.includes('>Class A<') && !page.includes('Class A</span>'), 'Class A 不应再展示');
+  assert(page.includes('loadUsage();'), '页面应只读缓存地加载一次');
+  return '卡片就位（无重算按钮）';
+});
+
+await check('管理器布局：桌面端用量卡在左栏，移动端不显示', async () => {
+  const page = await (await handle(
+    req('/__manage', { headers: { Authorization: basic } }), shareEnv, ctx,
+  )).text();
+  assert(page.includes('<aside class="side"><div id="usage"'), '用量卡片应在左侧 aside 中');
+  assert(page.includes('<section class="content">'), '文件列表应在 .content 中');
+  assert(page.includes('grid-template-columns:250px minmax(0,1fr)'), '桌面端应为「左栏 + 右内容」两栏网格');
+  assert(page.includes('.side{display:none}'), '移动端（≤860px）应隐藏用量卡片');
+  return '桌面：250px 左栏 + 右内容；≤860px：隐藏 B2 桶信息';
 });
 
 /* ---------- Durable Object 计数：单元 + 集成 + 23:00 窗口 ---------- */
@@ -605,25 +622,22 @@ await check('DO：首次读取要求扫描，之后不再重复要求', async ()
   return '首次 shouldScan=true → 存快照后 false（2 KB / 3 对象）';
 });
 
-await check('DO：手动刷新受最小间隔限流，超时后可再扫', async () => {
+await check('DO：refresh 参数已失效，不再触发重扫', async () => {
   const counter = new UsageCounter(fakeDoState(), {});
   await counter.onSnapshot(doReq('snapshot', { usedBytes: 100 }), doAt(10, 0));
 
-  const immediate = await (await counter.onSync(doReq('sync', {
-    ttl: 21600, minInterval: 300, refresh: true, windowHour: 23,
-  }), doAt(10, 1))).json();
-  assert(immediate.shouldScan === false && immediate.throttled === true, JSON.stringify(immediate));
-
-  const later = await (await counter.onSync(doReq('sync', {
-    ttl: 21600, minInterval: 300, refresh: true, windowHour: 23,
+  const out = await (await counter.onSync(doReq('sync', {
+    ttl: 21600, refresh: true, windowHour: 23,
   }), doAt(10, 6))).json();
-  assert(later.shouldScan === true, JSON.stringify(later));
-  return '60s 内 throttled=true；6 分钟后放行';
+  assert(out.shouldScan === false, 'refresh 不应再触发重扫: ' + JSON.stringify(out));
+  assert(out.throttled === undefined, 'throttled 字段应已移除');
+  assert(out.storage.usedBytes === 100, '应返回已有快照: ' + JSON.stringify(out.storage));
+  return 'refresh=true 被忽略，shouldScan=false，返回已有快照（100B）';
 });
 
 await check('DO：开启惰性窗口后，UTC 23 点内补扫一次、全天只补一次', async () => {
   const counter = new UsageCounter(fakeDoState(), {});
-  const auto = { ttl: 21600, minInterval: 300, windowHour: 23, autoScan: true };
+  const auto = { ttl: 21600, windowHour: 23, autoScan: true };
   await counter.onSnapshot(doReq('snapshot', { usedBytes: 500 }), doAt(22, 59));
 
   const inWindow = await (await counter.onSync(doReq('sync', auto), doAt(23, 5))).json();
@@ -641,7 +655,7 @@ await check('DO：开启惰性窗口后，UTC 23 点内补扫一次、全天只�
   const offCounter = new UsageCounter(fakeDoState(), {});
   await offCounter.onSnapshot(doReq('snapshot', { usedBytes: 500 }), doAt(22, 59));
   const off = await (await offCounter.onSync(doReq('sync', {
-    ttl: 21600, minInterval: 300, windowHour: 23,
+    ttl: 21600, windowHour: 23,
   }), doAt(23, 5))).json();
   assert(off.shouldScan === false, 'autoScan=false 时不该补扫: ' + JSON.stringify(off));
   return '22:59 不补 → 23:05 补 → 23:30 不补 → 次日 23:10 再补；autoScan=false 时关闭';
@@ -763,14 +777,14 @@ await check('USAGE_AUTO_SCAN=false（默认）：快照再旧也不会自动重�
   return '10 天前的快照仍直接返回（autoScan=false）';
 });
 
-await check('手动「重新统计」仍可强制刷新（受最小间隔限制）', async () => {
+await check('已移除手动重算：refresh=1 不再回源，直接返回现有快照', async () => {
   const before = sent.length;
   const body = await (await handle(
     req('/__api/usage?refresh=1', { headers: { Authorization: basic } }), shareEnv, ctx,
   )).json();
-  assert(sent.length > before, '手动刷新应回源');
-  assert(body.storage.cached === false && body.storage.usedBytes === 1024, JSON.stringify(body.storage));
-  return '手动刷新 → 重新扫描（1024B）';
+  assert(sent.length === before, 'refresh=1 不应回源，实际多出 ' + (sent.length - before) + ' 次');
+  assert(body.storage.cached === true && body.storage.usedBytes === 42, JSON.stringify(body.storage));
+  return 'refresh=1 被忽略 → 回源 0 次，仍返回快照（42B）';
 });
 
 await check('USAGE_AUTO_SCAN=true 时恢复惰性：过期快照触发重扫', async () => {
@@ -948,6 +962,31 @@ await check('$path 模式：匿名面包屑根链接带桶名前缀', async () =
   assert(crumb.includes('<a href="/my-bucket/share/">公开目录</a>'), '根链接应为 /my-bucket/share/: ' + crumb);
   assert(crumb.includes('<span class="cur">docs</span>'), '缺 docs 当前级: ' + crumb);
   return crumb;
+});
+
+await check('各页面都带空 favicon（否则 /favicon.ico 被当对象下载、白记 1 次 Class B）', async () => {
+  const pages = {
+    '公开目录页 /share/': await (await handle(req('/share/', { headers: { Authorization: basic } }), shareEnv, ctx)).text(),
+    '管理器页 /__manage': await (await handle(req('/__manage', { headers: { Authorization: basic } }), shareEnv, ctx)).text(),
+  };
+  for (const [name, html] of Object.entries(pages)) {
+    assert(html.includes('<link rel="icon" href="data:,">'), name + ' 缺少空 favicon');
+  }
+  // 欢迎页模板同样要有（源码级校验，避免依赖具体路由条件）
+  const src = await (await import('node:fs/promises')).readFile(
+    new URL('../src/b2-worker.js', import.meta.url), 'utf8',
+  );
+  const hits = src.split('<link rel="icon" href="data:,">').length - 1;
+  assert(hits >= 3, '三处页面模板都应带空 favicon，实际 ' + hits + ' 处');
+  return '2 个页面实测 + 源码共 ' + hits + ' 处';
+});
+
+await check('公开目录页的滚动续接也用绝对 URL（带凭据 URL 打开时 fetch 才不报错）', async () => {
+  const page = await (await handle(req('/share/', { headers: { Authorization: basic } }), shareEnv, ctx)).text();
+  assert(page.includes('function absUrl(u)'), '公开目录页缺少 absUrl');
+  assert(page.includes('fetch(absUrl(location.pathname'), '公开目录页的 more() 未改用绝对 URL');
+  assert(!/fetch\(location\.pathname/.test(page), '仍存在未包装的相对 URL fetch');
+  return 'more() → absUrl(location.pathname…)';
 });
 
 await check('公开根目录（/share/）匿名不再显示返回上一级，管理员仍可回根', async () => {
@@ -1347,8 +1386,8 @@ await check('管理器提供分片大小/并发输入框，默认值取服务端
   assert(page.includes('function partSizeMB'), '缺少 partSizeMB');
   assert(page.includes('function concurrency'), '缺少 concurrency');
   assert(page.includes('function syncTuning') && page.includes('cfb2-tune'), '缺少调参持久化');
-  assert(page.includes('id="tuneHint"'), '缺少当前值提示');
-  return '分片 25 MiB / 并发 3';
+  assert(!page.includes('tuneHint'), '提示行 tuneHint 应已移除');
+  return '分片 25 MiB / 并发 3（无提示行）';
 });
 
 await check('输入框默认值跟随 MULTIPART_PART_SIZE / UPLOAD_CONCURRENCY', async () => {
