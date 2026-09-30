@@ -1,15 +1,21 @@
-# 本地开发用（把本文件复制为 .dev.vars，永远不要提交到 Git）
-# 生产环境请用 `npx wrangler secret put XXX`
+# 复制为 .dev.vars（该文件已被 .gitignore 忽略）并填入真实值。
+# 本地开发：npx wrangler dev   部署：node deploy.mjs
 
-# Backblaze B2 Application Key ID（形如 0056xxxxxxxxxxxxxxxxxxxxx）
-B2_KEY_ID = "your-b2-key-id"
-
-# Backblaze B2 Application Key（形如 Kxxxxxxxxxxxxxxxxxxxxxxxxxx）
-B2_APPLICATION_KEY = "your-b2-application-key"
-
-# 管理端 Basic 认证（两者都要配）
+# 管理员凭据（Basic）
 ADMIN_USER = "admin"
-ADMIN_PASS = "change-me-please"
+ADMIN_PASS = "换一个强口令"
 
-# 或者使用 Bearer 令牌（与 Basic 二选一即可，配置后优先级更高）
-# ADMIN_TOKEN = "a-random-long-token"
+# ---- 多桶挂载表：每个桶一个 BUCKET_N（N 从 1 开始）----
+# 桶可分属不同 B2 账号（各自 KEY_ID / APPLICATION_KEY / ENDPOINT）。
+# ⚠️ BUCKET_NAME 不能重复（同一桶挂两次会被拒绝），也不能叫 share / __api / __manage。
+BUCKET_1 = {"BUCKET_NAME":"your-bucket","KEY_ID":"001122334455667700000000001","APPLICATION_KEY":"K001xxxxxxxxxxxxxxxxxxxxxxxxxxxx","ENDPOINT":"https://s3.us-west-001.backblazeb2.com"}
+# BUCKET_2 = {"BUCKET_NAME":"another-bucket","KEY_ID":"...","APPLICATION_KEY":"...","ENDPOINT":"https://s3.us-east-005.backblazeb2.com"}
+
+# 可选：给桶起显示名（默认用桶名）
+# BUCKET_1 里的 LABEL 字段同理，如 {"BUCKET_NAME":"...","LABEL":"我的主桶",...}
+
+# ---- 其余变量都有合理默认值（见 src/b2-worker.js 的 loadConfig），按需覆盖 ----
+# PUBLIC_READ = "true"
+# PUBLIC_PREFIX = "share"
+# ENABLE_WRITE = "true"
+# STORAGE_QUOTA_BYTES = "10000000000"

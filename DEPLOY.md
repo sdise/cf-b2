@@ -272,6 +272,16 @@ Basic ADMIN_USER/ADMIN_PASS  → 管理员
 - 需要改全局默认值 → 改 Workers 变量 `MULTIPART_PART_SIZE` / `UPLOAD_CONCURRENCY` 后重新部署。
 - Worker 代理模式下每片都要过 Worker，建议分片不要太大（25MiB 左右较稳）；直传模式下可酌情调大以减少请求数。
 
+#### 3.4.2 「配置CORS」按钮
+
+管理页头部有 **「配置CORS」** 按钮（在「刷新」旁，桌面常显、移动端收进「更多」折叠区）。点击后输入来源（**默认为当前访问的域名**，可自定义），Worker 会通过 **B2 原生 API**（`b2_authorize_account` → `b2_get_bucket` → `b2_update_bucket`）把该来源写入当前桶的 CORS 规则：
+
+- **按规则名去重**（`cfb2-<域名>`）：重复提交不会叠加；桶里已有的其它规则原样保留
+- 放行的操作：`b2_upload_file` / `b2_upload_part` / `s3_get` / `s3_put` / `s3_head` / `s3_post` / `s3_delete` 等（浏览器直传与跨域下载都需要）
+- B2 原生 API 属于**控制面调用，免费**，不计入 Class A/B/C/D 用量
+- 需要 `ENABLE_WRITE=true`（写入桶配置属于写操作）；密钥必须是该桶（所在账号）的有效应用密钥
+- 注意：CORS 是**桶级**配置 —— 多桶模式下要给每个桶分别配（切到对应桶的管理器再点）
+
 ### 3.5 多桶挂载（BUCKET_1..N）
 
 自 2026-10 起改为**多桶挂载**：每个 B2 桶一个环境变量 BUCKET_N（N 为序号），值为 JSON：
@@ -470,6 +480,7 @@ crons = ["0 23 * * *"]     # 每天 23:00 UTC：同一次触发里「先刷新�
 | `/__api/*` | 见下节 | 管理 API（需鉴权，`/health`、`/logout` 除外） |
 | `/<bucket>/__api/*` | 同上 | `$path` 模式下显式指定桶；也可用 `/__api/*?bucket=<桶名>` |
 | `/__api/usage` | GET | B2 用量：空间快照 + Class A/B/C/D 计数（**无手动重算参数**）。需管理员鉴权 |
+| `/__api/cors` | GET/POST | 读取/写入**桶级 CORS 规则**（走 B2 原生 API，免费不计 Class A-D）。`POST body {origin}` 追加一条放行规则（按规则名去重、保留已有规则）。需管理员鉴权 |
 | 任意 | OPTIONS | CORS 预检，返回 204 |
 
 > **判断规则**：路径以 `/` 结尾视为"目录"→ 返回列表；否则视为"对象"→ 走下载/上传/删除。

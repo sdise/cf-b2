@@ -40,6 +40,14 @@ compatibility_date = "2024-11-01"
 # 保留控制台上已有的明文变量（不因部署被清空/覆盖）——本文件的「对控制台友好」开关
 keep_vars = true
 
+# ---------- 多桶挂载表（BUCKET_1..N）放哪？----------
+# ⚠️ 不要写进本文件（会被 git 提交，泄漏 B2 密钥）。正确做法：
+#   · 本地开发（wrangler dev）：自动读 .dev.vars（已被 .gitignore 忽略）
+#   · 部署到 Worker：node deploy.mjs —— 从 .dev.vars 读 BUCKET_N，经 --var 传给 wrangler，
+#     keep_vars=true 保证控制台里其它变量不受影响
+# 每个 BUCKET_N 的值是一个 JSON：
+#   BUCKET_1={"BUCKET_NAME":"桶名","KEY_ID":"keyID","APPLICATION_KEY":"appKey","ENDPOINT":"https://s3.xx-nnn.backblazeb2.com"}
+
 # ---------- 自定义域名 / 路由 ----------
 # 路由由控制台管理时，保持下面 routes 全部注释：wrangler 不会去覆盖控制台的路由。
 workers_dev = true

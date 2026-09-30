@@ -7,7 +7,7 @@
   "scripts": {
     "test": "node tests/sigv4.test.mjs && node tests/router.test.mjs && node tests/manage-ui.test.mjs",
     "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
+    "deploy": "node deploy.mjs",
     "tail": "wrangler tail"
   },
   "devDependencies": {

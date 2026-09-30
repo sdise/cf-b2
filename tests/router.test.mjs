@@ -20,6 +20,7 @@ globalThis.caches = {
 };
 
 const sent = [];
+const corsBodies = [];   // 发往 B2 原生 API 的 b2_update_bucket 请求体
 const xml = (body, status = 200) => new Response(body, {
   status, headers: { 'Content-Type': 'application/xml' },
 });
@@ -30,6 +31,31 @@ globalThis.fetch = async (request, init) => {
   sent.push(target);
   const url = new URL(target.url);
   request = target;
+
+  // B2 原生 API（桶级 CORS 配置）：authorize → get_bucket → update_bucket
+  if (url.hostname === 'api.backblazeb2.com' && url.pathname.includes('b2_authorize_account')) {
+    return new Response(JSON.stringify({
+      authorizationToken: 'native-token',
+      apiUrl: 'https://api003.backblazeb2.com',
+      accountId: 'acc-1',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+  if (url.hostname.includes('backblazeb2.com') && url.pathname.includes('b2_list_buckets')) {
+    return new Response(JSON.stringify({
+      buckets: [
+        { bucketId: 'bid-1', bucketName: 'my-bucket',
+          corsRules: [{ corsRuleName: 'pre-existing', allowedOrigins: ['https://old.example.com'] }] },
+        { bucketId: 'bid-2', bucketName: 'other-bucket', corsRules: [] },
+      ],
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } });
+  }
+  if (url.hostname.includes('backblazeb2.com') && url.pathname.includes('b2_update_bucket')) {
+    const b = await target.json();
+    corsBodies.push(b);
+    return new Response(JSON.stringify({ bucketId: b.bucketId, corsRules: b.corsRules }), {
+      status: 200, headers: { 'Content-Type': 'application/json' },
+    });
+  }
 
   // ListObjectsV2：按请求里的 prefix 生成内容，便于验证前缀处理
   if (request.method === 'GET' && url.searchParams.get('list-type') === '2') {
@@ -389,6 +415,93 @@ await check('管理员可在 share 之外写入', async () => {
   assert(res.status === 200 && body.ok === true, 'status=' + res.status);
   return '已写入 /private/ok.txt';
 });
+
+/* ---------- 桶级 CORS 配置（B2 原生 API） ---------- */
+
+await check('CORS：POST /__api/cors 追加放行规则并保留已有规则', async () => {
+  const res = await handle(
+    req('/__api/cors', {
+      method: 'POST',
+      body: JSON.stringify({ origin: 'https://files.example.com' }),
+      headers: { Authorization: basic, 'Content-Type': 'application/json' },
+    }), shareEnv, ctx,
+  );
+  const body = await res.json();
+  assert(body.ok === true && body.bucket === 'my-bucket', JSON.stringify(body).slice(0, 160));
+  const rule = body.corsRules.find((r) => r.corsRuleName === 'cfb2-files-example-com');
+  assert(rule && rule.allowedOrigins[0] === 'https://files.example.com', '缺少新规则: ' + JSON.stringify(body.corsRules));
+  assert(rule.allowedOperations.includes('s3_put') && rule.allowedOperations.includes('b2_upload_file'), '直传操作未放行');
+  assert(rule.allowedOperations.includes('s3_get'), '下载操作未放行');
+  assert(body.corsRules.some((r) => r.corsRuleName === 'pre-existing'), '已有规则被破坏');
+  const upd = corsBodies[corsBodies.length - 1];
+  assert(upd.bucketId === 'bid-1' && upd.corsRules.length === body.corsRules.length, '发往 B2 的请求体异常');
+  return 'origin 已写入，桶内共 ' + body.corsRules.length + ' 条规则';
+});
+
+await check('CORS：同名规则去重（重复提交不叠加）且容忍尾斜杠', async () => {
+  const res = await handle(
+    req('/__api/cors', {
+      method: 'POST',
+      body: JSON.stringify({ origin: 'https://files.example.com/' }),
+      headers: { Authorization: basic, 'Content-Type': 'application/json' },
+    }), shareEnv, ctx,
+  );
+  const body = await res.json();
+  const same = body.corsRules.filter((r) => r.corsRuleName === 'cfb2-files-example-com');
+  assert(same.length === 1, '同名规则出现 ' + same.length + ' 次');
+  assert(body.origin === 'https://files.example.com', '尾斜杠应被去除: ' + body.origin);
+  return '去重 OK，origin=' + body.origin;
+});
+
+await check('CORS：非法 origin 400 / 匿名 401 / GET 返回现有规则', async () => {
+  const bad = await handle(
+    req('/__api/cors', {
+      method: 'POST', body: JSON.stringify({ origin: 'ftp://x' }),
+      headers: { Authorization: basic, 'Content-Type': 'application/json' },
+    }), shareEnv, ctx,
+  );
+  assert(bad.status === 400, 'status=' + bad.status);
+  const anon = await handle(req('/__api/cors', { method: 'GET' }), shareEnv, ctx);
+  assert(anon.status === 401, '匿名 status=' + anon.status);
+  const get = await handle(req('/__api/cors', { headers: { Authorization: basic } }), shareEnv, ctx);
+  const gb = await get.json();
+  assert(gb.ok === true && gb.bucket === 'my-bucket' && Array.isArray(gb.corsRules), JSON.stringify(gb).slice(0, 140));
+  assert(gb.corsRules.some((r) => r.corsRuleName === 'pre-existing'), 'GET 应返回桩中的现有规则');
+  return '400 / 401 / GET 正常';
+});
+
+await check('CORS：B2 侧报错时透传为 502（不掩盖原因）', async () => {
+  const broken = {
+    ...shareEnv,
+    BUCKET_1: JSON.stringify({
+      BUCKET_NAME: 'my-bucket', KEY_ID: 'bad', APPLICATION_KEY: 'bad',
+      ENDPOINT: 'https://s3.us-west-001.backblazeb2.com',
+    }),
+  };
+  // 桩对密钥为 bad 的 authorize 返回 401
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async (request, init) => {
+    const t = typeof request === 'string' ? new Request(request, init) : request;
+    if (t.url.includes('b2_authorize_account')) {
+      return new Response(JSON.stringify({ status: 401, code: 'bad_auth_token', message: 'Unauthorized' }), { status: 401 });
+    }
+    return realFetch(request, init);
+  };
+  try {
+    const res = await handle(
+      req('/__api/cors', {
+        method: 'POST', body: JSON.stringify({ origin: 'https://x.example.com' }),
+        headers: { Authorization: basic, 'Content-Type': 'application/json' },
+      }), broken, ctx,
+    );
+    const body = await res.json();
+    assert(res.status === 502 && /Unauthorized/.test(body.error), 'status=' + res.status + ' body=' + JSON.stringify(body));
+    return 'B2 错误透传: ' + body.error;
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
 
 /* ---------- B2 用量面板 ---------- */
 
@@ -1338,11 +1451,12 @@ await check('公开目录页也走滚动加载（无「下一页」链接）', a
   return '无限滚动（服务端首屏 + 前端续接）';
 });
 
-await check('复制的链接跟随当前域名（绝对地址）', async () => {
+await check('复制的链接跟随当前域名且锚定挂载点（绝对地址）', async () => {
   const page = await (await handle(req('/__manage', { headers: { Authorization: basic } }), env, ctx)).text();
-  assert(page.includes('location.origin + CFG.basePath'), '复制应使用 location.origin');
-  assert(!/function objUrl\(key\) \{ return CFG\.basePath/.test(page), '仍在使用相对路径');
-  return 'location.origin + basePath + key';
+  assert(page.includes('location.origin + "/share/" + CFG.bucketFixed'), '公开前缀内应生成 /share/<桶>/ 别名链接');
+  assert(page.includes('location.origin + "/" + CFG.bucketFixed + "/"'), '其余应生成 /<桶>/<key> 挂载链接');
+  assert(!page.includes('location.origin + CFG.basePath'), '不应再用 basePath 拼对象 URL（全局入口下会丢桶前缀）');
+  return '公开文件 → /share/<桶>/…；其余 → /<桶>/…（修复「未挂载的桶」）';
 });
 
 await check('上传方式下拉框不带 title 说明', async () => {

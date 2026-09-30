@@ -320,6 +320,43 @@ await check('移动端：文件行改为「名称+大小」一行、四个操作
   return '文件两行（按钮铺开）；目录单行（名称占满+删除右对齐）';
 });
 
+await check('管理器带「配置CORS」按钮并已绑定处理器', async () => {
+  const page = await render(env);
+  assert(page.includes('id="btnCors"'), '缺少配置CORS按钮');
+  assert(page.includes('call("cors"'), '缺少 CORS API 调用');
+  const { sandbox, els, scripts } = buildSandbox(page);
+  for (const code of scripts) vm.runInNewContext(code, sandbox);
+  assert(typeof els.get('btnCors').onclick === 'function', 'btnCors 未绑定处理器');
+  return '按钮 + 处理器就位';
+});
+
+await check('objUrl：公开前缀内生成 /share/<桶>/… 可分享链接，其余 /<桶>/…（复制/下载不再报「未挂载的桶」）', async () => {
+  const page = await render(env);
+  const m = page.match(/function objUrl\(key\) \{[\s\S]*?\n\}/);
+  assert(m, '页面缺少 objUrl 函数定义');
+  const sandboxCtx = {
+    CFG: { publicPrefix: 'share', bucketFixed: 'my-bucket' },
+    location: { origin: 'https://x' },
+  };
+  const objUrl = vm.runInNewContext(m[0] + '; objUrl', sandboxCtx);
+  // 公开前缀 share/ 内 → 别名 URL（匿名可访问、可分享）
+  assert(
+    objUrl('share/110MB.test') === 'https://x/share/my-bucket/110MB.test',
+    '公开文件链接错误: ' + objUrl('share/110MB.test'),
+  );
+  assert(
+    objUrl('share/images/a b.jpg') === 'https://x/share/my-bucket/images/a%20b.jpg',
+    '公开子目录文件链接错误: ' + objUrl('share/images/a b.jpg'),
+  );
+  // 公开前缀外 → 挂载点 URL（管理员经 Worker 访问）
+  assert(
+    objUrl('docs/x.bin') === 'https://x/my-bucket/docs/x.bin',
+    '非公开文件链接错误: ' + objUrl('docs/x.bin'),
+  );
+  assert(objUrl('a.bin') === 'https://x/my-bucket/a.bin', '根级文件链接错误');
+  return 'share/* → /share/my-bucket/*；其余 → /my-bucket/*';
+});
+
 await check('默认值来自服务端配置：分片 25 MiB / 并发 3', async () => {
   const { sandbox, els, scripts } = buildSandbox(await render(env));
   for (const code of scripts) vm.runInNewContext(code, sandbox);

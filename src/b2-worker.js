@@ -1580,6 +1580,74 @@ async function runScheduled(event, env) {
 
 /* ============================ 6. 管理 API ============================ */
 
+/* ---- B2 原生 API（控制面，免费、不计 Class A-D）：桶级 CORS 配置 ---- */
+
+/** b2_authorize_account：用桶自己的应用密钥换取控制面令牌 */
+async function b2Authorize(cfg) {
+  const basic = 'Basic ' + btoa(cfg.accessKeyId + ':' + cfg.secretAccessKey);
+  const res = await fetch('https://api.backblazeb2.com/b2api/v2/b2_authorize_account', {
+    headers: { Authorization: basic },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.authorizationToken) {
+    throw new Error('b2_authorize_account 失败: HTTP ' + res.status + ' ' + (data.message || data.code || ''));
+  }
+  return data;   // { authorizationToken, apiUrl, accountId, ... }
+}
+
+/** 生成一条放行指定来源的 CORS 规则（浏览器直传/下载都需要它）。
+ *  注意 corsRuleName 只允许字母数字与 '-'（点号会被 B2 拒绝），所以域名里的点要换成 '-'。 */
+function corsRuleFor(origin) {
+  const tag = String(origin).replace(/^https?:\/\//i, '').replace(/[^a-zA-Z0-9-]/g, '-').replace(/-+/g, '-').slice(0, 40) || 'default';
+  return {
+    corsRuleName: 'cfb2-' + tag,
+    allowedOrigins: [origin],
+    allowedOperations: [
+      'b2_upload_file', 'b2_upload_part', 'b2_download_file_by_id', 'b2_download_file_by_name',
+      's3_get', 's3_put', 's3_head', 's3_post', 's3_delete',
+    ],
+    allowedHeaders: ['authorization', 'content-type', 'content-range', 'range',
+      'x-amz-content-sha256', 'x-amz-date', 'x-requested-with'],
+    exposeHeaders: ['etag', 'content-length', 'content-range', 'last-modified'],
+    maxAgeSeconds: 3600,
+  };
+}
+
+async function b2GetBucketCors(cfg, bucket) {
+  const auth = await b2Authorize(cfg);
+  // 注意：不能用 b2_get_bucket?bucketName= —— 受限应用密钥下按名字查会 404 not_found
+  //（实测复现）。b2_list_buckets 对受限密钥返回其被允许的桶，且响应自带 corsRules，
+  // 一次调用同时拿到 bucketId 与现有规则。
+  const res = await fetch(auth.apiUrl + '/b2api/v2/b2_list_buckets', {
+    method: 'POST',
+    headers: { Authorization: auth.authorizationToken, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accountId: auth.accountId }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !Array.isArray(data.buckets)) {
+    throw new Error('b2_list_buckets 失败: HTTP ' + res.status + ' ' + (data.message || data.code || ''));
+  }
+  const m = data.buckets.find((b) => String(b.bucketName || '').toLowerCase() === String(bucket).toLowerCase());
+  if (!m) {
+    throw new Error('B2 账号（对该密钥可见的桶）中找不到 ' + bucket + '：请确认密钥未限制到其它桶');
+  }
+  return { bucketId: m.bucketId, corsRules: Array.isArray(m.corsRules) ? m.corsRules : [] };
+}
+
+async function b2UpdateBucketCors(cfg, bucketId, corsRules) {
+  const auth = await b2Authorize(cfg);
+  const res = await fetch(auth.apiUrl + '/b2api/v2/b2_update_bucket', {
+    method: 'POST',
+    headers: { Authorization: auth.authorizationToken, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ accountId: auth.accountId, bucketId, corsRules }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || !data.bucketId) {
+    throw new Error('b2_update_bucket 失败: HTTP ' + res.status + ' ' + (data.message || data.code || ''));
+  }
+  return Array.isArray(data.corsRules) ? data.corsRules : [];
+}
+
 async function readJsonBody(request) {
   const type = request.headers.get('content-type') || '';
   if (type.includes('application/json')) {
@@ -1814,6 +1882,41 @@ async function apiRouter(request, env, ctx, cfg, url) {
       });
       if (!response.ok) return deny(extractError(await response.text()), request, cfg, response.status);
       return json({ ok: true, prefix }, 200, request, cfg);
+    }
+
+    /* ---- 桶级 CORS 配置（B2 原生 API，控制面免费不计次） ----
+     * GET  /__api/cors                → 当前 CORS 规则
+     * POST /__api/cors {origin}       → 按 corsRuleName 去重后追加/更新一条放行规则
+     * 浏览器直传（presigned PUT）与跨域下载都依赖这条规则。 */
+    case 'cors': {
+      try {
+        if (request.method === 'GET') {
+          const info = await b2GetBucketCors(cfg, targetBucket);
+          return json({ ok: true, bucket: targetBucket, bucketId: info.bucketId, corsRules: info.corsRules }, 200, request, cfg);
+        }
+        if (request.method !== 'POST') return deny('不支持的方法', request, cfg, 405);
+        if (!cfg.enableWrite) return deny('已禁用写入（ENABLE_WRITE=false）', request, cfg, 403);
+        const body = await readJsonBody(request);
+        const origin = String(body.origin || '').trim().replace(/\/+$/, '');
+        if (!/^https?:\/\/[a-z0-9.-]+(:\d+)?$/i.test(origin)) {
+          return deny('origin 需形如 https://域名（可带端口）', request, cfg, 400);
+        }
+        const info = await b2GetBucketCors(cfg, targetBucket);
+        const rule = corsRuleFor(origin);
+        // 按规则名去重：同名覆盖，其余原样保留（不破坏已有规则）
+        const rules = info.corsRules.filter((r) => r && r.corsRuleName !== rule.corsRuleName);
+        rules.push(rule);
+        const updated = await b2UpdateBucketCors(cfg, info.bucketId, rules);
+        return json({
+          ok: true,
+          bucket: targetBucket,
+          origin,
+          corsRuleName: rule.corsRuleName,
+          corsRules: updated,
+        }, 200, request, cfg);
+      } catch (error) {
+        return deny(String((error && error.message) || error), request, cfg, 502);
+      }
     }
 
     /* ---- 分片上传 ---- */
@@ -2321,6 +2424,7 @@ function managePage(cfg, url) {
     '<button class="ghost" id="btnLogin">鉴权</button>',
     '<button class="ghost" id="btnLogout">退出</button>',
     '<button class="ghost" id="btnRefresh">刷新</button>',
+    '<button class="ghost" id="btnCors" title="把一个站点域名加入该桶的 CORS 规则（浏览器直传/跨域下载需要）。默认放行当前站点。">配置CORS</button>',
     '<select id="bucketSel" title="切换到其它桶的管理器"></select>',
     '<label class="set" title="分片大小（MiB）。直传单次 PUT 上限为 5–95，Worker 代理受 MAX_UPLOAD_BYTES 约束；B2 硬上限 100MiB。">分片',
     '<input id="partSize" type="number" min="5" max="95" step="1" value="' + defaultPartMiB + '">MiB</label>',
@@ -2728,8 +2832,19 @@ function managePage(cfg, url) {
     '    });',
     '  }).catch(function (e) { toast("上传失败: " + e.message, true); });',
     '}',
-    '/* 绝对地址（跟随当前访问域名，而不是写死某个域名） */',
-    'function objUrl(key) { return location.origin + CFG.basePath + key.split("/").map(encodeURIComponent).join("/"); }',
+    '/* 绝对地址（跟随当前访问域名，而不是写死某个域名）。',
+    '   多桶语义下对象 URL 必须落在挂载点上：公开前缀内的 key 生成 /share/<桶>/<去前缀路径>',
+    '   （匿名可访问、可直接分享）；其余生成 /<桶>/<key>（管理员经 Worker 访问）。',
+    '   之前用 CFG.basePath 拼接，在全局入口 /__manage 下 basePath 是 "/"，',
+    '   会把 /share/110MB.test 这类 URL 的第一段当桶名 → 「未挂载的桶」。 */',
+    'function objUrl(key) {',
+    '  var enc = key.split("/").map(encodeURIComponent).join("/");',
+    '  var pp = (CFG.publicPrefix || "").replace(/\\/+$/, "");',
+    '  if (pp && enc.toLowerCase().indexOf(pp.toLowerCase() + "/") === 0) {',
+    '    return location.origin + "/share/" + CFG.bucketFixed + "/" + enc.slice(pp.length + 1);',
+    '  }',
+    '  return location.origin + "/" + CFG.bucketFixed + "/" + enc;',
+    '}',
     '/* 复制链接：经 Worker 的可分享地址（与「下载」同一路径，加 ?dl=1 即强制另存） */',
     'function copyText(text) {',
     '  function fallback() { window.prompt("复制这条链接（经 Worker，可直接分享）", text); }',
@@ -2796,6 +2911,19 @@ function managePage(cfg, url) {
     '  if (e.target.tagName === "A") act(e.target);',
     '});',
     'el("btnRefresh").onclick = refresh;',
+    '/* 配置CORS：把一个来源写入当前桶的 CORS 规则（B2 原生 API，免费不计次）。',
+    '   浏览器直传（presigned PUT）与跨域下载依赖桶级 CORS；默认放行当前站点域名。 */',
+    'el("btnCors").onclick = function () {',
+    '  var def = (location.origin && location.origin.indexOf("http") === 0) ? location.origin : "https://";',
+    '  var o = window.prompt("加入 B2 桶 CORS 的来源（https://域名，可带端口）：", def);',
+    '  if (!o) return;',
+    '  o = o.replace(/\\/+$/, "");',
+    '  call("cors", { method: "POST", body: JSON.stringify({ origin: o }) })',
+    '    .then(function (r) {',
+    '      var n = r.data && r.data.corsRules ? r.data.corsRules.length : 0;',
+    '      toast(r.ok ? "CORS 已更新：已放行 " + o + "（该桶共 " + n + " 条规则）" : "CORS 配置失败: " + ((r.data && r.data.error) || r.status), !r.ok);',
+    '    });',
+    '};',
     'el("btnUpload").onclick = function () { el("file").click(); };',
     'el("file").onchange = function () { uploadFiles(this.files); this.value = ""; };',
     'el("btnMkdir").onclick = function () {',
